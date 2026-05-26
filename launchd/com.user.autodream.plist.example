@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Schedule cc-autodream to run nightly at 03:15 local time.
+
+  Install:
+    cp launchd/com.user.autodream.plist.example \
+       ~/Library/LaunchAgents/com.user.autodream.plist
+    # Edit the plist: replace REPLACE_WITH_USERNAME and any paths that differ.
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.autodream.plist
+    launchctl kickstart -k gui/$(id -u)/com.user.autodream    # run now to test
+
+  Logs land at $HOME/.claude/autodream/logs/launchd.{out,err}.log and
+  $HOME/.claude/autodream/logs/run-YYYY-MM-DD.log.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.autodream</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>$HOME/.claude/autodream/run.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACE_WITH_USERNAME/.claude/autodream/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACE_WITH_USERNAME/.claude/autodream/logs/launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/REPLACE_WITH_USERNAME</string>
+    </dict>
+</dict>
+</plist>
