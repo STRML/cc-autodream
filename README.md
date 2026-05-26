@@ -40,23 +40,51 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.autodream.plist
 
 Requires `claude` CLI on PATH (default expected at `$HOME/.local/bin/claude` — override with `CLAUDE_BIN`).
 
-## How it relates to memory-consolidation tooling
+## FAQ
 
-[`claudefa.st` describes an "Auto Dream" feature](https://claudefa.st/blog/guide/mechanics/auto-dream) for *consolidating memory* — pruning stale `MEMORY.md` entries, resolving contradictions, reorganizing the index — but as of `claude` `2.1.150` it isn't a feature shipped in the official Claude Code CLI. The role it describes is currently filled by community plugins. The most common one in this ecosystem is [`cc-simple-memory`](https://github.com/STRML/cc-simple-memory), whose `gc-memory.sh` runs an Opus-driven prune/merge pass on `MEMORY.md` (and an `ARCHIVE.md` cold-storage file) and respects the 📌 pin marker.
+### Why does this exist? Doesn't Claude Code have auto-dream built in?
 
-cc-autodream solves a different problem from any of these. Memory consolidators are **garbage collectors**; cc-autodream is a **signal extractor**. The two are designed to be symbiotic:
+Anthropic does ship an `autoDream` service in Claude Code — the [leaked source](https://github.com/codeaashu/claude-code) puts it at `src/services/autoDream/` with a four-phase consolidation prompt (Orient → Gather Signal → Consolidate → Prune-and-Index) and the same 200-line / 25 KB MEMORY.md index cap (`MAX_ENTRYPOINT_LINES = 200`, `MAX_ENTRYPOINT_BYTES = 25_000`). But that built-in feature is a **memory janitor**: it reads your `MEMORY.md` plus narrow transcript slices and rewrites the index to prune stale entries, resolve contradictions, and merge near-duplicates. It does not produce a daily report. It does not read all of yesterday's sessions end-to-end. It does not surface "you missed the commit-and-verify skill three times yesterday."
 
-| | memory consolidator (e.g. cc-simple-memory `gc-memory.sh`) | **cc-autodream (this repo)** |
-|---|---|---|
-| Reads | `MEMORY.md`, `ARCHIVE.md`, narrow transcript slices | full session JSONLs, fan-out across all of yesterday's sessions |
-| Writes | `MEMORY.md` (prune/merge), `ARCHIVE.md` (cold storage) | `dreams/YYYY-MM-DD.md`, `MEMORY.md` (📌 add only) |
-| Trigger | every N extractions, or on demand | nightly launchd at 03:15 |
-| Cares about | hygiene | discovery |
-| Output for the human | none | daily report + interactive triage |
+cc-autodream is a **signal extractor**, not a janitor. It fans out a Layer-1 worker per session JSONL, mines the full transcripts for recurring patterns (missed skills, sandbox friction, tool loops, fabricated identifiers, missed `ASSUMPTIONS` blocks, stop-projection), ranks them by `count × severity`, and writes a markdown report you triage with morning coffee. Plus 📌-pinned MEMORY.md entries for the small subset of findings that meet high-confidence / high-severity / recurring bars.
 
-**The contract that makes them play nice**: cc-autodream pins everything it writes with the 📌 marker, and never deletes or rewrites a pinned entry. Consolidators that respect 📌 (cc-simple-memory does) will not prune cc-autodream's entries. So cc-autodream adds high-signal pins; the consolidator grooms everything else around them.
+Different inputs, different outputs, different role.
 
-If `claude-memory` (cc-simple-memory's CLI) is on PATH and Layer 2 touched any project memory, `run.sh` triggers `claude-memory gc` for each touched project so the consolidator can resettle around the new pins. Disable with `AUTODREAM_GC=0`. If `claude-memory` isn't installed, that step is a silent no-op — the rest of the pipeline (Layer 1 + Layer 2 + report + notify) runs identically. `MEMORY.md` files will grow over time without a consolidator, but cc-autodream itself caps additions at high-confidence/high-severity (typically 0–2 per day), so you can defer installing one.
+| | Anthropic auto-dream (built-in) | claude-dream (community port) | cc-simple-memory | **cc-autodream (this repo)** |
+|---|---|---|---|---|
+| Input | MEMORY.md + topic files + narrow transcript slices | MEMORY.md + topic files | MEMORY.md + ARCHIVE.md | full session JSONLs (every session, fanned out) |
+| Output | rewritten MEMORY.md index | rewritten MEMORY.md index | pruned MEMORY.md + ARCHIVE.md cold storage | daily report + 📌 pins into MEMORY.md |
+| Trigger | `stopHooks` (24h + 5 sessions, gated by GrowthBook flag `tengu_onyx_plover`) | manual `/dream` | every N extractions or `claude-memory gc` | nightly launchd at 03:15 |
+| Role | janitor | janitor | janitor | **discovery telescope** |
+| Output for the human | none | none | none | daily markdown report + interactive triage |
+
+### Is this useful outside of (or alongside) the built-in auto-dream?
+
+Yes, for two independent reasons.
+
+1. **Most users don't have auto-dream active yet.** It's behind a GrowthBook rollout flag — the code is in the binary, the behavior is off for almost everyone. As of `claude 2.1.150` on my machine, `/memory` reports "isn't available in this environment" and no consolidation happens. You can check yours with `/memory` inside a session; if the toggle is unavailable, you're not in the rollout.
+
+2. **Even when auto-dream lights up, it solves a different problem.** It will tidy your MEMORY.md. It will not tell you that yesterday's `web-app` session bypassed the sandbox on 79% of Bash calls and that the `commit-and-verify` skill was skipped three times across two projects. That's cc-autodream's job. The two compose: cc-autodream adds the 📌 pins, auto-dream grooms everything around them.
+
+### If I don't have auto-dream yet, does cc-autodream do the same thing?
+
+No — and you probably want one of each.
+
+- **For memory hygiene** (the actual auto-dream role), pair cc-autodream with one of:
+  - [`jl-cmd/claude-dream`](https://github.com/jl-cmd/claude-dream) — a community port of Anthropic's auto-memory consolidation contract as a manual `/dream` slash command. Same 200-line / 25 KB / 150-char-per-entry caps. Same `{user, feedback, project, reference}` frontmatter taxonomy. Lightweight; no scheduled run.
+  - [`STRML/cc-simple-memory`](https://github.com/STRML/cc-simple-memory) — a heavier-weight memory plugin with extraction hooks plus `claude-memory gc` (Opus-driven prune + ARCHIVE.md cold storage). If you want consolidation to happen automatically every N extractions rather than on demand.
+  - Or wait for Anthropic to flip your `tengu_onyx_plover` flag.
+- **For cross-session signal extraction**, run cc-autodream. There is no built-in equivalent and (as far as I've looked) no other community tool that reads full session JSONLs and produces a ranked daily report.
+
+### How does cc-autodream stay out of the janitor's way?
+
+By respecting the same contract Anthropic's auto-dream enforces, so its pins survive any consolidator's grooming pass:
+
+- **Every entry cc-autodream writes is 📌-pinned.** All four tools above treat 📌 as "don't prune."
+- **Each MEMORY.md line stays ≤150 characters.** That's the implicit index-entry budget in the leaked `consolidationPrompt.ts` ("an index, not a dump — each entry should be one line under ~150 characters"). Topic-file bodies go in sibling files.
+- **Topic files use the four-type frontmatter** (`user` / `feedback` / `project` / `reference`). cc-autodream's signal almost always maps to `type: feedback`.
+- **cc-autodream never deletes or rewrites an existing 📌 entry.** Hygiene is the janitor's job; we only add.
+- **Optional GC handoff**: if `claude-memory` is on PATH, the nightly runner triggers `claude-memory gc` for each project where it added a pin so the consolidator can resettle around the new entries. Disable with `AUTODREAM_GC=0`. If `claude-memory` isn't installed, the step is a silent no-op.
 
 ## Architecture
 
