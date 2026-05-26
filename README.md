@@ -40,25 +40,23 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.autodream.plist
 
 Requires `claude` CLI on PATH (default expected at `$HOME/.local/bin/claude` — override with `CLAUDE_BIN`).
 
-## How it relates to Claude Code's built-in Auto Dream
+## How it relates to memory-consolidation tooling
 
-Claude Code v5.3+ ships [a built-in Auto Dream feature](https://claudefa.st/blog/guide/mechanics/auto-dream) that *consolidates memory*: it prunes stale MEMORY.md entries, resolves contradictions, and reorganizes the index. It runs on a 24h + 5-session trigger.
+[`claudefa.st` describes an "Auto Dream" feature](https://claudefa.st/blog/guide/mechanics/auto-dream) for *consolidating memory* — pruning stale `MEMORY.md` entries, resolving contradictions, reorganizing the index — but as of `claude` `2.1.150` it isn't a feature shipped in the official Claude Code CLI. The role it describes is currently filled by community plugins. The most common one in this ecosystem is [`cc-simple-memory`](https://github.com/STRML/cc-simple-memory), whose `gc-memory.sh` runs an Opus-driven prune/merge pass on `MEMORY.md` (and an `ARCHIVE.md` cold-storage file) and respects the 📌 pin marker.
 
-cc-autodream solves a different problem. The built-in consolidator is a **memory garbage collector**; cc-autodream is a **signal extractor**. The two are designed to be symbiotic:
+cc-autodream solves a different problem from any of these. Memory consolidators are **garbage collectors**; cc-autodream is a **signal extractor**. The two are designed to be symbiotic:
 
-| | claudefa.st Auto Dream (built-in) | cc-simple-memory `gc-memory.sh` | **cc-autodream (this repo)** |
-|---|---|---|---|
-| Reads | MEMORY.md, transcripts (narrow) | MEMORY.md, ARCHIVE.md | full session JSONLs, fan-out across all of yesterday's sessions |
-| Writes | MEMORY.md (prune/merge) | MEMORY.md (prune/merge), ARCHIVE.md | `dreams/YYYY-MM-DD.md`, MEMORY.md (📌 add) |
-| Trigger | 24h + 5 sessions | every 10 extractions | nightly launchd at 03:15 |
-| Cares about | hygiene | hygiene | discovery |
-| Output for the human | none | none | daily report + interactive triage |
+| | memory consolidator (e.g. cc-simple-memory `gc-memory.sh`) | **cc-autodream (this repo)** |
+|---|---|---|
+| Reads | `MEMORY.md`, `ARCHIVE.md`, narrow transcript slices | full session JSONLs, fan-out across all of yesterday's sessions |
+| Writes | `MEMORY.md` (prune/merge), `ARCHIVE.md` (cold storage) | `dreams/YYYY-MM-DD.md`, `MEMORY.md` (📌 add only) |
+| Trigger | every N extractions, or on demand | nightly launchd at 03:15 |
+| Cares about | hygiene | discovery |
+| Output for the human | none | daily report + interactive triage |
 
-**The contract that makes them play nice**: cc-autodream pins everything it writes with the 📌 marker, and never deletes or rewrites a pinned entry. Both consolidators respect 📌 pins (will not prune them). So cc-autodream adds high-signal pins; the consolidators groom everything else around them.
+**The contract that makes them play nice**: cc-autodream pins everything it writes with the 📌 marker, and never deletes or rewrites a pinned entry. Consolidators that respect 📌 (cc-simple-memory does) will not prune cc-autodream's entries. So cc-autodream adds high-signal pins; the consolidator grooms everything else around them.
 
-If the built-in Auto Dream is active on your install (`/memory` will show `Auto-dream: on`), you don't need to disable it — cc-autodream's writes survive its passes. If `cc-simple-memory` is installed, same story.
-
-If neither is installed, you have signal without hygiene. That's fine — your `MEMORY.md` files will grow until something prunes them, but cc-autodream itself caps additions at high-confidence/high-severity (typically 0–2 per day).
+If `claude-memory` (cc-simple-memory's CLI) is on PATH and Layer 2 touched any project memory, `run.sh` triggers `claude-memory gc` for each touched project so the consolidator can resettle around the new pins. Disable with `AUTODREAM_GC=0`. If `claude-memory` isn't installed, that step is a silent no-op — the rest of the pipeline (Layer 1 + Layer 2 + report + notify) runs identically. `MEMORY.md` files will grow over time without a consolidator, but cc-autodream itself caps additions at high-confidence/high-severity (typically 0–2 per day), so you can defer installing one.
 
 ## Architecture
 
