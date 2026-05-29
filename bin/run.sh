@@ -87,20 +87,44 @@ EOF
 
     [ -s "$output" ] && exit 0  # idempotent
 
-    prompt=$(printf "SESSION_PATH=%s\nOUTPUT_PATH=%s\n\n" "$session" "$output")
-    prompt="${prompt}$(cat "$AUTODREAM_DIR/SESSION_TRIAGE.md")"
+    # Validate the session is readable BEFORE spawning a worker. A path that find
+    # enumerated but that is gone/unreadable by dispatch time otherwise sends the
+    # worker into a cat/wc/Read retry loop. Emit a structured error record instead;
+    # this is deterministic, so leaving it in $output (idempotent-skipped on re-run)
+    # is correct — retrying would not help.
+    if [ ! -r "$session" ]; then
+      printf "{\"session_path\":\"%s\",\"error\":\"session file not readable at dispatch\",\"findings\":[]}\n" "$session" > "$output"
+      rm -f "$errlog"
+      echo "skip (unreadable): $session ($hash)" >&2
+      exit 0
+    fi
 
-    printf "%s" "$prompt" | "$CLAUDE_BIN" \
+    # Pass the paths as LITERAL data (not KEY=value) so the worker hands them
+    # straight to the Read/Write tools and never tries to $-expand them in a shell
+    # (there is no such env var, so it would expand to nothing and fail — exactly
+    # the failure mode that broke earlier runs). Assemble via a brace group piped
+    # straight to claude: a `prompt=$(...)` capture strips the trailing newlines,
+    # which would glue the SESSION_TRIAGE.md body onto the end of the output-path
+    # line and corrupt it. The printf keeps its blank-line separator this way.
+    {
+      printf "Session transcript to analyze (literal absolute path): %s\n" "$session"
+      printf "Write your findings JSON to this literal absolute path: %s\n\n" "$output"
+      cat "$AUTODREAM_DIR/SESSION_TRIAGE.md"
+    } | "$CLAUDE_BIN" \
       --print \
       --permission-mode bypassPermissions \
       --model claude-haiku-4-5 \
-      --append-system-prompt "Headless triage worker. Write JSON to OUTPUT_PATH via the Write tool. Print only the literal word done and exit." \
+      --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
       > /dev/null 2> "$errlog"
 
     if [ -s "$output" ]; then
       rm -f "$errlog"
       echo "ok: $session ($hash)"
     else
+      # Worker exited without writing findings JSON. Record a diagnostic so the
+      # failure is visible (no more silent zero-byte .err files). Leave $output
+      # absent so a re-run retries this (possibly transient) session.
+      printf "worker produced no findings JSON for %s (incomplete run: claude exited without writing output)\n" "$session" >> "$errlog"
       echo "FAIL: $session ($hash) — see $errlog" >&2
     fi
   ' _ {}
@@ -114,14 +138,19 @@ EOF
   log "L2 aggregation starting..."
   L2_START=$(date +%s)
 
-  prompt=$(printf "FINDINGS_DIR=%s\nREPORT_PATH=%s\n\n" "$FINDINGS_DIR" "$REPORT_PATH")
-  prompt="${prompt}$(cat "$AUTODREAM_DIR/PROMPT.md")"
-
-  printf "%s" "$prompt" | "$CLAUDE_BIN" \
+  # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
+  # comment): keep the paths as literal data the aggregator hands to Glob/Read/Write,
+  # and preserve the blank-line separator before PROMPT.md instead of letting a
+  # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
+  {
+    printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
+    printf "Write the report to this literal absolute path: %s\n\n" "$REPORT_PATH"
+    cat "$AUTODREAM_DIR/PROMPT.md"
+  } | "$CLAUDE_BIN" \
     --print \
     --permission-mode bypassPermissions \
     --model claude-opus-4-7 \
-    --append-system-prompt "Headless aggregator. Read findings JSONs from FINDINGS_DIR. Write the report to REPORT_PATH via Write. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
+    --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
 
   L2_RC=$?
   L2_ELAPSED=$(( $(date +%s) - L2_START ))

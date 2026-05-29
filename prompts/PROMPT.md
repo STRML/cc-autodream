@@ -4,15 +4,19 @@ You are running headlessly at ~3am. Layer 1 (haiku, fanned out one-per-session) 
 
 ## Inputs (first two lines of this prompt)
 
+The first two lines give you two **literal absolute paths**:
+
 ```
-FINDINGS_DIR=/absolute/path/to/findings/YYYY-MM-DD
-REPORT_PATH=/absolute/path/to/dreams/YYYY-MM-DD.md
+Findings directory to aggregate (literal absolute path): /absolute/path/to/findings/YYYY-MM-DD
+Write the report to this literal absolute path: /absolute/path/to/dreams/YYYY-MM-DD.md
 ```
 
-Read those two values. All other inputs you need:
+These are plain text values, **not shell variables**. Use them as literal paths with the Glob, Read, and Write tools; never write `$FINDINGS_DIR`, `$REPORT_PATH`, or any `$NAME` in a Bash command — no such environment variable is set, so it expands to nothing and the command fails.
 
-- **Per-session findings JSONs**: every file matching `$FINDINGS_DIR/*.json` is one session's structured output (schema in `SESSION_TRIAGE.md`). Read them all.
-- **Per-session stderr**: `$FINDINGS_DIR/*.json.err` if a triage call failed — note in your report.
+All other inputs you need (treat `<findings-dir>` below as the literal path from line 1):
+
+- **Per-session findings JSONs**: every file matching `<findings-dir>/*.json` (Glob it) is one session's structured output (schema in `SESSION_TRIAGE.md`). Read them all.
+- **Per-session stderr**: `<findings-dir>/*.json.err` if a triage call failed — note in your report.
 - **Installed skills**: walk `~/.claude/skills/`, `~/.claude/plugins/*/skills/`, and project `.claude/skills/`. Each has frontmatter `description`/triggers. Use this to validate `missed_skill` findings (skill exists? trigger matches?).
 - **Memory files**: `~/.claude/projects/*/memory/MEMORY.md` (one per project — may not exist).
 - **Global rules**: `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`.
@@ -69,7 +73,7 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 - Each MEMORY.md line is an **index entry**, not a full memory body. Hold it under ~150 characters: one-line pointer that can include a markdown link to a topic file. (claude-dream and Anthropic's auto-dream both groom on this contract — staying within it makes your pins survive their passes.)
 - When you write a longer-form memory body, put it in a topic file alongside MEMORY.md with frontmatter `type: feedback` (or `project` / `reference` where applicable — match Anthropic's four-type taxonomy: `user`, `feedback`, `project`, `reference`). cc-autodream's signal almost always maps to `type: feedback`.
 - Record EVERY edit in the report's "Auto-applied: yes" lines.
-- **Sidecar for the GC step**: every time you write to a project's `MEMORY.md`, append the project's encoded directory name (the `<encoded-cwd>` segment of the path) as a new line in `$FINDINGS_DIR/touched-projects.txt`. The runner reads this file after you exit and triggers `claude-memory gc` for each listed project so the consolidator can resettle around your new pins. If you didn't touch any project memory, don't create the file.
+- **Sidecar for the GC step**: every time you write to a project's `MEMORY.md`, append the project's encoded directory name (the `<encoded-cwd>` segment of the path) as a new line in a `touched-projects.txt` file inside the findings directory (the literal path from line 1). The runner reads this file after you exit and triggers `claude-memory gc` for each listed project so the consolidator can resettle around your new pins. If you didn't touch any project memory, don't create the file.
 
 ### 3. Anything you may NOT edit
 
@@ -80,12 +84,12 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 
 ## How to start
 
-1. Read `FINDINGS_DIR/*.json` (use Glob then Read).
+1. Read the findings directory's `*.json` files (use Glob then Read).
 2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity).
 3. Walk installed skills (Glob `~/.claude/skills/*/SKILL.md` etc., Read frontmatter).
-4. Write the report to `REPORT_PATH`.
+4. Write the report to the literal report path from line 2.
 5. For each high-confidence high-severity recurring finding, update the matching project's MEMORY.md.
-6. Print: `report: <REPORT_PATH>` then a 3-line summary (sessions reviewed, findings, edits made), then exit.
+6. Print: `report: <report-path>` (the literal path from line 2) then a 3-line summary (sessions reviewed, findings, edits made), then exit.
 
 ## Style
 

@@ -4,16 +4,20 @@ You are processing ONE Claude Code session transcript and emitting structured fi
 
 ## Inputs (first two lines of this prompt)
 
+The first two lines give you two **literal absolute paths**:
+
 ```
-SESSION_PATH=/absolute/path/to/session.jsonl
-OUTPUT_PATH=/absolute/path/where/to/write/findings.json
+Session transcript to analyze (literal absolute path): /absolute/path/to/session.jsonl
+Write your findings JSON to this literal absolute path: /absolute/path/to/findings.json
 ```
 
-Read those two values. Then:
+These are plain text values, **not shell variables**. Pass each path directly to the Read and Write tools as a literal string. Never write `$SESSION_PATH`, `$OUTPUT_PATH`, or any `$NAME` in a Bash command — no such environment variable is set, so it expands to nothing and the command fails. You do not need Bash for this task at all; the Read and Write tools are sufficient.
 
-1. **Read the session file** at `SESSION_PATH` with the Read tool. It is JSONL — one JSON object per line. If the file is >10000 lines, sample: head 2000, middle 2000, tail 2000.
+Then:
+
+1. **Read the session transcript** with the Read tool, using the literal path from line 1. It is JSONL — one JSON object per line. If it is larger than ~2000 lines, read it in chunks with the Read tool's `offset`/`limit` (e.g. the first 2000, a middle 2000, and the last 2000 lines) rather than all at once. **Cap: do not retry a failed Read with progressively smaller limits more than once** — if Read still errors, proceed with whatever you have already read rather than looping (the read-shrink-retry loop has wasted entire runs before).
 2. **Extract structured findings** per the schema below.
-3. **Write the JSON** to `OUTPUT_PATH` with the Write tool — exactly one JSON object, no prose around it.
+3. **Write the JSON** with the Write tool to the literal output path from line 2 — exactly one JSON object, no prose around it.
 4. Print `done` and exit. No commentary.
 
 ## What to look for
@@ -71,7 +75,7 @@ Cap findings at 10 per session — pick the highest-severity ones.
 
 ## Important
 
-- Do NOT use search-sessions, grep across other sessions, or read any file besides the one at SESSION_PATH (you have just this session's scope).
-- Do NOT write anywhere except OUTPUT_PATH.
+- Do NOT use search-sessions, grep across other sessions, or read any file besides the session transcript path you were given (you have just this session's scope).
+- Do NOT write anywhere except the output path you were given.
 - Do NOT update MEMORY.md, CLAUDE.md, or skills — Layer 2 owns aggregation; you only emit signal.
 - Be fast. Aim for <30s per session.
