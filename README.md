@@ -134,12 +134,28 @@ bin/
 prompts/
   SESSION_TRIAGE.md Layer 1 prompt (haiku worker, per-session JSON output schema)
   PROMPT.md         Layer 2 prompt (opus aggregator, report + pinned memory writes)
+tests/
+  run-all.sh        integration tests (drives run.sh against a mock claude)
+  mock-claude.sh    stand-in claude binary used by the tests
 example/
   2026-05-25.md     a real overnight report
 launchd/
   com.user.autodream.plist.example   schedule nightly at 03:15
 install.sh          symlink scripts/prompts into ~/.claude/autodream/
 ```
+
+## Tests
+
+```
+tests/run-all.sh
+```
+
+Integration tests that run the real `bin/run.sh` end-to-end against a mock
+`claude` binary (`tests/mock-claude.sh`) and fixture session files — no network,
+no model calls. They cover the happy path, unreadable-session validation,
+incomplete worker runs, idempotent re-runs, the no-sessions stub, and a
+regression guard on the literal-path prompt framing (no `KEY=value` / `$VAR`
+shapes that a worker could mistakenly `$`-expand). macOS only (BSD `date`/`touch`).
 
 ## Environment overrides
 
