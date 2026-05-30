@@ -17,3 +17,20 @@ All notable changes to cc-autodream. Format loosely follows Keep a Changelog.
 ### Notes
 - **Do not use `--bare` / `CLAUDE_CODE_SIMPLE`.** Verified they disable OAuth/keychain auth (require an API key) and limit tools to Bash+Edit; the composed flags above are the supported path for subscription users.
 - Tests grew from 6 to 12 cases (changelog window, prune helper, self-session exclusion, L1 flaky retry, idempotency guard, self-audit stats); all offline against the mock claude.
+
+## 2026-05-29
+
+### Fixed
+- **Triage runner hardening.** L1 workers and the L2 aggregator received their paths as `KEY=value` text inlined into the prompt rather than as exported env vars, so any `$SESSION_PATH` / `$FINDINGS_DIR` the model emitted in a shell expanded to nothing and failed; the prompt was also assembled via `prompt=$(printf ...)`, whose trailing-newline strip glued the body onto the output-path line. Paths are now framed as literal absolute data with `$`-expansion explicitly forbidden in the system prompt, sessions are validated (`[ -r ]`) before dispatch, a worker that exits without writing JSON leaves a diagnostic `.json.err` (no more silent zero-byte file) and is left absent so a re-run retries, and the prompt is assembled via a brace-group pipe to preserve the blank-line separator before `SESSION_TRIAGE.md`.
+
+### Added
+- **Integration test suite.** `tests/run-all.sh` drives the real `bin/run.sh` end-to-end with `CLAUDE_BIN` pointed at `tests/mock-claude.sh` and the state/output dirs pointed at per-test fixtures — no network, no model calls. 20 assertions across 6 cases: happy path, unreadable-session validation, incomplete worker run (non-empty `.err`, no output, retriable), idempotent re-run, no-sessions stub, and a regression guard asserting the literal-path prompt framing. macOS only (BSD `date`/`touch`).
+
+## 2026-05-26
+
+### Added
+- **Initial release: cc-autodream two-layer nightly review pipeline.** Layer 1 (haiku, fanned out one per session) reads yesterday's Claude Code session transcripts and emits structured findings JSON. Layer 2 (opus) aggregates into a ranked daily report and pin-marks high-confidence recurring findings into the relevant project's MEMORY.md. A morning `review.sh` launches an interactive Claude session preloaded with the report to walk through open questions one at a time. When cc-simple-memory is installed, the runner triggers a per-project `claude-memory gc` pass at the end so the consolidator can resettle around the new pins.
+- **README FAQ + auto-dream contract alignment.** Restructured the comparison section into an FAQ answering the three questions a reader actually has, anchored in the leaked auto-dream source (`src/services/autoDream/`, `MAX_ENTRYPOINT_LINES = 200`, `MAX_ENTRYPOINT_BYTES = 25_000`), and linked out to claude-dream and cc-simple-memory for the janitor role. PROMPT.md updated so cc-autodream's pins honor the same 200/25KB/150-char index contract and four-type frontmatter taxonomy both consolidators use.
+
+### Changed
+- Dropped a fictional v5.3 version claim from the README.
