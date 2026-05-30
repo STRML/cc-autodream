@@ -320,7 +320,12 @@ EOF
   L1_ELAPSED=$(( $(date +%s) - L1_START ))
   L1_OK=$(ls -1 "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
   L1_FAIL=$(ls -1 "$FINDINGS_DIR"/*.json.err 2>/dev/null | wc -l | tr -d " ")
-  log "L1 done in ${L1_ELAPSED}s: $L1_OK done, $MISSING missing (.err files: $L1_FAIL)"
+  # In-band failures: a worker that ran to completion but couldn't fit the transcript
+  # writes a findings JSON carrying a top-level "error" key (empty findings). These are
+  # NOT .json.err files, so l1_err_files=0 masked them — count them explicitly so the
+  # self-audit can alarm on a high extraction-failure rate (slimming should drive →0).
+  L1_ERRORED=$(grep -l '"error":' "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
+  log "L1 done in ${L1_ELAPSED}s: $L1_OK done ($L1_ERRORED with errors), $MISSING missing (.err files: $L1_FAIL)"
 
   # ---- Self-audit stats: runtime telemetry only the runner can see ----
   # The aggregator can't observe its own machinery — which sessions were autodream's
@@ -335,6 +340,7 @@ EOF
     printf 'l1_rounds_used: %s\n' "$round"
     printf 'l1_rounds_max: %s\n' "$L1_ROUNDS"
     printf 'l1_findings_written: %s\n' "$L1_OK"
+    printf 'l1_findings_with_error: %s\n' "$L1_ERRORED"
     printf 'l1_missing_after_retries: %s\n' "$MISSING"
     printf 'l1_err_files: %s\n' "$L1_FAIL"
     printf 'l1_elapsed_seconds: %s\n' "$L1_ELAPSED"

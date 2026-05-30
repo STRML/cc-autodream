@@ -100,6 +100,7 @@ test_self_audit_stats(){
   assert_file  "$stats" "run-stats.txt written"
   assert_grep  "$stats" 'self_sessions_excluded: 1' "stats record the excluded self-session"
   assert_grep  "$stats" 'sessions_triaged: 1'        "stats record the triaged count"
+  assert_grep  "$stats" 'l1_findings_with_error: 0'  "stats record the in-band error count"
   rm -rf "$root"
 }
 
