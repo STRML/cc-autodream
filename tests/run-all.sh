@@ -24,6 +24,7 @@ assert_file(){     [ -f "$1" ] && ok "$2" || no "$2 (missing: $1)"; }
 assert_no_file(){  [ ! -e "$1" ] && ok "$2" || no "$2 (unexpected: $1)"; }
 assert_nonempty(){ [ -s "$1" ] && ok "$2" || no "$2 (empty/missing: $1)"; }
 assert_grep(){     grep -q "$2" "$1" 2>/dev/null && ok "$3" || no "$3 (no /$2/ in $1)"; }
+assert_nogrep(){   grep -q "$2" "$1" 2>/dev/null && no "$3 (/$2/ unexpectedly in $1)" || ok "$3"; }
 assert_eq(){       [ "$1" = "$2" ] && ok "$3" || no "$3 (got [$1] want [$2])"; }
 
 # Fresh sandbox: projects/ (session inputs) + autodream/ (prompts + state) + dreams/.
@@ -40,8 +41,12 @@ mk_session(){ # $1=root $2=name
   touch -t "$STAMP" "$f"
 }
 hash_of(){ printf '%s' "$1" | shasum -a 1 | cut -c1-12; }
-run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT from caller's env
-  AUTODREAM_GC=0 CLAUDE_BIN="$MOCK" \
+run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog knobs from env
+  # Changelog check defaults OFF so the suite never touches the network; the dedicated
+  # changelog test exports AUTODREAM_CHANGELOG=1 with a local CHANGELOG_REMOTE.
+  # Retry/network knobs forced fast+offline so the suite never sleeps or hits the net.
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" CLAUDE_BIN="$MOCK" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
   PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
 }
@@ -81,6 +86,20 @@ test_incomplete(){
   assert_nonempty "$(fdir "$root")/$h.json.err" ".err is non-empty (no silent zero-byte file)"
   assert_grep     "$(fdir "$root")/$h.json.err" 'incomplete run' ".err carries a diagnostic"
   assert_file     "$root/dreams/$DATE.md"       "L2 still produced the report"
+  rm -rf "$root"
+}
+
+test_self_audit_stats(){
+  echo "# run-stats.txt self-audit telemetry is written"
+  local root; root=$(setup_env); mk_session "$root" real1
+  local sf="$root/projects/proj-a/selfworker.jsonl"
+  printf '{"type":"user","message":{"role":"user","content":"SESSION_PATH=/x/y.jsonl"}}\n{"type":"assistant"}\n' > "$sf"
+  touch -t "$STAMP" "$sf"
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_file  "$stats" "run-stats.txt written"
+  assert_grep  "$stats" 'self_sessions_excluded: 1' "stats record the excluded self-session"
+  assert_grep  "$stats" 'sessions_triaged: 1'        "stats record the triaged count"
   rm -rf "$root"
 }
 
@@ -124,6 +143,97 @@ test_framing(){
   rm -rf "$root"
 }
 
+test_changelog(){
+  echo "# upstream changelog window (offline, local fixture remote)"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+
+  # Build a local 'remote' for anthropics/claude-code: one CHANGELOG commit dated
+  # inside the target day [2020-01-02, 2020-01-03), one dated a month later (out of window).
+  local up="$root/upstream"; mkdir -p "$up"
+  ( cd "$up" && git init -q && git config user.email t@t.invalid && git config user.name t
+    printf '# Changelog\n\n## 2.1.999\n\n- In-window mock feature\n' > CHANGELOG.md
+    git add CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-01-02T12:00:00" GIT_COMMITTER_DATE="2020-01-02T12:00:00" \
+      git commit -q -m 'release 2.1.999'
+    printf '# Changelog\n\n## 2.2.0\n\n- Out-of-window mock feature\n\n## 2.1.999\n\n- In-window mock feature\n' > CHANGELOG.md
+    git add CHANGELOG.md
+    GIT_AUTHOR_DATE="2020-02-01T12:00:00" GIT_COMMITTER_DATE="2020-02-01T12:00:00" \
+      git commit -q -m 'release 2.2.0' )
+
+  export AUTODREAM_CHANGELOG=1 CHANGELOG_REMOTE="$up" CLAUDE_CODE_REPO="$root/cache/cc"
+  run_dream "$root"
+  unset AUTODREAM_CHANGELOG CHANGELOG_REMOTE CLAUDE_CODE_REPO
+
+  local cw="$(fdir "$root")/changelog-window.md"
+  assert_file   "$cw" "changelog-window.md written"
+  assert_grep   "$cw" '2.1.999'              "captures the in-window release"
+  assert_grep   "$cw" 'In-window mock'       "captures the in-window bullet"
+  assert_nogrep "$cw" '2.2.0'                "excludes the out-of-window release"
+  rm -rf "$root"
+}
+
+test_prune_helper(){
+  echo "# prune-self-sessions helper: list / filter / delete"
+  local PR="$REPO/bin/prune-self-sessions.sh"
+  [ -x "$PR" ] || { no "prune helper executable"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$root/projects/-Users-x"
+  local self="$root/projects/-Users-x/self.jsonl" real="$root/projects/-Users-x/real.jsonl"
+  printf '{"type":"user","message":{"role":"user","content":"Session transcript to analyze (literal absolute path): /x"}}\n' > "$self"
+  printf '{"type":"user","message":{"role":"user","content":"fix the bug in foo.ts"}}\n' > "$real"
+
+  local out; out=$(PROJECTS_DIR="$root/projects" "$PR")
+  case "$out" in *self.jsonl*) ok "list includes the self session" ;; *) no "list includes the self session (got [$out])" ;; esac
+  case "$out" in *real.jsonl*) no "list must exclude the real session" ;; *) ok "list excludes the real session" ;; esac
+
+  printf '%s\n%s\n' "$self" "$real" | "$PR" --filter > "$root/filtered.txt"
+  assert_grep   "$root/filtered.txt" 'real.jsonl' "filter keeps the real session"
+  assert_nogrep "$root/filtered.txt" 'self.jsonl' "filter drops the self session"
+
+  PROJECTS_DIR="$root/projects" "$PR" --delete >/dev/null
+  assert_no_file "$self" "self session deleted"
+  assert_file    "$real" "real session kept"
+  rm -rf "$root"
+}
+
+test_self_session_excluded(){
+  echo "# autodream's own transcripts are excluded from triage"
+  local root; root=$(setup_env); mk_session "$root" real1
+  local sf="$root/projects/proj-a/selfworker.jsonl"
+  printf '{"type":"user","message":{"role":"user","content":"SESSION_PATH=/Users/x/.claude/projects/foo/bar.jsonl"}}\n{"type":"assistant"}\n' > "$sf"
+  touch -t "$STAMP" "$sf"
+  run_dream "$root"
+  local hr hs; hr=$(hash_of "$root/projects/proj-a/real1.jsonl"); hs=$(hash_of "$sf")
+  assert_file    "$(fdir "$root")/$hr.json" "real session triaged"
+  assert_no_file "$(fdir "$root")/$hs.json" "self-session excluded (no findings JSON)"
+  assert_grep    "$root/run.out" 'excluded 1 autodream-own' "run log reports the exclusion"
+  rm -rf "$root"
+}
+
+test_l1_retry(){
+  echo "# L1 retries a flaky session and completes it on a later round"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export MOCK_MODE=l1_flaky AUTODREAM_L1_ROUNDS=3; run_dream "$root"; unset MOCK_MODE AUTODREAM_L1_ROUNDS
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  assert_file "$(fdir "$root")/$h.json"  "flaky session produced findings on retry"
+  assert_grep "$root/run.out" 'round 2'  "a second L1 round ran"
+  assert_file "$root/dreams/$DATE.md"    "report still produced"
+  rm -rf "$root"
+}
+
+test_idempotency_guard(){
+  echo "# existing report short-circuits the run (launchd catch-up no-op)"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  printf 'SENTINEL REPORT' > "$root/dreams/$DATE.md"
+  run_dream "$root"
+  assert_eq   "$(cat "$root/dreams/$DATE.md")" "SENTINEL REPORT" "existing report left untouched"
+  assert_grep "$root/run.out" 'already exists' "run logged the skip"
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  assert_no_file "$(fdir "$root")/$h.json" "no L1 work done when report already exists"
+  rm -rf "$root"
+}
+
 # ---------------------------------------------------------------------------
 
 [ -x "$RUN" ]  || { echo "FATAL: $RUN not executable"; exit 1; }
@@ -137,6 +247,12 @@ test_incomplete
 test_idempotent
 test_no_sessions
 test_framing
+test_changelog
+test_prune_helper
+test_self_session_excluded
+test_l1_retry
+test_idempotency_guard
+test_self_audit_stats
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

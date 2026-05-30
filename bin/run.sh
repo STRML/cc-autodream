@@ -18,6 +18,14 @@
 #   AUTODREAM_DIR  scripts + prompts + state           default: $HOME/.claude/autodream
 #   DREAMS_DIR     where final reports are written     default: $HOME/.claude/dreams
 #   FANOUT         L1 parallelism                      default: 8
+#   AUTODREAM_CHANGELOG  set 0 to skip the upstream-changelog check  default: 1
+#   CLAUDE_CODE_REPO     persistent cache for the claude-code clone  default: $AUTODREAM_DIR/cache/claude-code
+#   CHANGELOG_REMOTE     git remote to clone/pull       default: https://github.com/anthropics/claude-code.git
+#   AUTODREAM_L1_ROUNDS  max L1 retry rounds for missing sessions    default: 5
+#   AUTODREAM_L2_ATTEMPTS max L2 attempts to produce a report        default: 3
+#   AUTODREAM_RETRY_WAIT seconds to pause between retry rounds       default: 60
+#   AUTODREAM_NETCHECK   set 0 to skip waiting-for-network on retry  default: 1
+#   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 
 set -u
 
@@ -36,6 +44,13 @@ REPORT_PATH="$DREAMS_DIR/$TARGET_DATE.md"
 RUN_LOG="$LOG_DIR/run-$TARGET_DATE.log"
 SESSIONS_LIST="$FINDINGS_DIR/sessions.txt"
 
+# Self-session prune helper — single source of truth for "is this autodream's own
+# transcript?". Resolve it next to this script first (works for the repo copy and the
+# ~/.claude/autodream symlink), then fall back to the install dir.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
+[ -x "$PRUNE" ] || PRUNE="$AUTODREAM_DIR/prune-self-sessions.sh"
+
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR"
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -43,42 +58,101 @@ cd "$HOME"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
-run() {
-  log "===== autodream start: $(date) ====="
-  log "target date: $TARGET_DATE"
-  log "findings:    $FINDINGS_DIR"
-  log "report:      $REPORT_PATH"
-  log "fanout:      $FANOUT"
-  log "claude:      $CLAUDE_BIN"
+# ---- Upstream changelog: detect Claude Code releases committed on the target day ----
+# Clones (once) and pulls anthropics/claude-code into a persistent cache, then diffs
+# CHANGELOG.md over [TARGET_DATE, NEXT_DATE) by real commit date and writes the inserted
+# entries into the findings dir for Layer 2 to read. There is no remote `git blame`/`log`,
+# so we keep a persistent local cache (not a tmpdir): nightly cost is one delta `git pull`.
+# git is the only dependency. Any failure is recorded in the output file, never aborts the
+# pipeline. Window matches the session scan exactly, so each release is reported once.
+# Disable with AUTODREAM_CHANGELOG=0; point CHANGELOG_REMOTE at a local repo for offline tests.
+changelog_window() {
+  local out="$FINDINGS_DIR/changelog-window.md"
+  [ "${AUTODREAM_CHANGELOG:-1}" != "0" ] || { log "changelog check disabled (AUTODREAM_CHANGELOG=0)"; return 0; }
+  command -v git >/dev/null 2>&1 || { log "changelog: git not found; skipping"; return 0; }
 
-  [ -x "$CLAUDE_BIN" ] || { log "FATAL: claude not at $CLAUDE_BIN"; exit 1; }
+  local remote="${CHANGELOG_REMOTE:-https://github.com/anthropics/claude-code.git}"
+  local repo="${CLAUDE_CODE_REPO:-$AUTODREAM_DIR/cache/claude-code}"
 
-  # ---- Enumerate sessions modified during the target day ----
-  log "scanning $PROJECTS_DIR for sessions modified between $TARGET_DATE and $NEXT_DATE..."
-  find "$PROJECTS_DIR" -type f -name '*.jsonl' \
-       -newermt "$TARGET_DATE 00:00:00" \
-       ! -newermt "$NEXT_DATE 00:00:00" \
-       2>/dev/null > "$SESSIONS_LIST"
-  COUNT=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
-  log "found $COUNT session files"
-
-  if [ "$COUNT" -eq 0 ]; then
-    log "no sessions to triage; writing stub report and exiting"
-    cat > "$REPORT_PATH" <<EOF
-# Autodream — $TARGET_DATE
-
-No Claude Code sessions were modified on this date.
-
-(Generated $(date -u +%Y-%m-%dT%H:%M:%SZ))
-EOF
-    return 0
+  if [ -d "$repo/.git" ]; then
+    log "changelog: updating cache ($repo)..."
+    if ! ( cd "$repo" && git pull --ff-only --quiet ) 2>>"$RUN_LOG"; then
+      log "changelog: pull failed"
+      printf '# Claude Code changelog\n\nGit pull failed; upstream changes not checked this run.\n' > "$out"
+      return 0
+    fi
+  else
+    log "changelog: cloning $remote -> $repo..."
+    rm -rf "$repo"
+    if ! git clone --quiet "$remote" "$repo" 2>>"$RUN_LOG"; then
+      log "changelog: clone failed"
+      printf '# Claude Code changelog\n\nGit clone failed; upstream changes not checked this run.\n' > "$out"
+      return 0
+    fi
   fi
 
-  # ---- Layer 1: haiku triage, parallel ----
-  log "L1 triage starting (fanout=$FANOUT)..."
-  L1_START=$(date +%s)
+  local head_sha n added
+  head_sha=$( cd "$repo" && git rev-parse --short HEAD 2>/dev/null ) || head_sha="?"
+  n=$( cd "$repo" && git log --format=%H \
+         --since="$TARGET_DATE 00:00:00" --until="$NEXT_DATE 00:00:00" \
+         -- CHANGELOG.md 2>/dev/null | wc -l | tr -d ' ' )
+  # Inserted changelog lines (new version headers + bullets), oldest-first; strip the
+  # diff's leading '+' but drop the '+++ b/CHANGELOG.md' file header.
+  added=$( cd "$repo" && git log -p --reverse \
+             --since="$TARGET_DATE 00:00:00" --until="$NEXT_DATE 00:00:00" \
+             -- CHANGELOG.md 2>/dev/null \
+           | grep '^+' | grep -v '^+++' | sed 's/^+//' )
 
-  export CLAUDE_BIN AUTODREAM_DIR FINDINGS_DIR
+  if [ "${n:-0}" -gt 0 ] && [ -n "$added" ]; then
+    {
+      printf '# Claude Code changelog — commits in [%s, %s)\n' "$TARGET_DATE" "$NEXT_DATE"
+      printf '# Source: %s @ %s\n' "$remote" "$head_sha"
+      printf '# Commits touching CHANGELOG.md in window: %s\n\n' "$n"
+      printf '%s\n' "$added"
+    } > "$out"
+    log "changelog: $n commit(s) in window -> $out"
+  else
+    printf '# Claude Code changelog — commits in [%s, %s)\n# Source: %s @ %s\n\nNo changelog commits in this window.\n' \
+      "$TARGET_DATE" "$NEXT_DATE" "$remote" "$head_sha" > "$out"
+    log "changelog: no commits in window"
+  fi
+}
+
+# ---- Sleep/network resilience helpers ----
+# A laptop that sleeps mid-run loses the network and whole batches of workers fail
+# (this is the common overnight failure: started on a brief wake, slept through the
+# run, ~half the workers errored, L2 produced no report). The L1 worker is already
+# idempotent — a session with a findings JSON is skipped — so we can just re-dispatch
+# the still-missing sessions across wake/sleep cycles until they all land, and retry
+# L2 until a report exists. Tunable; network-wait/sleep are disabled in tests.
+
+net_up() { # exit 0 if the API host is reachable (any HTTP code beats "000" = no route)
+  local code
+  code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>/dev/null)
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+wait_for_network() { # block until net_up (capped); no-op when AUTODREAM_NETCHECK=0
+  [ "${AUTODREAM_NETCHECK:-1}" != "0" ] || return 0
+  local waited=0 cap="${AUTODREAM_NETCHECK_CAP:-1800}"
+  while ! net_up; do
+    [ "$waited" -ge "$cap" ] && { log "network still down after ~${cap}s of checks; proceeding anyway"; return 0; }
+    log "waiting for network to return... (${waited}s)"
+    sleep 15; waited=$((waited + 15))
+  done
+}
+
+l1_missing_count() { # count sessions in $SESSIONS_LIST that still have no findings JSON
+  local m=0 s h
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    h=$(printf "%s" "$s" | shasum -a 1 | cut -c1-12)
+    [ -s "$FINDINGS_DIR/$h.json" ] || m=$((m + 1))
+  done < "$SESSIONS_LIST"
+  printf '%s' "$m"
+}
+
+dispatch_l1() { # one parallel pass; idempotent worker → only the still-missing sessions run
   < "$SESSIONS_LIST" xargs -P "$FANOUT" -I {} bash -c '
     session="$1"
     hash=$(printf "%s" "$session" | shasum -a 1 | cut -c1-12)
@@ -114,6 +188,11 @@ EOF
       --print \
       --permission-mode bypassPermissions \
       --model claude-haiku-4-5 \
+      --no-session-persistence \
+      --tools Read Write \
+      --disable-slash-commands \
+      --strict-mcp-config \
+      --settings "{\"disableAllHooks\":true}" \
       --append-system-prompt "Headless triage worker. Read the session transcript and write exactly one findings JSON object, via the Write tool, to the literal output path given on line 2 of the prompt. Those paths are literal strings, not shell variables — never \$-expand them. Print only the literal word done and exit." \
       > /dev/null 2> "$errlog"
 
@@ -128,33 +207,152 @@ EOF
       echo "FAIL: $session ($hash) — see $errlog" >&2
     fi
   ' _ {}
+}
 
+run() {
+  log "===== autodream start: $(date) ====="
+  log "target date: $TARGET_DATE"
+  log "findings:    $FINDINGS_DIR"
+  log "report:      $REPORT_PATH"
+  log "fanout:      $FANOUT"
+  log "claude:      $CLAUDE_BIN"
+
+  [ -x "$CLAUDE_BIN" ] || { log "FATAL: claude not at $CLAUDE_BIN"; exit 1; }
+
+  # ---- Idempotency guard: a finished report means we're done ----
+  # A report is only written after a successful L2, so its presence means the date is
+  # complete. This makes launchd catch-up/relaunch (the sleep-resilience strategy:
+  # multiple wake-time triggers) cheap no-ops once the night succeeded. A run that
+  # failed overnight left NO report, so it correctly proceeds and finishes the work.
+  if [ -s "$REPORT_PATH" ] && [ "${AUTODREAM_FORCE:-0}" != "1" ]; then
+    log "report already exists for $TARGET_DATE ($REPORT_PATH); nothing to do (AUTODREAM_FORCE=1 to rebuild)"
+    return 0
+  fi
+
+  # ---- Enumerate sessions modified during the target day ----
+  log "scanning $PROJECTS_DIR for sessions modified between $TARGET_DATE and $NEXT_DATE..."
+  find "$PROJECTS_DIR" -type f -name '*.jsonl' \
+       -newermt "$TARGET_DATE 00:00:00" \
+       ! -newermt "$NEXT_DATE 00:00:00" \
+       2>/dev/null > "$SESSIONS_LIST.raw"
+  RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
+
+  # Exclude autodream's OWN headless worker/aggregator transcripts. New runs leave none
+  # (--no-session-persistence), but runs predating that fix littered ~/.claude/projects/
+  # and those files must not be re-triaged. The prune helper owns the predicate; if it's
+  # missing, fall back to the raw list rather than silently dropping real sessions.
+  if [ -x "$PRUNE" ]; then
+    "$PRUNE" --filter < "$SESSIONS_LIST.raw" > "$SESSIONS_LIST" 2>/dev/null || cp "$SESSIONS_LIST.raw" "$SESSIONS_LIST"
+  else
+    cp "$SESSIONS_LIST.raw" "$SESSIONS_LIST"
+  fi
+  COUNT=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
+  EXCLUDED=$(( RAW - COUNT ))
+  log "found $RAW session files; excluded $EXCLUDED autodream-own; $COUNT to triage"
+
+  if [ "$COUNT" -eq 0 ]; then
+    log "no sessions to triage; writing stub report and exiting"
+    cat > "$REPORT_PATH" <<EOF
+# Autodream — $TARGET_DATE
+
+No Claude Code sessions were modified on this date.
+
+(Generated $(date -u +%Y-%m-%dT%H:%M:%SZ))
+EOF
+    return 0
+  fi
+
+  # ---- Layer 1: haiku triage, parallel, retried across sleep/network gaps ----
+  # Lean-query env (claude-cells internal/claude/query.go pattern): keep subscription
+  # OAuth auth but strip per-call bloat — no CLAUDE.md auto-load, no telemetry/error
+  # reporting. Combined with the per-call flags (--no-session-persistence, --tools,
+  # --disable-slash-commands, --strict-mcp-config, --settings disableAllHooks) this is
+  # the token-minimal footprint WITHOUT --bare (which would disable OAuth/keychain auth
+  # and require an API key). Exported once so both the L1 xargs subshells and the L2
+  # call inherit it.
+  export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1
+  export CLAUDE_BIN AUTODREAM_DIR FINDINGS_DIR
+
+  L1_START=$(date +%s)
+  L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-5}"
+  MISSING=$COUNT
+  for round in $(seq 1 "$L1_ROUNDS"); do
+    log "L1 triage round $round/$L1_ROUNDS (fanout=$FANOUT)..."
+    dispatch_l1
+    MISSING=$(l1_missing_count)
+    L1_DONE=$(ls -1 "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
+    log "L1 round $round: $L1_DONE done, $MISSING still missing"
+    [ "$MISSING" -eq 0 ] && break
+    if [ "$round" -lt "$L1_ROUNDS" ]; then
+      log "L1 retrying $MISSING missing session(s) after a network/sleep check..."
+      wait_for_network
+      sleep "${AUTODREAM_RETRY_WAIT:-60}"
+    fi
+  done
   L1_ELAPSED=$(( $(date +%s) - L1_START ))
   L1_OK=$(ls -1 "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
   L1_FAIL=$(ls -1 "$FINDINGS_DIR"/*.json.err 2>/dev/null | wc -l | tr -d " ")
-  log "L1 done in ${L1_ELAPSED}s: $L1_OK ok, $L1_FAIL failed"
+  log "L1 done in ${L1_ELAPSED}s: $L1_OK done, $MISSING missing (.err files: $L1_FAIL)"
 
-  # ---- Layer 2: opus aggregate ----
-  log "L2 aggregation starting..."
-  L2_START=$(date +%s)
-
-  # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
-  # comment): keep the paths as literal data the aggregator hands to Glob/Read/Write,
-  # and preserve the blank-line separator before PROMPT.md instead of letting a
-  # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
+  # ---- Self-audit stats: runtime telemetry only the runner can see ----
+  # The aggregator can't observe its own machinery — which sessions were autodream's
+  # own (already excluded), how many workers failed, how many retry rounds it took.
+  # Surface it so PROMPT.md's "Autodream self-audit" section can flag regressions
+  # (e.g. the self-pollution exclusion count climbing again) and propose source fixes.
   {
-    printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
-    printf "Write the report to this literal absolute path: %s\n\n" "$REPORT_PATH"
-    cat "$AUTODREAM_DIR/PROMPT.md"
-  } | "$CLAUDE_BIN" \
-    --print \
-    --permission-mode bypassPermissions \
-    --model claude-opus-4-7 \
-    --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
+    printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
+    printf 'sessions_found_raw: %s\n' "$RAW"
+    printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
+    printf 'sessions_triaged: %s\n' "$COUNT"
+    printf 'l1_rounds_used: %s\n' "$round"
+    printf 'l1_rounds_max: %s\n' "$L1_ROUNDS"
+    printf 'l1_findings_written: %s\n' "$L1_OK"
+    printf 'l1_missing_after_retries: %s\n' "$MISSING"
+    printf 'l1_err_files: %s\n' "$L1_FAIL"
+    printf 'l1_elapsed_seconds: %s\n' "$L1_ELAPSED"
+  } > "$FINDINGS_DIR/run-stats.txt"
 
-  L2_RC=$?
+  # ---- Upstream changelog window (writes changelog-window.md for L2 to read) ----
+  changelog_window
+
+  # ---- Layer 2: opus aggregate, retried until a report lands ----
+  # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
+  # "no report" overnight). Retry until $REPORT_PATH is non-empty, waiting for the
+  # network between attempts. Idempotent: a re-run overwrites the report harmlessly.
+  L2_ATTEMPTS="${AUTODREAM_L2_ATTEMPTS:-3}"
+  L2_START=$(date +%s)
+  L2_RC=1
+  for attempt in $(seq 1 "$L2_ATTEMPTS"); do
+    log "L2 aggregation attempt $attempt/$L2_ATTEMPTS..."
+    # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
+    # comment): keep the paths as literal data the aggregator hands to Glob/Read/Write,
+    # and preserve the blank-line separator before PROMPT.md instead of letting a
+    # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
+    {
+      printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
+      printf "Write the report to this literal absolute path: %s\n\n" "$REPORT_PATH"
+      cat "$AUTODREAM_DIR/PROMPT.md"
+    } | "$CLAUDE_BIN" \
+      --print \
+      --permission-mode bypassPermissions \
+      --model claude-opus-4-7 \
+      --no-session-persistence \
+      --tools Glob Read Write Edit \
+      --disable-slash-commands \
+      --strict-mcp-config \
+      --settings '{"disableAllHooks":true}' \
+      --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
+
+    L2_RC=$?
+    [ -s "$REPORT_PATH" ] && break
+    log "L2 attempt $attempt wrote no report (exit $L2_RC)"
+    if [ "$attempt" -lt "$L2_ATTEMPTS" ]; then
+      wait_for_network
+      sleep "${AUTODREAM_RETRY_WAIT:-60}"
+    fi
+  done
   L2_ELAPSED=$(( $(date +%s) - L2_START ))
-  log "L2 done in ${L2_ELAPSED}s (exit $L2_RC)"
+  log "L2 done in ${L2_ELAPSED}s (exit $L2_RC, $attempt attempt(s))"
 
   if [ -f "$REPORT_PATH" ]; then
     log "report bytes: $(wc -c < "$REPORT_PATH" | tr -d ' ')"

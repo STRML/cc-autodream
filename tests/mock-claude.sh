@@ -25,9 +25,13 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
     printf '%s\n' "$@" > "$MOCK_CAPTURE_DIR/l1-args.txt"
   fi
   out=$(printf '%s' "$line2" | sed 's/^Write your findings JSON to this literal absolute path: //')
-  if [ "$mode" != "l1_incomplete" ]; then
-    printf '{"session_path":"x","project":"proj-a","turn_count":2,"tool_call_count":0,"tools_used":[],"skills_invoked":[],"models_used":[],"notable_initiatives":[],"findings":[]}' > "$out"
-  fi
+  write_findings() { printf '{"session_path":"x","project":"proj-a","turn_count":2,"tool_call_count":0,"tools_used":[],"skills_invoked":[],"models_used":[],"notable_initiatives":[],"findings":[]}' > "$out"; }
+  case "$mode" in
+    l1_incomplete) : ;;                 # never write — simulates a worker that exits empty
+    l1_flaky)                           # fail the first dispatch per session, succeed on retry
+      if [ -f "$out.attempt" ]; then write_findings; else : > "$out.attempt"; fi ;;
+    *) write_findings ;;
+  esac
   echo done
 else
   # ---- Layer 2: aggregator ----

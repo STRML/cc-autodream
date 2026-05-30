@@ -1,7 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Schedule cc-autodream to run nightly at 03:15 local time.
+  Schedule cc-autodream to run nightly, with catch-up retries for sleep.
+
+  Why several times instead of one: a LaunchAgent with StartCalendarInterval behaves
+  like anacron, not vanilla cron — if the Mac is asleep at the trigger, launchd runs
+  the job once on the next wake. But launchd does NOT wake the Mac, and if the Mac
+  sleeps DURING the run, workers lose the network and fail. So we schedule a few
+  morning triggers (03:15, 06:15, 09:15, 12:15). run.sh is idempotent and guards on a
+  finished report: the first trigger that runs to completion writes the report, and
+  every later trigger that day sees it and exits in a second. A run that failed
+  overnight (no report) is retried by the next trigger. run.sh also retries its own
+  workers across short network/sleep gaps within a single invocation.
+
+  To GUARANTEE the Mac is awake at 03:15 (so the job runs at all), add a scheduled
+  wake — launchd can't do this itself:
+    sudo pmset repeat wake MTWRFSU 03:10:00
 
   Install:
     cp launchd/com.user.autodream.plist.example \
@@ -25,13 +39,14 @@
         <string>$HOME/.claude/autodream/run.sh</string>
     </array>
 
+    <!-- Several catch-up triggers; the idempotency guard makes all-but-one a no-op. -->
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>3</integer>
-        <key>Minute</key>
-        <integer>15</integer>
-    </dict>
+    <array>
+        <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>15</integer></dict>
+    </array>
 
     <key>RunAtLoad</key>
     <false/>

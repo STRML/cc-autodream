@@ -20,6 +20,8 @@ All other inputs you need (treat `<findings-dir>` below as the literal path from
 - **Installed skills**: walk `~/.claude/skills/`, `~/.claude/plugins/*/skills/`, and project `.claude/skills/`. Each has frontmatter `description`/triggers. Use this to validate `missed_skill` findings (skill exists? trigger matches?).
 - **Memory files**: `~/.claude/projects/*/memory/MEMORY.md` (one per project — may not exist).
 - **Global rules**: `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`.
+- **Run self-audit stats**: `<findings-dir>/run-stats.txt`, if present — runtime telemetry the runner captured about *this autodream run itself* (sessions found vs. self-excluded vs. triaged, L1 retry rounds, workers still missing, `.err` count, elapsed). Drives the "Autodream self-audit" report section below.
+- **Changelog window**: `<findings-dir>/changelog-window.md`, if present. The runner already cloned/pulled `anthropics/claude-code` and diffed `CHANGELOG.md` over this report's date window, so this file holds the verbatim new release entries (version headers + bullets) with a few `# `-prefixed comment lines at the top (source, HEAD sha, commit count). Read it and drive the "Upstream Claude Code changes" report section below. The file may say "No changelog commits in this window." or report a clone/fetch failure — handle both per that section.
 
 ## What you produce
 
@@ -35,6 +37,14 @@ Write to `REPORT_PATH`. Overwrite if present (idempotent re-runs are fine). Requ
 - Total turns / tool calls (sum from JSONs)
 - Skills invoked (top 5 by count)
 - Models used (with counts)
+
+## Upstream Claude Code changes
+Read `<findings-dir>/changelog-window.md` (the runner's diff of `anthropics/claude-code`'s `CHANGELOG.md` over this report's date window). For each release entry in it, judge whether it changes how we should operate:
+
+- **Session behavior** — new/renamed skills, flags, slash commands, permission or sandbox defaults, model defaults, or deprecations that should change our habits or the global `CLAUDE.md` / `rules/*.md` guidance.
+- **Active projects** — anything that touches a project that had sessions in *this* run (cross-reference the findings' `project` fields), e.g. a workflow/agent/plugin change for a project built on those features.
+
+Output one bullet per relevant release: `**<version>** — <what changed> → <so-what for us>`. Skip pure bugfixes with no behavioral impact (you may name their versions in a single trailing "also released, no action: …" line). If a release demands a human decision (adopt a new default, rewrite a rule, migrate a project), add it to **Open questions** too. If the file says no commits in the window (or is absent), write "No upstream releases in the window." If it reports a clone/fetch failure, write "Changelog check failed (<reason from the file>); upstream changes not checked this run." and continue.
 
 ## Top patterns (ranked)
 For each, ordered by (count × max-severity) descending, cap at 10:
@@ -56,6 +66,16 @@ Cross-reference `missed_skill` findings against installed skills. If a recurring
 
 ## Triage failures
 Any session whose `.json.err` is non-empty or whose JSON is missing/malformed.
+
+## Autodream self-audit
+cc-autodream is its author's own project — turn the lens on the pipeline itself. Read `<findings-dir>/run-stats.txt` and report on autodream's own health, then propose concrete self-improvements to the cc-autodream source (these are suggestions in the report — you do NOT edit cc-autodream source):
+
+- **Self-pollution watch**: `self_sessions_excluded` is how many of autodream's own `claude --print` worker transcripts the runner filtered out. With `--no-session-persistence` in place this should trend toward 0; a non-trivial or rising count means the fix regressed or a new headless caller is leaking transcripts — flag it and name the likely source.
+- **Pipeline capacity**: if `l1_err_files > 0` or many findings JSONs carry an `error` (e.g. oversized transcripts that exceeded the token budget), call it out with counts and propose the fix in cc-autodream's Layer-1 prompt/script (chunked reads, a `jq` pre-summarizer that strips verbose tool outputs, etc.).
+- **Retry/sleep health**: if `l1_rounds_used` approached `l1_rounds_max` or `l1_missing_after_retries > 0`, the run fought the network/sleep — note it (the laptop likely slept mid-run) and whether the report is complete.
+- **Recurring self-findings**: if cc-autodream sessions themselves surfaced patterns (the author working on the tool), give them first-class weight here rather than burying them in per-project notes.
+
+Keep it to what the stats and findings actually show; skip the section's sub-bullets that have nothing to report. If `run-stats.txt` is absent, say so and move on.
 
 ## Open questions for the user
 Anything ambiguous that needs a human call before being acted on. Group by topic.
@@ -87,9 +107,10 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 1. Read the findings directory's `*.json` files (use Glob then Read).
 2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity).
 3. Walk installed skills (Glob `~/.claude/skills/*/SKILL.md` etc., Read frontmatter).
-4. Write the report to the literal report path from line 2.
-5. For each high-confidence high-severity recurring finding, update the matching project's MEMORY.md.
-6. Print: `report: <report-path>` (the literal path from line 2) then a 3-line summary (sessions reviewed, findings, edits made), then exit.
+4. Read `<findings-dir>/changelog-window.md` (Upstream changes) and `<findings-dir>/run-stats.txt` (Autodream self-audit) if present.
+5. Write the report to the literal report path from line 2.
+6. For each high-confidence high-severity recurring finding, update the matching project's MEMORY.md.
+7. Print: `report: <report-path>` (the literal path from line 2) then a 3-line summary (sessions reviewed, findings, edits made), then exit.
 
 ## Style
 

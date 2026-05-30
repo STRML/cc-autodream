@@ -5,7 +5,7 @@ Nightly background process that reads your Claude Code session transcripts, find
 Two-layer pipeline:
 
 - **Layer 1** — for each of yesterday's session JSONLs, a `claude --model haiku` worker reads the transcript and emits structured findings (JSON). Fanned out in parallel.
-- **Layer 2** — a single `claude --model opus` aggregator reads all Layer-1 JSONs, ranks patterns by `count × severity`, writes a markdown report to `~/.claude/dreams/YYYY-MM-DD.md`, and (only for high-confidence/high-severity recurring findings) adds 📌-pinned entries to the relevant project's `MEMORY.md`.
+- **Layer 2** — a single `claude --model opus` aggregator reads all Layer-1 JSONs, ranks patterns by `count × severity`, writes a markdown report to `~/.claude/dreams/YYYY-MM-DD.md`, and (only for high-confidence/high-severity recurring findings) adds 📌-pinned entries to the relevant project's `MEMORY.md`. `run.sh` also pulls `anthropics/claude-code` into a persistent cache and diffs `CHANGELOG.md` over the report's date window (by real commit date); the aggregator reads that diff and surfaces an "Upstream Claude Code changes" section flagging releases that should change how we work in sessions or affect active projects.
 
 Then in the morning: `review.sh` opens an interactive Claude session preloaded with the report and walks you through the open questions one at a time.
 
@@ -104,9 +104,17 @@ By respecting the same contract Anthropic's auto-dream enforces, so its pins sur
                   │
                   ▼
   ┌──────────────────────────────────────────────┐
+  │ Changelog: git pull anthropics/claude-code   │
+  │   diff CHANGELOG.md over [date, date+1)      │
+  │   → findings/<date>/changelog-window.md      │
+  └──────────────────────────────────────────────┘
+                  │
+                  ▼
+  ┌──────────────────────────────────────────────┐
   │ Layer 2:                                     │
   │   claude --model opus --print                │
   │   with prompts/PROMPT.md                     │
+  │   reads findings + changelog-window.md       │
   │   → dreams/YYYY-MM-DD.md                     │
   │   → projects/*/memory/MEMORY.md (📌 only)    │
   └──────────────────────────────────────────────┘
@@ -131,6 +139,7 @@ bin/
   run.sh            nightly entry point — both layers
   review.sh         interactive morning triage
   notify.sh         extracts open questions → Sublime
+  prune-self-sessions.sh  find/--delete autodream's own worker transcripts; --filter excludes them from triage
 prompts/
   SESSION_TRIAGE.md Layer 1 prompt (haiku worker, per-session JSON output schema)
   PROMPT.md         Layer 2 prompt (opus aggregator, report + pinned memory writes)
@@ -153,9 +162,12 @@ tests/run-all.sh
 Integration tests that run the real `bin/run.sh` end-to-end against a mock
 `claude` binary (`tests/mock-claude.sh`) and fixture session files — no network,
 no model calls. They cover the happy path, unreadable-session validation,
-incomplete worker runs, idempotent re-runs, the no-sessions stub, and a
+incomplete worker runs, idempotent re-runs, the no-sessions stub, a
 regression guard on the literal-path prompt framing (no `KEY=value` / `$VAR`
-shapes that a worker could mistakenly `$`-expand). macOS only (BSD `date`/`touch`).
+shapes that a worker could mistakenly `$`-expand), and the upstream-changelog
+window (driven against a local fixture git remote, so it stays offline and
+asserts that in-window releases are captured and out-of-window ones excluded).
+macOS only (BSD `date`/`touch`).
 
 ## Environment overrides
 
@@ -169,10 +181,30 @@ All optional; defaults work for a vanilla Claude Code install on macOS.
 | `DREAMS_DIR` | `$HOME/.claude/dreams` | where final reports are written |
 | `FANOUT` | `8` | Layer 1 parallelism |
 | `SUBL` | `$HOME/bin/subl` then PATH | Sublime Text CLI for `notify.sh` |
+| `AUTODREAM_CHANGELOG` | `1` | set `0` to skip the upstream-changelog check |
+| `CLAUDE_CODE_REPO` | `$AUTODREAM_DIR/cache/claude-code` | persistent cache for the `anthropics/claude-code` clone |
+| `CHANGELOG_REMOTE` | `https://github.com/anthropics/claude-code.git` | git remote to clone/pull for the changelog |
+
+## Lean workers, and not eating your own tail
+
+Each layer shells out to `claude --print`, and two things matter for cost and correctness:
+
+**No self-pollution.** A `claude --print` call persists its own session JSONL into `~/.claude/projects/`. Left unchecked, last night's ~190 worker transcripts become tonight's "sessions to triage" — ~90% of the corpus is autodream looking at itself. Both layers now pass `--no-session-persistence`, so new runs leave no transcript. For transcripts left by older runs, the enumeration step pipes the session list through `prune-self-sessions.sh --filter` (which recognizes autodream's own inlined prompts) so they're never triaged. Clean up the backlog on disk with `prune-self-sessions.sh` (dry-run) then `--delete`.
+
+**Minimal footprint, subscription auth preserved.** The workers don't need your hooks, skills, MCP servers, or `CLAUDE.md`. Rather than `--bare` / `CLAUDE_CODE_SIMPLE` — which on a keychain host disable OAuth and demand an `ANTHROPIC_API_KEY` — each call composes the individual lean flags (the `claude-cells` `internal/claude/query.go` pattern), which keep subscription auth:
+
+```
+--no-session-persistence            # no transcript
+--tools Read Write                  # L1 (L2: Glob Read Write Edit) — only what's needed
+--disable-slash-commands            # no skills
+--strict-mcp-config                 # no MCP servers
+--settings '{"disableAllHooks":true}'   # no hooks (incl. SessionStart injection)
+```
+plus env `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1`.
 
 ## Costs
 
-Per nightly run, very rough order-of-magnitude on a typical 50-session day:
+Per nightly run, very rough order-of-magnitude on a typical 50-session day (after self-session exclusion):
 
 - Layer 1: ~50 × haiku, each ~3-15k input tokens, ~500 output. With prompt caching: ~$0.20–0.50/day.
 - Layer 2: 1 × opus, ~50–100k input (all findings) + 5–10k output. Without caching: ~$1–2/day.
@@ -184,6 +216,7 @@ Tune `FANOUT` down if you hit rate limits; the worker is idempotent (re-running 
 - macOS only as written (uses `date -v-1d`, BSD `xargs`, BSD `find -newermt`). Linux port is trivial — swap `date -v-1d +%Y-%m-%d` for `date -d yesterday +%Y-%m-%d`.
 - Requires `bypassPermissions` mode for both layers (workers need to Write into `findings/`, aggregator needs to Edit project MEMORY.md files). Don't run this in a shared environment.
 - The report can be opinionated. The Layer-2 prompt instructs it to skip findings whose only proposed action is vague — but you should still read critically before acting on memory writes.
+- The upstream-changelog step needs `git` and network at run time to clone/pull `anthropics/claude-code`. It degrades gracefully — a clone/pull failure (or `AUTODREAM_CHANGELOG=0`) just writes a note into `changelog-window.md` and the run continues. The cache persists between runs, so steady-state cost is one delta fetch.
 
 ## License
 
