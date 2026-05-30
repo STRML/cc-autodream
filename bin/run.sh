@@ -26,6 +26,7 @@
 #   AUTODREAM_RETRY_WAIT seconds to pause between retry rounds       default: 60
 #   AUTODREAM_NETCHECK   set 0 to skip waiting-for-network on retry  default: 1
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
+#   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
 
 set -u
 
@@ -50,6 +51,9 @@ SESSIONS_LIST="$FINDINGS_DIR/sessions.txt"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
 [ -x "$PRUNE" ] || PRUNE="$AUTODREAM_DIR/prune-self-sessions.sh"
+# Oversized-transcript slimmer (resolved the same way; exported to the L1 workers).
+SLIM="$SCRIPT_DIR/slim-transcript.sh"
+[ -x "$SLIM" ] || SLIM="$AUTODREAM_DIR/slim-transcript.sh"
 
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR"
 
@@ -173,6 +177,23 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       exit 0
     fi
 
+    # Oversized transcripts (multi-MB, base64 images, giant tool outputs) blow the
+    # worker token budget so it errors out instead of triaging. Slim those first and
+    # point the worker at the reduced copy; small sessions are read verbatim. The
+    # findings session_path is rewritten back to the original after a successful run.
+    readpath="$session"
+    slimfile=""
+    sz=$(wc -c < "$session" | tr -d " ")
+    if [ "${sz:-0}" -gt "${AUTODREAM_SLIM_BYTES:-262144}" ] && [ -x "$SLIM" ]; then
+      slimfile="$FINDINGS_DIR/$hash.slim.jsonl"
+      if "$SLIM" "$session" "$slimfile" 2>/dev/null && [ -s "$slimfile" ]; then
+        readpath="$slimfile"
+        echo "slimmed: $session ($sz bytes) ($hash)" >&2
+      else
+        rm -f "$slimfile"; slimfile=""
+      fi
+    fi
+
     # Pass the paths as LITERAL data (not KEY=value) so the worker hands them
     # straight to the Read/Write tools and never tries to $-expand them in a shell
     # (there is no such env var, so it would expand to nothing and fail — exactly
@@ -181,7 +202,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     # which would glue the SESSION_TRIAGE.md body onto the end of the output-path
     # line and corrupt it. The printf keeps its blank-line separator this way.
     {
-      printf "Session transcript to analyze (literal absolute path): %s\n" "$session"
+      printf "Session transcript to analyze (literal absolute path): %s\n" "$readpath"
       printf "Write your findings JSON to this literal absolute path: %s\n\n" "$output"
       cat "$AUTODREAM_DIR/SESSION_TRIAGE.md"
     } | "$CLAUDE_BIN" \
@@ -197,9 +218,16 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       > /dev/null 2> "$errlog"
 
     if [ -s "$output" ]; then
+      # Reported path should be the real session, not the temp slim copy. Then drop
+      # the slim file (regenerable; keeps the findings dir clean).
+      if [ -n "$slimfile" ]; then
+        sed -i "" "s#$slimfile#$session#g" "$output" 2>/dev/null || true
+        rm -f "$slimfile"
+      fi
       rm -f "$errlog"
       echo "ok: $session ($hash)"
     else
+      [ -n "$slimfile" ] && rm -f "$slimfile"
       # Worker exited without writing findings JSON. Record a diagnostic so the
       # failure is visible (no more silent zero-byte .err files). Leave $output
       # absent so a re-run retries this (possibly transient) session.
@@ -271,7 +299,7 @@ EOF
   # and require an API key). Exported once so both the L1 xargs subshells and the L2
   # call inherit it.
   export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1
-  export CLAUDE_BIN AUTODREAM_DIR FINDINGS_DIR
+  export CLAUDE_BIN AUTODREAM_DIR FINDINGS_DIR SLIM
 
   L1_START=$(date +%s)
   L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-5}"

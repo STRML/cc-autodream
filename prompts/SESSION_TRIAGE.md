@@ -15,7 +15,7 @@ These are plain text values, **not shell variables**. Pass each path directly to
 
 Then:
 
-1. **Read the session transcript** with the Read tool, using the literal path from line 1. It is JSONL — one JSON object per line. If it is larger than ~2000 lines, read it in chunks with the Read tool's `offset`/`limit` (e.g. the first 2000, a middle 2000, and the last 2000 lines) rather than all at once. **Cap: do not retry a failed Read with progressively smaller limits more than once** — if Read still errors, proceed with whatever you have already read rather than looping (the read-shrink-retry loop has wasted entire runs before).
+1. **Read the session transcript** with the Read tool, using the literal path from line 1. It is JSONL — one JSON object per line. If it is larger than ~2000 lines, read it in chunks with the Read tool's `offset`/`limit` (e.g. the first 2000, a middle 2000, and the last 2000 lines) rather than all at once. **Cap: do not retry a failed Read with progressively smaller limits more than once** — if Read still errors, proceed with whatever you have already read rather than looping (the read-shrink-retry loop has wasted entire runs before). Note: an oversized transcript may have been **pre-slimmed** by the runner — long lines truncated, the middle elided, with `...[autodream slimmed/elided ...]...` markers. That is expected; triage what is present and don't treat the markers as session content.
 2. **Extract structured findings** per the schema below.
 3. **Write the JSON** with the Write tool to the literal output path from line 2 — exactly one JSON object, no prose around it.
 4. Print `done` and exit. No commentary.

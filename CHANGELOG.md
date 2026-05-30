@@ -9,6 +9,7 @@ All notable changes to cc-autodream. Format loosely follows Keep a Changelog.
 - **Self-pollution prevention.** Both layers now pass `--no-session-persistence`, so `claude --print` workers no longer leave their own transcripts in `~/.claude/projects/` for the next run to re-triage (this had been ~90% of the corpus). New `bin/prune-self-sessions.sh` is the single source of truth for the "is this autodream's own session?" predicate: lists them, `--delete` purges the backlog, `--filter` excludes them. `run.sh` enumeration pipes through `--filter` so pre-fix transcripts are never triaged.
 - **Sleep-resilient retry.** `run.sh` retries L1 over only the still-missing sessions across network/sleep gaps (`AUTODREAM_L1_ROUNDS`, `wait_for_network`), retries L2 until a report lands (`AUTODREAM_L2_ATTEMPTS`), and short-circuits via an idempotency guard when a report already exists (`AUTODREAM_FORCE=1` to rebuild). The launchd example now schedules several morning catch-up triggers and documents a `pmset` scheduled wake.
 - **Autodream self-audit.** `run.sh` writes `run-stats.txt` (sessions found/excluded/triaged, L1 rounds/done/missing/err, elapsed). A new PROMPT.md "Autodream self-audit" section turns the lens on the pipeline: it flags self-pollution regressions, pipeline-capacity issues (oversized transcripts), and retry/sleep health, and proposes concrete cc-autodream source fixes since the user authors the tool.
+- **Oversized-transcript slimming.** New `bin/slim-transcript.sh` truncates long lines, samples head+tail, and hard-caps total bytes. The L1 worker pre-slims any session over `AUTODREAM_SLIM_BYTES` (256 KB) before the haiku read, then rewrites the findings `session_path` back to the original. Sessions that previously errored ("exceeds token budget" — multi-MB transcripts with base64 images / giant tool outputs) now get triaged. Verified end-to-end: a 21 MB / 6463-line session slimmed to 205 KB / 603 lines and produced valid findings.
 - **Docs.** `CLAUDE.md` (decisions, state layout, gotchas) and `codemaps/architecture.md` (data flow + file map), so the analysis behind this work is not re-derived next session.
 
 ### Changed
@@ -16,7 +17,7 @@ All notable changes to cc-autodream. Format loosely follows Keep a Changelog.
 
 ### Notes
 - **Do not use `--bare` / `CLAUDE_CODE_SIMPLE`.** Verified they disable OAuth/keychain auth (require an API key) and limit tools to Bash+Edit; the composed flags above are the supported path for subscription users.
-- Tests grew from 6 to 12 cases (changelog window, prune helper, self-session exclusion, L1 flaky retry, idempotency guard, self-audit stats); all offline against the mock claude.
+- Tests grew from 6 to 14 cases (changelog window, prune helper, self-session exclusion, L1 flaky retry, idempotency guard, self-audit stats, transcript slimming); all offline against the mock claude.
 
 ## 2026-05-29
 

@@ -234,6 +234,22 @@ test_idempotency_guard(){
   rm -rf "$root"
 }
 
+test_slim_transcript(){
+  echo "# slim-transcript bounds an oversized transcript"
+  local SL="$REPO/bin/slim-transcript.sh"
+  [ -x "$SL" ] || { no "slim-transcript executable"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  local big="$root/big.jsonl" out="$root/slim.jsonl"
+  # 3000 lines × ~3000 chars ≈ 9 MB
+  awk 'BEGIN{ b=""; for(i=0;i<3000;i++) b=b "x"; for(n=0;n<3000;n++) print "{\"n\":" n ",\"blob\":\"" b "\"}" }' > "$big"
+  "$SL" "$big" "$out"
+  local osz; osz=$(wc -c < "$out" | tr -d ' ')
+  [ "$osz" -lt 300000 ] && ok "slimmed far below original ($osz bytes < 300k, orig ~9M)" || no "slim output too big ($osz)"
+  assert_grep "$out" 'elided by autodream'     "elides the middle"
+  assert_grep "$out" 'slimmed this transcript' "appends the slim note"
+  rm -rf "$root"
+}
+
 # ---------------------------------------------------------------------------
 
 [ -x "$RUN" ]  || { echo "FATAL: $RUN not executable"; exit 1; }
@@ -253,6 +269,7 @@ test_self_session_excluded
 test_l1_retry
 test_idempotency_guard
 test_self_audit_stats
+test_slim_transcript
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"
