@@ -28,7 +28,10 @@ QUESTIONS=$(awk '
   capture { print }
 ' "$REPORT")
 QUESTIONS=$(printf "%s" "$QUESTIONS" | awk 'NF{p=1} p')
-COUNT=$(printf "%s\n" "$QUESTIONS" | grep -cE '^[[:space:]]*[0-9]+\.' || true)
+# Count question items: L2 may format them as a numbered list ("1.") or as dash
+# bullets grouped under bold subheadings ("- ..."). Match both, or notify silently
+# no-ops on a report that is actually full of questions.
+COUNT=$(printf "%s\n" "$QUESTIONS" | grep -cE '^[[:space:]]*([0-9]+\.|[-*])[[:space:]]' || true)
 
 if [ -z "$QUESTIONS" ] || [ "$COUNT" -eq 0 ]; then
   echo "notify.sh: $DATE has 0 open questions; nothing to pop"
