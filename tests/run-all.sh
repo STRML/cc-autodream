@@ -212,6 +212,35 @@ test_self_session_excluded(){
   rm -rf "$root"
 }
 
+test_skip_empty_sessions(){
+  echo "# 0-turn shell sessions are skipped before fanout"
+  local root; root=$(setup_env); mk_session "$root" real1
+  # an auto-opened/aborted shell: a single ai-title line, no user turn at all
+  local empty="$root/projects/proj-a/shell.jsonl"
+  printf '{"type":"ai-title","title":"some tab title"}\n' > "$empty"
+  touch -t "$STAMP" "$empty"
+  run_dream "$root"
+  local hr he; hr=$(hash_of "$root/projects/proj-a/real1.jsonl"); he=$(hash_of "$empty")
+  assert_file    "$(fdir "$root")/$hr.json" "real session triaged"
+  assert_no_file "$(fdir "$root")/$he.json" "empty shell skipped (no findings JSON)"
+  assert_grep    "$(fdir "$root")/run-stats.txt" 'sessions_skipped_empty: 1' "stats record the empty skip"
+  assert_grep    "$(fdir "$root")/run-stats.txt" 'sessions_triaged: 1'        "stats record one triaged"
+  assert_grep    "$root/run.out" 'skipped 1 empty' "run log reports the empty skip"
+  rm -rf "$root"
+}
+
+test_skip_empty_disabled(){
+  echo "# AUTODREAM_SKIP_EMPTY=0 keeps 0-turn shells in the triage set"
+  local root; root=$(setup_env)
+  local empty="$root/projects/proj-a/shell.jsonl"
+  printf '{"type":"ai-title","title":"some tab title"}\n' > "$empty"
+  touch -t "$STAMP" "$empty"
+  export AUTODREAM_SKIP_EMPTY=0; run_dream "$root"; unset AUTODREAM_SKIP_EMPTY
+  assert_grep "$(fdir "$root")/run-stats.txt" 'sessions_skipped_empty: 0' "no skips when disabled"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'sessions_triaged: 1'        "shell still triaged when disabled"
+  rm -rf "$root"
+}
+
 test_l1_retry(){
   echo "# L1 retries a flaky session and completes it on a later round"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -267,6 +296,8 @@ test_framing
 test_changelog
 test_prune_helper
 test_self_session_excluded
+test_skip_empty_sessions
+test_skip_empty_disabled
 test_l1_retry
 test_idempotency_guard
 test_self_audit_stats

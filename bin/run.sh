@@ -62,6 +62,33 @@ cd "$HOME"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
+# ---- Empty-session filter: drop 0-turn shells before fanout ----
+# Most of a quiet night's corpus is auto-opened/aborted sessions that hold no user
+# input (observed: ~150 of 163 files on 2026-05-30 were single-line `ai-title` shells).
+# They cost an L1 worker each for zero signal. A session is SUBSTANTIVE iff it has at
+# least one `user` turn that isn't `isMeta:true`; everything else is skippable. The
+# predicate is deliberately conservative — any user turn keeps the session, and a jq
+# parse failure keeps it too (bias to triage, never silently drop a real session).
+# Reads a session-list file on stdin, prints the substantive subset.
+# Disable with AUTODREAM_SKIP_EMPTY=0.
+filter_empty_sessions() {
+  while IFS= read -r sp; do
+    [ -n "$sp" ] || continue
+    if session_is_substantive "$sp"; then
+      printf '%s\n' "$sp"
+    fi
+  done
+}
+
+# exit 0 = keep (substantive or unparseable), 1 = skip (provably a 0-turn shell).
+session_is_substantive() {
+  local sp="$1" verdict
+  [ -r "$sp" ] || return 0
+  verdict=$(jq -s 'if any(.[]; .type=="user" and (.isMeta != true)) then 1 else 0 end' "$sp" 2>/dev/null) || return 0
+  [ "$verdict" = "0" ] && return 1
+  return 0
+}
+
 # ---- Upstream changelog: detect Claude Code releases committed on the target day ----
 # Clones (once) and pulls anthropics/claude-code into a persistent cache, then diffs
 # CHANGELOG.md over [TARGET_DATE, NEXT_DATE) by real commit date and writes the inserted
@@ -274,9 +301,20 @@ run() {
   else
     cp "$SESSIONS_LIST.raw" "$SESSIONS_LIST"
   fi
+  COUNT_AFTER_PRUNE=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
+  EXCLUDED=$(( RAW - COUNT_AFTER_PRUNE ))
+
+  # Drop 0-turn shells (auto-opened/aborted sessions with no user input) before fanout.
+  # Independent of the self-prune above, so the two telemetry counts don't overlap.
+  SKIPPED_EMPTY=0
+  if [ "${AUTODREAM_SKIP_EMPTY:-1}" != "0" ]; then
+    filter_empty_sessions < "$SESSIONS_LIST" > "$SESSIONS_LIST.nonempty" \
+      && mv "$SESSIONS_LIST.nonempty" "$SESSIONS_LIST" \
+      || rm -f "$SESSIONS_LIST.nonempty"
+  fi
   COUNT=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
-  EXCLUDED=$(( RAW - COUNT ))
-  log "found $RAW session files; excluded $EXCLUDED autodream-own; $COUNT to triage"
+  SKIPPED_EMPTY=$(( COUNT_AFTER_PRUNE - COUNT ))
+  log "found $RAW session files; excluded $EXCLUDED autodream-own, skipped $SKIPPED_EMPTY empty; $COUNT to triage"
 
   if [ "$COUNT" -eq 0 ]; then
     log "no sessions to triage; writing stub report and exiting"
@@ -336,6 +374,7 @@ EOF
     printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
     printf 'sessions_found_raw: %s\n' "$RAW"
     printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
+    printf 'sessions_skipped_empty: %s\n' "$SKIPPED_EMPTY"
     printf 'sessions_triaged: %s\n' "$COUNT"
     printf 'l1_rounds_used: %s\n' "$round"
     printf 'l1_rounds_max: %s\n' "$L1_ROUNDS"
