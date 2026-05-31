@@ -81,6 +81,21 @@ AUTODREAM_FORCE=1 ~/.claude/autodream/run.sh 2026-05-29   # rebuild despite an e
 ```
 To reprocess cleanly (e.g. after the corpus changed), delete that date's findings dir AND report first, then run; otherwise idempotency reuses old findings and the guard skips. Env knobs are documented in `run.sh`'s header and the README.
 
+### Running on-demand without the 10-min cap (`autodream-now.sh`)
+
+A full run routinely exceeds 10 minutes, so launching `run.sh` from a foreground/background context that has a time cap (a Claude Code background Bash task, an ssh session that may drop) gets it killed mid-flight. `bin/autodream-now.sh` sidesteps this by handing the run to **launchd**, which owns the process — no time cap, survives the caller disconnecting.
+
+```
+~/.claude/autodream/autodream-now.sh                  # yesterday, now
+~/.claude/autodream/autodream-now.sh 2026-05-29 --force   # specific date, rebuild
+~/.claude/autodream/autodream-now.sh 2026-05-29 --watch   # tail run log until report lands
+~/.claude/autodream/autodream-now.sh 2026-05-29 --dry-run # print plist + commands, run nothing
+```
+
+How it works: it writes a transient one-shot LaunchAgent (`<base-label>.ondemand`, RunAtLoad) into `$AUTODREAM_DIR`, `bootout`s any prior instance, then `bootstrap`s it so launchd runs `run.sh <date>` once and the job exits. It never touches the scheduled nightly job. Everything is auto-detected (it resolves its own symlink to find `run.sh`, reads the scheduled job's Label for the namespace, detects uid and the `claude`/`git` dirs for the agent's PATH) so it is not specific to one user or host. `--force` maps to `AUTODREAM_FORCE=1`; the caller's `AUTODREAM_DIR`/`DREAMS_DIR`/`AUTODREAM_TZ` are passed through. Progress is in `$AUTODREAM_DIR/logs/run-<date>.log`; the agent's own stdout/stderr go to `logs/ondemand.{out,err}.log`.
+
+When you (the agent) need to kick off a run, prefer this over a background Bash task — fire it, then poll `dreams/<date>.md` instead of holding a long task open.
+
 ## Tests
 
 `tests/run-all.sh` drives the real `run.sh` against `tests/mock-claude.sh` (no network, no model). Mock modes: `good` (default), `l1_incomplete` (worker writes nothing), `l1_flaky` (fails first dispatch per session, succeeds on retry). The suite forces `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0` and a low `AUTODREAM_L1_ROUNDS` so it never sleeps or hits the network. macOS only (BSD `date`/`touch`). Run it after any run.sh/prompt change.

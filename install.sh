@@ -27,6 +27,7 @@ link() {
 
 echo "Installing cc-autodream into $TARGET"
 link "$REPO_DIR/bin/run.sh"             "$TARGET/run.sh"
+link "$REPO_DIR/bin/autodream-now.sh"   "$TARGET/autodream-now.sh"
 link "$REPO_DIR/bin/review.sh"          "$TARGET/review.sh"
 link "$REPO_DIR/bin/notify.sh"          "$TARGET/notify.sh"
 link "$REPO_DIR/bin/prune-self-sessions.sh" "$TARGET/prune-self-sessions.sh"

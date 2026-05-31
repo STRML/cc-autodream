@@ -37,6 +37,7 @@ bin/run.sh  TARGET_DATE
 | File | Role |
 |---|---|
 | `bin/run.sh` | orchestrator: guard, enumerate+filter, L1 retry loop, changelog, L2 retry loop, notify, gc |
+| `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); picks the scheduled plist that runs `run.sh` for its label namespace |
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/notify.sh` | extract "Open questions" → inbox file in Sublime |
 | `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`) |
@@ -53,3 +54,27 @@ bin/run.sh  TARGET_DATE
 - A `dreams/<date>.md` exists only after a successful L2 → it is the "done" signal for the idempotency guard.
 - `prune-self-sessions.sh` matches only the FIRST user turn against autodream's own prompt framing → human sessions about autodream are not false positives.
 - claude is always invoked with the lean flags + subscription auth; never `--bare`/`CLAUDE_CODE_SIMPLE` (breaks auth).
+
+## Environment overrides
+
+All optional; full list (with defaults) is documented in `bin/run.sh`'s header. The ones you reach for most:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CLAUDE_BIN` | `$HOME/.local/bin/claude` | path to `claude` CLI |
+| `PROJECTS_DIR` | `$HOME/.claude/projects` | where Claude Code stores session JSONLs |
+| `AUTODREAM_DIR` | `$HOME/.claude/autodream` | scripts + runtime state |
+| `DREAMS_DIR` | `$HOME/.claude/dreams` | where reports are written |
+| `FANOUT` | `8` | L1 parallelism |
+| `AUTODREAM_FORCE` | `0` | `1` rebuilds even if a report exists |
+| `AUTODREAM_CHANGELOG` | `1` | `0` skips the upstream-changelog check |
+| `CLAUDE_CODE_REPO` / `CHANGELOG_REMOTE` | cache dir / anthropics/claude-code | changelog clone source/cache |
+| `AUTODREAM_L1_ROUNDS` / `AUTODREAM_L2_ATTEMPTS` | `5` / `3` | sleep-resilient retry bounds |
+| `AUTODREAM_NETCHECK` / `AUTODREAM_RETRY_WAIT` | `1` / `60` | network-wait between retry rounds |
+| `AUTODREAM_SLIM_BYTES` | `262144` | sessions larger than this are slimmed for L1 |
+| `SUBL` | `$HOME/bin/subl` then PATH | Sublime CLI for `notify.sh` |
+
+## Lean queries / no self-pollution (see CLAUDE.md for full detail)
+
+- Both layers call `claude --print` with composed lean flags (`--no-session-persistence --disable-slash-commands --strict-mcp-config --settings '{"disableAllHooks":true}'` + `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` …) — minimal footprint while keeping subscription/OAuth auth.
+- `--no-session-persistence` stops workers leaving their own transcripts; the enumeration also pipes through `prune-self-sessions.sh --filter` to drop any left by older runs. Without this, ~90% of a night's corpus is autodream re-reading itself.
