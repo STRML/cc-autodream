@@ -46,7 +46,7 @@ bin/run.sh  TARGET_DATE
 | `tests/run-all.sh` | integration tests vs `mock-claude.sh` (offline) |
 | `tests/mock-claude.sh` | stand-in claude; modes: good / l1_incomplete / l1_flaky |
 | `launchd/com.user.autodream.plist.example` | schedule (multi-trigger catch-up + pmset note) |
-| `install.sh` | symlink scripts/prompts into `~/.claude/autodream/` |
+| `install.sh` | symlink scripts/prompts into `~/.claude/autodream/`; by default also generates + bootstraps the nightly launchd schedule (auto-detected label/PATH/dirs; `--no-schedule` to skip) |
 
 ## Key invariants
 

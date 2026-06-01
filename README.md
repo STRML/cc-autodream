@@ -65,17 +65,29 @@ cd ~/git/cc-autodream
 ./install.sh
 ```
 
-This symlinks `bin/*.sh` and `prompts/*.md` into `~/.claude/autodream/` and creates
-`~/.claude/dreams/`. Because they're symlinks, editing the repo copy takes effect
-immediately. Requires the `claude` CLI on PATH (override with `CLAUDE_BIN`).
+This symlinks `bin/*.sh` and `prompts/*.md` into `~/.claude/autodream/`, creates
+`~/.claude/dreams/`, and on macOS installs and bootstraps the nightly launchd
+schedule for you (auto-detecting your username, paths, and `claude`/`git` location —
+no plist editing). Because the scripts are symlinks, editing the repo copy takes
+effect immediately. Requires the `claude` CLI on PATH (override with `CLAUDE_BIN`).
 
-Schedule the overnight run (macOS launchd):
+The schedule fires `run.sh` at 03:15 with morning catch-up triggers (06:15/09:15/12:15)
+in case the Mac was asleep; the idempotency guard makes all but the first a one-second
+no-op. To skip scheduling and only symlink the scripts:
 
 ```bash
-cp launchd/com.user.autodream.plist.example ~/Library/LaunchAgents/com.user.autodream.plist
-# edit the plist: replace REPLACE_WITH_USERNAME with your username, then:
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.autodream.plist
+./install.sh --no-schedule
 ```
+
+launchd won't *wake* the Mac, so to guarantee the 03:15 trigger runs at all, add a
+scheduled wake:
+
+```bash
+sudo pmset repeat wake MTWRFSU 03:10:00
+```
+
+The hand-editable template lives at `launchd/com.user.autodream.plist.example` if you'd
+rather install the job yourself.
 
 ## Running it by hand
 

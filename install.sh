@@ -1,17 +1,31 @@
 #!/bin/bash
 # cc-autodream installer.
 #
-# Symlinks the scripts + prompts from this repo into ~/.claude/autodream/
-# so the standard paths resolve. Idempotent — safe to re-run.
+# Symlinks the scripts + prompts from this repo into ~/.claude/autodream/ and (on
+# macOS) installs the nightly launchd schedule so overnight runs Just Work.
+# Idempotent — safe to re-run.
 #
 # Usage:
-#   ./install.sh             # symlink into $HOME/.claude/autodream/
-#   ./install.sh /path/to    # symlink into /path/to/autodream/
+#   ./install.sh                 # symlink into $HOME/.claude/ + schedule nightly job
+#   ./install.sh /path/to        # symlink into /path/to/autodream/ instead
+#   ./install.sh --no-schedule   # symlink only; don't touch launchd
+#   ./install.sh -h|--help
 
 set -eu
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET_PARENT="${1:-$HOME/.claude}"
+
+# ----------------------------------------------------------------- arg parsing --
+SCHEDULE=1
+TARGET_PARENT="$HOME/.claude"
+for a in "$@"; do
+  case "$a" in
+    --no-schedule) SCHEDULE=0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -*) echo "install: unknown flag '$a'" >&2; exit 64 ;;
+    *) TARGET_PARENT="$a" ;;
+  esac
+done
 TARGET="$TARGET_PARENT/autodream"
 
 mkdir -p "$TARGET" "$TARGET_PARENT/dreams" "$TARGET/findings" "$TARGET/inbox" "$TARGET/logs"
@@ -37,9 +51,109 @@ link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 
 chmod +x "$REPO_DIR/bin/"*.sh
 
+# --------------------------------------------------- nightly launchd schedule --
+# Builds and bootstraps a LaunchAgent that runs run.sh on several morning triggers
+# (catch-up for a Mac asleep at 03:15; the idempotency guard no-ops all but the
+# first to complete). Everything is auto-detected — no REPLACE_WITH_USERNAME edit.
+install_schedule() {
+  local la_dir="$HOME/Library/LaunchAgents"
+  mkdir -p "$la_dir"
+
+  # Reuse an existing autodream label if one is already installed (keeps the
+  # namespace stable across re-installs and shared with autodream-now's .ondemand
+  # sibling); else synthesize com.<user>.autodream. Match the plist that runs
+  # run.sh — not siblings like *-review.
+  local label="" plist l
+  for plist in "$la_dir"/*autodream*.plist; do
+    [ -e "$plist" ] || continue
+    case "$plist" in *.ondemand.plist) continue ;; esac
+    /usr/bin/grep -q 'run\.sh' "$plist" 2>/dev/null || continue
+    if l="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$plist" 2>/dev/null)"; then
+      label="$l"; break
+    fi
+  done
+  [ -n "$label" ] || label="com.$(id -un | tr -dc 'a-zA-Z0-9').autodream"
+
+  # launchd agents start with a minimal PATH; seed it with the dirs of the tools
+  # the pipeline shells out to (claude, git, bash) plus the usual suspects.
+  local path_dirs="" tool b d
+  for tool in claude git bash; do
+    if b="$(command -v "$tool" 2>/dev/null)"; then
+      d="$(cd "$(dirname "$b")" && pwd)"
+      case ":$path_dirs:" in *":$d:"*) ;; *) path_dirs="${path_dirs:+$path_dirs:}$d" ;; esac
+    fi
+  done
+  local path_val="${path_dirs:+$path_dirs:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+  local target_plist="$la_dir/$label.plist"
+  local domain="gui/$(id -u)"
+
+  cat > "$target_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$label</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$TARGET/run.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>15</integer></dict>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>$path_val</string>
+        <key>HOME</key><string>$HOME</string>
+        <key>AUTODREAM_DIR</key><string>$TARGET</string>
+        <key>DREAMS_DIR</key><string>$TARGET_PARENT/dreams</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>$TARGET/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>$TARGET/logs/launchd.err.log</string>
+</dict>
+</plist>
+PLIST
+
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$target_plist" >/dev/null || {
+      echo "  ! generated plist failed plutil lint: $target_plist" >&2
+      return 1
+    }
+  fi
+
+  # Clear any prior instance, then bootstrap. RunAtLoad is false, so this arms the
+  # schedule without firing a run now.
+  launchctl bootout   "$domain/$label" 2>/dev/null || true
+  launchctl bootstrap "$domain" "$target_plist"
+  echo "  scheduled: $label  (daily 03:15/06:15/09:15/12:15)  -> $target_plist"
+}
+
+echo
+if [ "$SCHEDULE" = 1 ] && command -v launchctl >/dev/null 2>&1; then
+  echo "Installing nightly schedule (launchd):"
+  install_schedule
+  echo
+  echo "  Guarantee the Mac is awake for the 03:15 trigger (launchd won't wake it):"
+  echo "    sudo pmset repeat wake MTWRFSU 03:10:00"
+elif [ "$SCHEDULE" = 1 ]; then
+  echo "Skipping schedule: launchctl not found (not macOS?). See launchd/ for the template."
+else
+  echo "Skipping schedule (--no-schedule). See launchd/com.user.autodream.plist.example to add one."
+fi
+
 echo
 echo "Installed. Try:"
 echo "  $TARGET/run.sh \$(date -v-1d +%Y-%m-%d)   # process yesterday"
 echo "  $TARGET/review.sh                        # triage the latest report"
-echo
-echo "To schedule overnight runs see launchd/com.user.autodream.plist.example"
