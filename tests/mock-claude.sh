@@ -25,9 +25,14 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
     printf '%s\n' "$@" > "$MOCK_CAPTURE_DIR/l1-args.txt"
   fi
   out=$(printf '%s' "$line2" | sed 's/^Write your findings JSON to this literal absolute path: //')
+  sess=$(printf '%s' "$line1" | sed 's/^Session transcript to analyze (literal absolute path): //')
   write_findings() { printf '{"session_path":"x","project":"proj-a","turn_count":2,"tool_call_count":0,"tools_used":[],"skills_invoked":[],"models_used":[],"notable_initiatives":[],"findings":[]}' > "$out"; }
+  # Emit a real session_path but a deliberately WRONG project (what nondeterministic
+  # haiku does), so run.sh's path-based normalization pass has something to correct.
+  write_badproject() { printf '{"session_path":"%s","project":"WRONG-PROJECT","turn_count":2,"tool_call_count":0,"tools_used":[],"skills_invoked":[],"models_used":[],"notable_initiatives":[],"findings":[]}' "$sess" > "$out"; }
   case "$mode" in
     l1_incomplete) : ;;                 # never write — simulates a worker that exits empty
+    l1_badproject) write_badproject ;;  # wrong project + real path — exercises normalization
     l1_flaky)                           # fail the first dispatch per session, succeed on retry
       if [ -f "$out.attempt" ]; then write_findings; else : > "$out.attempt"; fi ;;
     *) write_findings ;;

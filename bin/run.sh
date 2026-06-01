@@ -274,9 +274,28 @@ run() {
   else
     cp "$SESSIONS_LIST.raw" "$SESSIONS_LIST"
   fi
+  AFTER_PRUNE=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
+
+  # Drop empty/stub sessions before L1 dispatch. A transcript with no user AND no
+  # assistant turn (e.g. a bare `ai-title` meta record, or a residual headless
+  # self-session) carries zero signal but still costs an L1 invocation + $. Keep
+  # any file we cannot read so a transient FS hiccup never silently drops a real
+  # session. Disable AUTODREAM_KEEP_EMPTY=1 to retain stubs for completeness.
+  if [ "${AUTODREAM_KEEP_EMPTY:-0}" != "1" ]; then
+    while IFS= read -r session; do
+      [ -n "$session" ] || continue
+      if [ ! -r "$session" ] \
+         || grep -qE '"type":"(user|assistant)"' "$session" 2>/dev/null; then
+        printf '%s\n' "$session"
+      fi
+    done < "$SESSIONS_LIST" > "$SESSIONS_LIST.kept"
+    mv "$SESSIONS_LIST.kept" "$SESSIONS_LIST"
+  fi
+
   COUNT=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
-  EXCLUDED=$(( RAW - COUNT ))
-  log "found $RAW session files; excluded $EXCLUDED autodream-own; $COUNT to triage"
+  EXCLUDED=$(( RAW - AFTER_PRUNE ))
+  EMPTY=$(( AFTER_PRUNE - COUNT ))
+  log "found $RAW session files; excluded $EXCLUDED autodream-own, $EMPTY empty-stub; $COUNT to triage"
 
   if [ "$COUNT" -eq 0 ]; then
     log "no sessions to triage; writing stub report and exiting"
@@ -327,6 +346,43 @@ EOF
   L1_ERRORED=$(grep -l '"error":' "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
   log "L1 done in ${L1_ELAPSED}s: $L1_OK done ($L1_ERRORED with errors), $MISSING missing (.err files: $L1_FAIL)"
 
+  # ---- Normalize the project field deterministically from the session path ----
+  # SESSION_TRIAGE.md asks the L1 worker to emit "project" by hand, and haiku does it
+  # nondeterministically: one run surfaced the SAME -Users-sean dir as "-Users-sean",
+  # "Users-sean" (dash stripped), and even the bare session UUID (filename, not dir).
+  # That splinters L2's per-project grouping. The encoded project dir is just the parent
+  # directory of the session JSONL, so derive it from each findings JSON's own
+  # session_path (already rewritten back to the real session after any slimming) and
+  # overwrite whatever the model guessed. Deterministic, idempotent on re-runs.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$FINDINGS_DIR" <<'PY'
+import glob, json, os, sys
+findings_dir = sys.argv[1]
+fixed = 0
+for path in glob.glob(os.path.join(findings_dir, "*.json")):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (ValueError, OSError):
+        continue  # malformed JSON: leave for the triage-failures report section
+    sp = data.get("session_path")
+    if not sp:
+        continue
+    proj = os.path.basename(os.path.dirname(sp))
+    if proj and data.get("project") != proj:
+        data["project"] = proj
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+        fixed += 1
+print(fixed)
+PY
+    log "normalized project field from session path"
+  else
+    log "python3 not found; skipping project-field normalization (L2 grouping may show dupes)"
+  fi
+
   # ---- Self-audit stats: runtime telemetry only the runner can see ----
   # The aggregator can't observe its own machinery — which sessions were autodream's
   # own (already excluded), how many workers failed, how many retry rounds it took.
@@ -336,6 +392,7 @@ EOF
     printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
     printf 'sessions_found_raw: %s\n' "$RAW"
     printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
+    printf 'empty_sessions_excluded: %s\n' "$EMPTY"
     printf 'sessions_triaged: %s\n' "$COUNT"
     printf 'l1_rounds_used: %s\n' "$round"
     printf 'l1_rounds_max: %s\n' "$L1_ROUNDS"
