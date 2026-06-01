@@ -420,6 +420,43 @@ EOF
   L1_ERRORED=$(grep -l '"error":' "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
   log "L1 done in ${L1_ELAPSED}s: $L1_OK done ($L1_ERRORED with errors), $MISSING missing (.err files: $L1_FAIL)"
 
+  # ---- Normalize the project field deterministically from the session path ----
+  # SESSION_TRIAGE.md asks the L1 worker to emit "project" by hand, and haiku does it
+  # nondeterministically: one run surfaced the SAME -Users-sean dir as "-Users-sean",
+  # "Users-sean" (dash stripped), and even the bare session UUID (filename, not dir).
+  # That splinters L2's per-project grouping. The encoded project dir is just the parent
+  # directory of the session JSONL, so derive it from each findings JSON's own
+  # session_path (already rewritten back to the real session after any slimming) and
+  # overwrite whatever the model guessed. Deterministic, idempotent on re-runs.
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$FINDINGS_DIR" <<'PY'
+import glob, json, os, sys
+findings_dir = sys.argv[1]
+fixed = 0
+for path in glob.glob(os.path.join(findings_dir, "*.json")):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (ValueError, OSError):
+        continue  # malformed JSON: leave for the triage-failures report section
+    sp = data.get("session_path")
+    if not sp:
+        continue
+    proj = os.path.basename(os.path.dirname(sp))
+    if proj and data.get("project") != proj:
+        data["project"] = proj
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+        fixed += 1
+print(fixed)
+PY
+    log "normalized project field from session path"
+  else
+    log "python3 not found; skipping project-field normalization (L2 grouping may show dupes)"
+  fi
+
   # ---- Self-audit stats: runtime telemetry only the runner can see ----
   # The aggregator can't observe its own machinery — which sessions were autodream's
   # own (already excluded), how many workers failed, how many retry rounds it took.

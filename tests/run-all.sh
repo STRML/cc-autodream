@@ -317,6 +317,20 @@ test_idempotency_guard(){
   rm -rf "$root"
 }
 
+test_normalize_project(){
+  echo "# project field is normalized deterministically from the session path"
+  command -v python3 >/dev/null 2>&1 || { echo "  skip - python3 not available"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export MOCK_MODE=l1_badproject; run_dream "$root"; unset MOCK_MODE
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  local fj="$(fdir "$root")/$h.json"
+  assert_file   "$fj" "findings JSON written"
+  assert_nogrep "$fj" 'WRONG-PROJECT'     "model's wrong project value was overwritten"
+  assert_grep   "$fj" '"project": "proj-a"' "project normalized to the session dir basename"
+  assert_grep   "$root/run.out" 'normalized project field' "run log reports normalization"
+  rm -rf "$root"
+}
+
 test_slim_transcript(){
   echo "# slim-transcript bounds an oversized transcript"
   local SL="$REPO/bin/slim-transcript.sh"
@@ -357,6 +371,7 @@ test_idempotency_guard
 test_self_audit_stats
 test_self_audit_stats_failure_denominator
 test_self_audit_stats_precached_disambiguation
+test_normalize_project
 test_slim_transcript
 echo
 echo "----------------------------------------"
