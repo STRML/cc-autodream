@@ -5,9 +5,12 @@
 # JSONL into ~/.claude/projects/-Users-<you>/. The next night's run would then
 # triage those as if they were real sessions — ~190 self-generated files/night,
 # ~90% of the corpus, pure noise and wasted model spend. run.sh now passes
-# --no-session-persistence so new runs leave no transcript, but older runs already
-# littered the corpus; this script cleans them up and is also the single source of
-# truth for the "is this one of ours?" predicate (run.sh calls `--filter`).
+# --no-session-persistence so new runs leave no full transcript, and now runs workers
+# from an isolated cwd so even the residual AI-title stub lands in a bucket run.sh
+# wipes. Older runs predating those fixes still littered the real session bucket with
+# both full transcripts AND one-line ai-title stubs; this script cleans up both and is
+# the single source of truth for the "is this one of ours?" predicate (run.sh
+# calls `--filter`).
 #
 # Usage:
 #   prune-self-sessions.sh                 # list self-sessions under $PROJECTS_DIR (dry run)
@@ -28,8 +31,39 @@ set -u
 # framing from earlier runs.
 SELF_RE='"content":"(Session transcript to analyze \(literal absolute path\)|Findings directory to aggregate \(literal absolute path\)|SESSION_PATH=|FINDINGS_DIR=)'
 
+# Second vector: an orphan AI-title stub. Claude Code's async title generation writes
+# a one-line `{"type":"ai-title",...}` record into the worker's session bucket even
+# under --no-session-persistence (which only suppresses the full transcript). These
+# stubs carry NO conversation, so the first-user-turn rule above never catches them.
+# We match them by the model-generated title, which paraphrases our L1/L2 prompts
+# (e.g. "Analyze Claude session findings", "Triage coding session for findings",
+# "Aggregate daily findings into report"). Safety comes from REQUIRING the file to be
+# an orphan stub — no user turn anywhere. A real session is a single file containing
+# its title alongside its turns, so it always has a user turn and is never matched;
+# only headless calls that didn't persist a transcript leave a title-only orphan. And
+# we still demand the title describe session triage / findings aggregation, so a real
+# headless orphan about an unrelated task (e.g. "GCU Rush firmware development") is
+# spared. Tuned against the real backlog: catches the L1/L2 title variants, spares
+# terminal-tab-title stubs and unrelated work-session orphans.
+is_self_title() { # $1 = jsonl path → exit 0 if it's an autodream orphan title stub
+  grep -q '"type":"user"' "$1" 2>/dev/null && return 1   # has conversation → not an orphan
+  local t
+  t=$(sed -n 's/.*"aiTitle":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1)
+  [ -n "$t" ] || return 1
+  # L2 aggregator: aggregating per-session findings into the daily report
+  printf '%s' "$t" | grep -qiE 'aggregate.*findings|findings.*(into|report)' && return 0
+  # L1 triage, "session triage … findings" phrasings (verb may follow the noun)
+  printf '%s' "$t" | grep -qiE 'session triage|triage.*findings|findings.*extraction' && return 0
+  # L1 triage: a verb acting on a session/transcript, producing findings/triage/analysis
+  printf '%s' "$t" | grep -qiE '(analyz|triag|process|review|debug).*(session|transcript)' \
+    && printf '%s' "$t" | grep -qiE 'findings|transcript|triage|analysis|extract|emit|structured' \
+    && return 0
+  return 1
+}
+
 is_self() { # $1 = jsonl path → exit 0 if it's an autodream-generated session
-  grep -m1 '"type":"user"' "$1" 2>/dev/null | grep -qE "$SELF_RE"
+  grep -m1 '"type":"user"' "$1" 2>/dev/null | grep -qE "$SELF_RE" && return 0
+  is_self_title "$1"
 }
 
 # ---- --filter: stdin paths -> stdout the ones we should still triage ----

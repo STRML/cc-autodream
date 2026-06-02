@@ -37,6 +37,15 @@ DREAMS_DIR="${DREAMS_DIR:-$HOME/.claude/dreams}"
 LOG_DIR="$AUTODREAM_DIR/logs"
 FANOUT="${FANOUT:-8}"
 
+# Isolated cwd for every `claude --print` worker (see "AI-title stubs" below). The
+# workers all read/write by ABSOLUTE path, so their cwd is functionally irrelevant —
+# we point it at a dedicated dir purely to redirect Claude Code's session bucket.
+# Claude maps the launch cwd to ~/.claude/projects/<cwd with / and . replaced by ->,
+# so running from here lands any stray stub in an isolated bucket we own and wipe,
+# instead of polluting the user's real -Users-<you> session history.
+WORK_DIR="$AUTODREAM_DIR/work"
+WORK_BUCKET="$PROJECTS_DIR/$(printf '%s' "$WORK_DIR" | sed 's#[/.]#-#g')"
+
 TARGET_DATE="${1:-$(date -v-1d +%Y-%m-%d)}"
 NEXT_DATE=$(date -j -f %Y-%m-%d -v+1d "$TARGET_DATE" +%Y-%m-%d)
 
@@ -55,12 +64,19 @@ PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
 SLIM="$SCRIPT_DIR/slim-transcript.sh"
 [ -x "$SLIM" ] || SLIM="$AUTODREAM_DIR/slim-transcript.sh"
 
-mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR"
+mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 cd "$HOME"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+# Wipe the isolated worker bucket. Claude Code's async AI-title generation writes a
+# one-line `{"type":"ai-title",...}` stub into the launch cwd's session bucket even
+# under --no-session-persistence (that flag only suppresses the full transcript). By
+# running workers from $WORK_DIR those stubs land in $WORK_BUCKET, which we empty
+# before and after every run so they never accumulate in the user's session history.
+clean_work_bucket() { rm -rf "$WORK_BUCKET" 2>/dev/null || true; }
 
 # ---- Empty-session filter: drop 0-turn shells before fanout ----
 # Most of a quiet night's corpus is auto-opened/aborted sessions that hold no user
@@ -228,6 +244,9 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     # straight to claude: a `prompt=$(...)` capture strips the trailing newlines,
     # which would glue the SESSION_TRIAGE.md body onto the end of the output-path
     # line and corrupt it. The printf keeps its blank-line separator this way.
+    # Launch from the isolated worker cwd so any AI-title stub lands in $WORK_BUCKET,
+    # not the real session bucket. All paths below are absolute, so cd is safe here.
+    cd "$WORK_DIR" 2>/dev/null || true
     {
       printf "Session transcript to analyze (literal absolute path): %s\n" "$readpath"
       printf "Write your findings JSON to this literal absolute path: %s\n\n" "$output"
@@ -337,7 +356,9 @@ EOF
   # and require an API key). Exported once so both the L1 xargs subshells and the L2
   # call inherit it.
   export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1
-  export CLAUDE_BIN AUTODREAM_DIR FINDINGS_DIR SLIM
+  export CLAUDE_BIN AUTODREAM_DIR FINDINGS_DIR SLIM WORK_DIR
+
+  clean_work_bucket  # start clean: drop any stub left by a prior run's workers
 
   L1_START=$(date +%s)
   L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-5}"
@@ -401,20 +422,26 @@ EOF
     # comment): keep the paths as literal data the aggregator hands to Glob/Read/Write,
     # and preserve the blank-line separator before PROMPT.md instead of letting a
     # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
-    {
-      printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
-      printf "Write the report to this literal absolute path: %s\n\n" "$REPORT_PATH"
-      cat "$AUTODREAM_DIR/PROMPT.md"
-    } | "$CLAUDE_BIN" \
-      --print \
-      --permission-mode bypassPermissions \
-      --model claude-opus-4-7 \
-      --no-session-persistence \
-      --tools Glob Read Write Edit \
-      --disable-slash-commands \
-      --strict-mcp-config \
-      --settings '{"disableAllHooks":true}' \
-      --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
+    # Subshell so the cwd change (isolating the AI-title stub into $WORK_BUCKET, same
+    # as L1) is scoped to this call and doesn't leak into the notify/GC steps below.
+    # $? after the subshell is the pipeline's exit (claude's), exactly as before.
+    (
+      cd "$WORK_DIR" 2>/dev/null || true
+      {
+        printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
+        printf "Write the report to this literal absolute path: %s\n\n" "$REPORT_PATH"
+        cat "$AUTODREAM_DIR/PROMPT.md"
+      } | "$CLAUDE_BIN" \
+        --print \
+        --permission-mode bypassPermissions \
+        --model claude-opus-4-7 \
+        --no-session-persistence \
+        --tools Glob Read Write Edit \
+        --disable-slash-commands \
+        --strict-mcp-config \
+        --settings '{"disableAllHooks":true}' \
+        --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
+    )
 
     L2_RC=$?
     [ -s "$REPORT_PATH" ] && break
@@ -424,6 +451,8 @@ EOF
       sleep "${AUTODREAM_RETRY_WAIT:-60}"
     fi
   done
+  clean_work_bucket  # all workers have exited; remove their AI-title stubs
+
   L2_ELAPSED=$(( $(date +%s) - L2_START ))
   log "L2 done in ${L2_ELAPSED}s (exit $L2_RC, $attempt attempt(s))"
 
