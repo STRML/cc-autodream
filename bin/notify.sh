@@ -58,13 +58,27 @@ $QUESTIONS
 EOF
 
 # Persistent banner first — survives the 3am launchd run regardless of GUI state.
-# Best-effort: a notification failure must never break the run. osascript string
-# literals are double-quoted, so strip any double quotes from the interpolated count
-# line to keep the AppleScript well-formed.
-if command -v osascript >/dev/null 2>&1; then
-  plural=$([ "$COUNT" -eq 1 ] || echo s)
+# Best-effort: a notification failure must never break the run.
+#
+# terminal-notifier gives a CLICKABLE banner (-execute runs on click → opens the
+# inbox file in Sublime). Plain osascript banners cannot carry a click action, so they
+# are only the fallback when terminal-notifier is absent. -group collapses repeat
+# notifications for the same date instead of stacking. NOTE: click-to-open requires
+# terminal-notifier's notification style to be "Alerts" (not "Banners") in System
+# Settings ▸ Notifications — banners can auto-dismiss before you click them.
+plural=$([ "$COUNT" -eq 1 ] || echo s)
+if command -v terminal-notifier >/dev/null 2>&1; then
+  terminal-notifier \
+    -title "Autodream — $DATE" \
+    -message "$COUNT open question$plural — click to open" \
+    -execute "open -a 'Sublime Text' '$OUT'" \
+    -group "autodream-$DATE" \
+    -sound Glass >/dev/null 2>&1 \
+    && echo "notify.sh: posted clickable notification for $DATE ($COUNT open question$plural)" \
+    || echo "notify.sh: terminal-notifier post failed (continuing)"
+elif command -v osascript >/dev/null 2>&1; then
   osascript -e "display notification \"$COUNT open question$plural — see inbox\" with title \"Autodream — $DATE\" sound name \"Glass\"" >/dev/null 2>&1 \
-    && echo "notify.sh: posted notification for $DATE ($COUNT open question$plural)" \
+    && echo "notify.sh: posted notification for $DATE ($COUNT open question$plural; install terminal-notifier for click-to-open)" \
     || echo "notify.sh: notification post failed (continuing)"
 fi
 
