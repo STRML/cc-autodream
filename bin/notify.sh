@@ -23,6 +23,21 @@ INBOX_DIR="$AUTODREAM_DIR/inbox"
 SUBL="${SUBL:-$HOME/bin/subl}"
 [ -x "$SUBL" ] || SUBL=$(command -v subl || echo /Applications/Sublime\ Text.app/Contents/SharedSupport/bin/subl)
 
+# Resolve the notifier. Prefer our rebranded bundle so banners read "cc-autodream"
+# instead of "terminal-notifier"; bootstrap it once via make-notifier.sh if it's
+# missing but terminal-notifier is installed. Fall back to plain terminal-notifier,
+# then to an osascript banner (not clickable). Resolve make-notifier.sh next to this
+# script (repo + ~/.claude/autodream symlink both work), then the install dir.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+MAKE_NOTIFIER="$SCRIPT_DIR/make-notifier.sh"
+[ -x "$MAKE_NOTIFIER" ] || MAKE_NOTIFIER="$AUTODREAM_DIR/make-notifier.sh"
+BRANDED="$AUTODREAM_DIR/cc-autodream.app/Contents/MacOS/terminal-notifier"
+if [ ! -x "$BRANDED" ] && command -v terminal-notifier >/dev/null 2>&1 && [ -x "$MAKE_NOTIFIER" ]; then
+  "$MAKE_NOTIFIER" >/dev/null 2>&1 || true
+fi
+NOTIFIER=""
+[ -x "$BRANDED" ] && NOTIFIER="$BRANDED" || NOTIFIER="$(command -v terminal-notifier || true)"
+
 mkdir -p "$INBOX_DIR"
 
 [ -f "$REPORT" ] || { echo "notify.sh: no such report: $REPORT" >&2; exit 1; }
@@ -67,8 +82,8 @@ EOF
 # terminal-notifier's notification style to be "Alerts" (not "Banners") in System
 # Settings ▸ Notifications — banners can auto-dismiss before you click them.
 plural=$([ "$COUNT" -eq 1 ] || echo s)
-if command -v terminal-notifier >/dev/null 2>&1; then
-  terminal-notifier \
+if [ -n "$NOTIFIER" ]; then
+  "$NOTIFIER" \
     -title "Autodream — $DATE" \
     -message "$COUNT open question$plural — click to open" \
     -execute "open -a 'Sublime Text' '$OUT'" \

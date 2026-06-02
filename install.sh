@@ -44,12 +44,19 @@ link "$REPO_DIR/bin/run.sh"             "$TARGET/run.sh"
 link "$REPO_DIR/bin/autodream-now.sh"   "$TARGET/autodream-now.sh"
 link "$REPO_DIR/bin/review.sh"          "$TARGET/review.sh"
 link "$REPO_DIR/bin/notify.sh"          "$TARGET/notify.sh"
+link "$REPO_DIR/bin/make-notifier.sh"   "$TARGET/make-notifier.sh"
 link "$REPO_DIR/bin/prune-self-sessions.sh" "$TARGET/prune-self-sessions.sh"
 link "$REPO_DIR/bin/slim-transcript.sh"     "$TARGET/slim-transcript.sh"
 link "$REPO_DIR/prompts/PROMPT.md"      "$TARGET/PROMPT.md"
 link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 
 chmod +x "$REPO_DIR/bin/"*.sh
+
+# Build the rebranded "cc-autodream" notifier bundle so open-questions banners show up
+# under that name instead of "terminal-notifier". No-op if terminal-notifier isn't
+# installed (notify.sh falls back to plain terminal-notifier / an osascript banner) or
+# if the bundle already exists. notify.sh also bootstraps this on first run.
+AUTODREAM_DIR="$TARGET" "$REPO_DIR/bin/make-notifier.sh" || true
 
 # --------------------------------------------------- nightly launchd schedule --
 # Builds and bootstraps a LaunchAgent that runs run.sh on several morning triggers
