@@ -1,6 +1,12 @@
 #!/bin/bash
-# Write the "Open questions" section of an autodream report to a text file
-# and pop it open in Sublime Text. Quiet no-op if there are no questions.
+# Write the "Open questions" section of an autodream report to a text file, post a
+# persistent macOS notification, and pop it open in Sublime Text. Quiet no-op if there
+# are no questions.
+#
+# The banner is the reliable signal: the nightly run fires ~3am under launchd, when a
+# GUI window open (subl) silently fails to surface. `display notification` posts to
+# Notification Center, which persists until dismissed, so the alert is waiting whenever
+# the Mac is next used. The subl open stays as a best-effort convenience on top.
 #
 # Usage: notify.sh <report.md>
 #
@@ -50,6 +56,17 @@ cat > "$OUT" <<EOF
 
 $QUESTIONS
 EOF
+
+# Persistent banner first — survives the 3am launchd run regardless of GUI state.
+# Best-effort: a notification failure must never break the run. osascript string
+# literals are double-quoted, so strip any double quotes from the interpolated count
+# line to keep the AppleScript well-formed.
+if command -v osascript >/dev/null 2>&1; then
+  plural=$([ "$COUNT" -eq 1 ] || echo s)
+  osascript -e "display notification \"$COUNT open question$plural — see inbox\" with title \"Autodream — $DATE\" sound name \"Glass\"" >/dev/null 2>&1 \
+    && echo "notify.sh: posted notification for $DATE ($COUNT open question$plural)" \
+    || echo "notify.sh: notification post failed (continuing)"
+fi
 
 if [ -x "$SUBL" ]; then
   "$SUBL" "$OUT"
