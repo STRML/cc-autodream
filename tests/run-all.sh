@@ -105,12 +105,28 @@ test_self_audit_stats(){
 }
 
 test_idempotent(){
-  echo "# idempotent (pre-existing findings JSON is not re-run)"
+  echo "# idempotent (pre-existing VALID findings JSON is not re-run)"
   local root; root=$(setup_env); mk_session "$root" sess1
   local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
-  mkdir -p "$(fdir "$root")"; printf 'SENTINEL' > "$(fdir "$root")/$h.json"
+  # A valid findings record (has a top-level findings key) marks a completed
+  # triage; the run must leave it untouched. Sentinel lives in session_path.
+  mkdir -p "$(fdir "$root")"
+  printf '{"session_path":"SENTINEL","findings":[]}' > "$(fdir "$root")/$h.json"
   run_dream "$root"
-  assert_eq "$(cat "$(fdir "$root")/$h.json")" "SENTINEL" "existing findings JSON left untouched"
+  assert_eq "$(jq -r .session_path "$(fdir "$root")/$h.json")" "SENTINEL" "valid findings JSON left untouched"
+  rm -rf "$root"
+}
+
+test_revalidates_garbage(){
+  echo "# a non-empty but malformed findings JSON is re-dispatched, not counted as done"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # Old contract treated any non-empty file as done; new contract re-runs a
+  # record that lacks a valid top-level findings key (a worker that emitted
+  # garbage). The mock worker overwrites it with a well-formed record.
+  mkdir -p "$(fdir "$root")"; printf 'GARBAGE{not json' > "$(fdir "$root")/$h.json"
+  run_dream "$root"
+  assert_eq "$(jq -e 'has("findings")' "$(fdir "$root")/$h.json" 2>/dev/null)" "true" "garbage findings JSON re-dispatched and replaced"
   rm -rf "$root"
 }
 
@@ -291,6 +307,7 @@ test_happy
 test_unreadable
 test_incomplete
 test_idempotent
+test_revalidates_garbage
 test_no_sessions
 test_framing
 test_changelog

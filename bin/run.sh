@@ -194,7 +194,7 @@ l1_missing_count() { # count sessions in $SESSIONS_LIST that still have no findi
   while IFS= read -r s; do
     [ -n "$s" ] || continue
     h=$(printf "%s" "$s" | shasum -a 1 | cut -c1-12)
-    [ -s "$FINDINGS_DIR/$h.json" ] || m=$((m + 1))
+    jq -e .findings "$FINDINGS_DIR/$h.json" >/dev/null 2>&1 || m=$((m + 1))
   done < "$SESSIONS_LIST"
   printf '%s' "$m"
 }
@@ -206,7 +206,11 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     output="$FINDINGS_DIR/$hash.json"
     errlog="$output.err"
 
-    [ -s "$output" ] && exit 0  # idempotent
+    # Idempotent, but validate: a non-empty file that is malformed or lacks a
+    # top-level findings key is NOT a completed triage (a worker that emitted
+    # garbage JSON). Treat it as missing so this pass re-dispatches it, rather
+    # than letting it count as done and feed broken records to L2.
+    jq -e .findings "$output" >/dev/null 2>&1 && exit 0
 
     # Validate the session is readable BEFORE spawning a worker. A path that find
     # enumerated but that is gone/unreadable by dispatch time otherwise sends the
