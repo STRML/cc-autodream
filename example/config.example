@@ -1,0 +1,20 @@
+# cc-autodream config — copy to ~/.claude/autodream/config and edit.
+#
+# This file is sourced by the scripts as plain bash (KEY=VALUE), so quote values
+# with spaces. Environment variables always override anything set here.
+
+# Where the interactive morning triage (review.sh) opens.
+#   inline  (default)  run the claude session in the current terminal. Launching
+#                      review.sh as a shell script means macOS routes it to the
+#                      default handler for public.shell-script (often iTerm2).
+#   cmux               launch it in its own dedicated cmux workspace.
+AUTODREAM_TRIAGE_SURFACE=cmux
+
+# Whether the cmux triage workspace grabs focus when it launches.
+#   false (default)  open it in the background; don't yank you out of your work
+#   true             switch to the new workspace immediately
+# AUTODREAM_TRIAGE_FOCUS=false
+
+# Path to the cmux CLI. Only consulted when the surface above is `cmux`.
+# Defaults to the app-bundle path; uncomment to override.
+# CMUX_BIN=/Applications/cmux.app/Contents/Resources/bin/cmux

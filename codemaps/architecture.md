@@ -40,7 +40,7 @@ bin/run.sh  TARGET_DATE
 | `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); picks the scheduled plist that runs `run.sh` for its label namespace |
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/notify.sh` | extract "Open questions" → inbox file in Sublime |
-| `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`) |
+| `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`); `AUTODREAM_TRIAGE_SURFACE=cmux` (config/env) launches it in its own cmux workspace instead of inline |
 | `prompts/SESSION_TRIAGE.md` | L1 prompt: per-session JSON schema |
 | `prompts/PROMPT.md` | L2 prompt: report sections incl. Upstream changes + Autodream self-audit, memory rules |
 | `tests/run-all.sh` | integration tests vs `mock-claude.sh` (offline) |
@@ -73,6 +73,10 @@ All optional; full list (with defaults) is documented in `bin/run.sh`'s header. 
 | `AUTODREAM_NETCHECK` / `AUTODREAM_RETRY_WAIT` | `1` / `60` | network-wait between retry rounds |
 | `AUTODREAM_SLIM_BYTES` | `262144` | sessions larger than this are slimmed for L1 |
 | `SUBL` | `$HOME/bin/subl` then PATH | Sublime CLI for `notify.sh` |
+| `AUTODREAM_TRIAGE_SURFACE` | `inline` | `review.sh` triage surface: `inline` (current terminal) or `cmux` (own workspace) |
+| `AUTODREAM_TRIAGE_FOCUS` | `false` | cmux surface only: `true` switches to the new workspace on launch, `false` opens it in the background |
+| `CMUX_BIN` | `/Applications/cmux.app/.../bin/cmux` then PATH | cmux CLI, used when surface is `cmux` |
+| `AUTODREAM_CONFIG` | `$AUTODREAM_DIR/config` | sourced KEY=VALUE config (env vars override it) |
 
 ## Lean queries / no self-pollution (see CLAUDE.md for full detail)
 

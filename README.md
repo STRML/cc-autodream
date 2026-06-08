@@ -97,6 +97,16 @@ AUTODREAM_FORCE=1 ~/.claude/autodream/run.sh 2026-05-29  # rebuild a date
 ~/.claude/autodream/review.sh                            # solve the latest report's questions
 ```
 
+By default `review.sh` runs the triage session inline in the current terminal —
+and if you launch it as a shell script, macOS hands it to whatever app is the
+default handler for shell scripts (often iTerm2). To make it open in its own
+cmux workspace instead, drop a config file at `~/.claude/autodream/config`
+(see `example/config.example`):
+
+```bash
+AUTODREAM_TRIAGE_SURFACE=cmux    # inline (default) | cmux
+```
+
 A full run usually takes more than 10 minutes. If you're kicking it off from
 something that kills long jobs (a Claude Code background task, a flaky ssh session),
 use `autodream-now.sh` — it hands the run to launchd, which has no time cap and keeps
