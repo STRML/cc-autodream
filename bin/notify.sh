@@ -72,16 +72,28 @@ cat > "$OUT" <<EOF
 $QUESTIONS
 EOF
 
-# Persistent banner first — survives the 3am launchd run regardless of GUI state.
+# Persistent banner — survives the 3am launchd run regardless of GUI state.
 # Best-effort: a notification failure must never break the run.
 #
-# terminal-notifier gives a CLICKABLE banner (-execute runs on click → opens the
-# inbox file in Sublime). Plain osascript banners cannot carry a click action, so they
-# are only the fallback when terminal-notifier is absent. -group collapses repeat
-# notifications for the same date instead of stacking. NOTE: click-to-open requires
-# terminal-notifier's notification style to be "Alerts" (not "Banners") in System
-# Settings ▸ Notifications — banners can auto-dismiss before you click them.
+# Resilience note (learned the hard way, 2026-06): a banner's exit code does NOT prove it
+# was shown. If the sender's notification permission is off — or a Focus/Do-Not-Disturb
+# suppresses it — macOS silently drops the banner to Notification Center and the command
+# still exits 0. The branded cc-autodream.app bundle is its OWN sender, so when branding
+# was introduced macOS treated it as a new app defaulting to notifications-off, and every
+# nightly banner vanished for a week while the log read "posted". That auth state is
+# TCC-protected and unreadable from a script, so we cannot detect the drop.
+#
+# Defense: fire BOTH senders. terminal-notifier gives the CLICKABLE, branded banner
+# (-execute opens the inbox in Sublime; -group collapses repeats). osascript posts through
+# the system's already-trusted sender as a backup floor, so one blacked-out sender can't
+# black out the whole alert. The osascript backup is silent (no -sound) to avoid a double
+# chime when both land; set AUTODREAM_NOTIFY_OSA_BACKUP=0 to suppress the backup entirely.
+# NOTE: for click-to-open, the cc-autodream sender's style must be "Alerts" (not "Banners",
+# which auto-dismiss) in System Settings ▸ Notifications, and allowed through any Focus.
 plural=$([ "$COUNT" -eq 1 ] || echo s)
+OSA_BACKUP="${AUTODREAM_NOTIFY_OSA_BACKUP:-1}"
+posted=0
+
 if [ -n "$NOTIFIER" ]; then
   "$NOTIFIER" \
     -title "Autodream — $DATE" \
@@ -89,13 +101,19 @@ if [ -n "$NOTIFIER" ]; then
     -execute "open -a 'Sublime Text' '$OUT'" \
     -group "autodream-$DATE" \
     -sound Glass >/dev/null 2>&1 \
-    && echo "notify.sh: posted clickable notification for $DATE ($COUNT open question$plural)" \
+    && { echo "notify.sh: posted clickable notification for $DATE ($COUNT open question$plural)"; posted=1; } \
     || echo "notify.sh: terminal-notifier post failed (continuing)"
-elif command -v osascript >/dev/null 2>&1; then
-  osascript -e "display notification \"$COUNT open question$plural — see inbox\" with title \"Autodream — $DATE\" sound name \"Glass\"" >/dev/null 2>&1 \
-    && echo "notify.sh: posted notification for $DATE ($COUNT open question$plural; install terminal-notifier for click-to-open)" \
-    || echo "notify.sh: notification post failed (continuing)"
 fi
+
+# osascript is the primary when there's no terminal-notifier, otherwise the backup sender.
+if command -v osascript >/dev/null 2>&1 && { [ -z "$NOTIFIER" ] || [ "$OSA_BACKUP" != "0" ]; }; then
+  if [ -n "$NOTIFIER" ]; then osa_sound=""; osa_role="backup"; else osa_sound=' sound name "Glass"'; osa_role="primary"; fi
+  osascript -e "display notification \"$COUNT open question$plural — see inbox\" with title \"Autodream — $DATE\"$osa_sound" >/dev/null 2>&1 \
+    && { echo "notify.sh: posted osascript $osa_role banner for $DATE"; posted=1; } \
+    || echo "notify.sh: osascript notification post failed (continuing)"
+fi
+
+[ "$posted" -eq 1 ] || echo "notify.sh: WARNING no banner posted for $DATE (inbox written to $OUT)"
 
 if [ -x "$SUBL" ]; then
   "$SUBL" "$OUT"
