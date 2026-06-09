@@ -27,6 +27,7 @@
 #   AUTODREAM_NETCHECK   set 0 to skip waiting-for-network on retry  default: 1
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
+#   AUTODREAM_L2_MODEL   override the L2 aggregator model            default: fable-5 until 2026-06-20, claude-opus-4-7 from 2026-06-21
 
 set -u
 
@@ -417,6 +418,22 @@ EOF
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
   # "no report" overnight). Retry until $REPORT_PATH is non-empty, waiting for the
   # network between attempts. Idempotent: a re-run overwrites the report harmlessly.
+  # Fable 5 is included in the subscription only until 2026-06-20; it moves to
+  # usage-based pricing on 2026-06-21, so revert to opus from that day on. The
+  # cutoff keys on the wall-clock run date (when the call is billed), not the
+  # target date being processed. Pin the exact "claude-fable-5[1m]" string: the
+  # CLI silently falls back to opus on unrecognized --model values (verified
+  # 2026-06-09 on 2.1.170), and bare "claude-fable-5" is one of those — only
+  # the alias "fable" and the [1m]-suffixed form actually serve Fable 5.
+  if [ -z "${AUTODREAM_L2_MODEL:-}" ]; then
+    if [ "$(date +%Y%m%d)" -ge 20260621 ]; then
+      AUTODREAM_L2_MODEL="claude-opus-4-7"
+    else
+      AUTODREAM_L2_MODEL="claude-fable-5[1m]"
+    fi
+  fi
+  log "L2 model: $AUTODREAM_L2_MODEL"
+
   L2_ATTEMPTS="${AUTODREAM_L2_ATTEMPTS:-3}"
   L2_START=$(date +%s)
   L2_RC=1
@@ -438,7 +455,7 @@ EOF
       } | "$CLAUDE_BIN" \
         --print \
         --permission-mode bypassPermissions \
-        --model claude-opus-4-7 \
+        --model "$AUTODREAM_L2_MODEL" \
         --no-session-persistence \
         --tools Glob Read Write Edit \
         --disable-slash-commands \
