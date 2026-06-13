@@ -82,8 +82,14 @@ test_incomplete(){
   local root; root=$(setup_env); mk_session "$root" sess1
   export MOCK_MODE=l1_incomplete; run_dream "$root"; unset MOCK_MODE
   local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
-  assert_no_file  "$(fdir "$root")/$h.json"     "no output JSON (left absent so a re-run retries)"
-  assert_nonempty "$(fdir "$root")/$h.json.err" ".err is non-empty (no silent zero-byte file)"
+  # After the 2026-06-11 self-audit fix: on the FINAL retry round, a worker
+  # that produced no output gets a metadata-only stub so the session is
+  # visible to L1_ERRORED and the L2 aggregator instead of becoming a silent
+  # .err. Earlier rounds still left the slot absent so retries could fire.
+  assert_file     "$(fdir "$root")/$h.json"     "final-round stub written (no longer a silent failure)"
+  assert_grep     "$(fdir "$root")/$h.json"     'worker exited without findings JSON' "stub carries the failure reason"
+  assert_grep     "$(fdir "$root")/$h.json"     '"findings":\[\]'                     "stub has an empty findings array (counted by L1_ERRORED via the error key)"
+  assert_nonempty "$(fdir "$root")/$h.json.err" ".err is still non-empty (per-round diagnostics)"
   assert_grep     "$(fdir "$root")/$h.json.err" 'incomplete run' ".err carries a diagnostic"
   assert_file     "$root/dreams/$DATE.md"       "L2 still produced the report"
   rm -rf "$root"
@@ -101,6 +107,37 @@ test_self_audit_stats(){
   assert_grep  "$stats" 'self_sessions_excluded: 1' "stats record the excluded self-session"
   assert_grep  "$stats" 'sessions_triaged: 1'        "stats record the triaged count"
   assert_grep  "$stats" 'l1_findings_with_error: 0'  "stats record the in-band error count"
+  # 2026-06-11 self-audit fix: vs.-raw denominator + cache-disambiguating fields.
+  assert_grep  "$stats" 'sessions_dropped_after_failures: 0'   "no dropped sessions on a clean happy-path run"
+  assert_grep  "$stats" 'l1_sessions_already_done_at_start: 0' "no precached findings on a fresh run"
+  assert_grep  "$stats" 'l1_sessions_freshly_processed: 1'     "the one session was freshly processed this run"
+  rm -rf "$root"
+}
+
+test_self_audit_stats_failure_denominator(){
+  echo "# self-audit stats: dropped-after-failures is nonzero when a worker dies"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export MOCK_MODE=l1_incomplete; run_dream "$root"; unset MOCK_MODE
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_file  "$stats" "run-stats.txt written"
+  # After the fix, even a stubbed final-round failure is counted: the stub
+  # carries an "error" key so it lands in l1_findings_with_error, AND the
+  # vs.-raw denominator stays accurate. Old behavior reported zero across
+  # the board even though the session never produced real findings.
+  assert_grep  "$stats" 'l1_findings_with_error: 1' "stats now surface the failed session via the error key"
+  rm -rf "$root"
+}
+
+test_self_audit_stats_precached_disambiguation(){
+  echo "# self-audit stats: precached findings counted so fast elapsed isn't 'impossible'"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  # Pre-seed a valid findings JSON so dispatcher's idempotency skips the worker.
+  mkdir -p "$(fdir "$root")"; printf '{"session_path":"CACHED","findings":[]}' > "$(fdir "$root")/$h.json"
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep  "$stats" 'l1_sessions_already_done_at_start: 1' "precached session counted as already done"
+  assert_grep  "$stats" 'l1_sessions_freshly_processed: 0'     "no fresh work this run"
   rm -rf "$root"
 }
 
@@ -318,6 +355,8 @@ test_skip_empty_disabled
 test_l1_retry
 test_idempotency_guard
 test_self_audit_stats
+test_self_audit_stats_failure_denominator
+test_self_audit_stats_precached_disambiguation
 test_slim_transcript
 echo
 echo "----------------------------------------"
