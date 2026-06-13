@@ -280,10 +280,24 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     else
       [ -n "$slimfile" ] && rm -f "$slimfile"
       # Worker exited without writing findings JSON. Record a diagnostic so the
-      # failure is visible (no more silent zero-byte .err files). Leave $output
-      # absent so a re-run retries this (possibly transient) session.
+      # failure is visible.
       printf "worker produced no findings JSON for %s (incomplete run: claude exited without writing output)\n" "$session" >> "$errlog"
-      echo "FAIL: $session ($hash) — see $errlog" >&2
+      # On the FINAL retry round, fall back to a metadata-only findings stub so
+      # the session is visible to L1_ERRORED and the L2 aggregator instead of
+      # disappearing into a silent .err file (the old behavior, which the
+      # 2026-06-11 self-audit flagged: 12 .err with l1_findings_with_error=0).
+      # Earlier rounds leave $output absent so the next round can retry; only
+      # the last round writes the stub. AUTODREAM_L1_ROUNDS comes through the
+      # environment (exported below).
+      if [ "${AUTODREAM_CURRENT_ROUND:-1}" -ge "${AUTODREAM_L1_ROUNDS:-5}" ]; then
+        sz=$(wc -c < "$session" 2>/dev/null | tr -d " ")
+        lines=$(wc -l < "$session" 2>/dev/null | tr -d " ")
+        printf "{\"session_path\":\"%s\",\"error\":\"worker exited without findings JSON after %s rounds\",\"meta\":{\"bytes\":%s,\"lines\":%s,\"slimmed\":%s},\"findings\":[]}\n" \
+          "$session" "${AUTODREAM_L1_ROUNDS:-5}" "${sz:-0}" "${lines:-0}" "$([ -n "$slimfile" ] && echo true || echo false)" > "$output"
+        echo "FAIL (metadata stub written): $session ($hash) — see $errlog" >&2
+      else
+        echo "FAIL: $session ($hash) — see $errlog" >&2
+      fi
     fi
   ' _ {}
 }
@@ -362,14 +376,29 @@ EOF
   # call inherit it.
   export CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1
   export CLAUDE_BIN AUTODREAM_DIR FINDINGS_DIR SLIM WORK_DIR
+  # AUTODREAM_L1_ROUNDS is referenced by the dispatcher subshell to decide
+  # whether this is the last retry round (gates the metadata-stub fallback).
+  export AUTODREAM_L1_ROUNDS
 
   clean_work_bucket  # start clean: drop any stub left by a prior run's workers
+
+  # Pre-L1 cache snapshot: how many sessions in the worklist already have a valid
+  # findings JSON before any worker runs. Without this, a re-run after a partial
+  # crash shows an "impossible" l1_elapsed_seconds (e.g. 2s for 36 sessions)
+  # because the dispatcher's idempotent skip exits every worker instantly. The
+  # aggregator's self-audit needs this to disambiguate "fast run" from "broken
+  # timer".
+  L1_PRECACHED=$(l1_missing_count)
+  L1_PRECACHED=$(( COUNT - L1_PRECACHED ))
 
   L1_START=$(date +%s)
   L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-5}"
   MISSING=$COUNT
   for round in $(seq 1 "$L1_ROUNDS"); do
     log "L1 triage round $round/$L1_ROUNDS (fanout=$FANOUT)..."
+    # The dispatcher's subshell reads this to decide whether the last-round
+    # metadata-stub fallback should fire for sessions that produced no output.
+    export AUTODREAM_CURRENT_ROUND="$round"
     dispatch_l1
     MISSING=$(l1_missing_count)
     L1_DONE=$(ls -1 "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
@@ -396,18 +425,37 @@ EOF
   # own (already excluded), how many workers failed, how many retry rounds it took.
   # Surface it so PROMPT.md's "Autodream self-audit" section can flag regressions
   # (e.g. the self-pollution exclusion count climbing again) and propose source fixes.
+  # Sessions enumerated by find but unaccounted for at run end — not pruned as
+  # self/empty, not in findings. This is the gap the 2026-06-11 self-audit
+  # caught: 12 .err files existed but stats showed l1_missing_after_retries=0
+  # because both denominators counted from the POST-prune sessions.txt. By
+  # computing against RAW and subtracting the legitimate prunes, any session
+  # lost to a filter mis-classification or silent worker death surfaces here.
+  # Bounded at 0 in case of a counting bug in the prunes.
+  DROPPED_AFTER_FAILURES=$(( RAW - L1_OK - EXCLUDED - SKIPPED_EMPTY ))
+  [ "$DROPPED_AFTER_FAILURES" -lt 0 ] && DROPPED_AFTER_FAILURES=0
+  L1_FRESHLY_PROCESSED=$(( L1_OK - L1_PRECACHED ))
+  [ "$L1_FRESHLY_PROCESSED" -lt 0 ] && L1_FRESHLY_PROCESSED=0
   {
     printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
     printf 'sessions_found_raw: %s\n' "$RAW"
     printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
     printf 'sessions_skipped_empty: %s\n' "$SKIPPED_EMPTY"
     printf 'sessions_triaged: %s\n' "$COUNT"
+    # vs.-raw denominator: a session lost to ANY path (prune mis-classification,
+    # silent worker death, slim leftovers) shows up here. Always >= 0; if
+    # nonzero, the aggregator should investigate even when l1_missing=0.
+    printf 'sessions_dropped_after_failures: %s\n' "$DROPPED_AFTER_FAILURES"
     printf 'l1_rounds_used: %s\n' "$round"
     printf 'l1_rounds_max: %s\n' "$L1_ROUNDS"
     printf 'l1_findings_written: %s\n' "$L1_OK"
     printf 'l1_findings_with_error: %s\n' "$L1_ERRORED"
     printf 'l1_missing_after_retries: %s\n' "$MISSING"
     printf 'l1_err_files: %s\n' "$L1_FAIL"
+    # Cached vs. fresh: lets the aggregator distinguish a sub-second "elapsed"
+    # caused by everything already being done from a broken timer.
+    printf 'l1_sessions_already_done_at_start: %s\n' "$L1_PRECACHED"
+    printf 'l1_sessions_freshly_processed: %s\n' "$L1_FRESHLY_PROCESSED"
     printf 'l1_elapsed_seconds: %s\n' "$L1_ELAPSED"
   } > "$FINDINGS_DIR/run-stats.txt"
 
