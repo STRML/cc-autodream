@@ -88,7 +88,10 @@ test_incomplete(){
   # .err. Earlier rounds still left the slot absent so retries could fire.
   assert_file     "$(fdir "$root")/$h.json"     "final-round stub written (no longer a silent failure)"
   assert_grep     "$(fdir "$root")/$h.json"     'worker exited without findings JSON' "stub carries the failure reason"
-  assert_grep     "$(fdir "$root")/$h.json"     '"findings":\[\]'                     "stub has an empty findings array (counted by L1_ERRORED via the error key)"
+  # Whitespace-tolerant: the project-field normalization pass rewrites this stub via
+  # json.dump (it has a real session_path + no project), reformatting "findings":[] →
+  # "findings": []. The assertion is about the empty array, not its exact spacing.
+  assert_grep     "$(fdir "$root")/$h.json"     '"findings": *\[\]'                   "stub has an empty findings array (counted by L1_ERRORED via the error key)"
   assert_nonempty "$(fdir "$root")/$h.json.err" ".err is still non-empty (per-round diagnostics)"
   assert_grep     "$(fdir "$root")/$h.json.err" 'incomplete run' ".err carries a diagnostic"
   assert_file     "$root/dreams/$DATE.md"       "L2 still produced the report"
