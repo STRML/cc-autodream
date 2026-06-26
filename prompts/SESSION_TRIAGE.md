@@ -26,7 +26,7 @@ Quote 1-3 sentences of evidence for every finding. Don't synthesize, don't infer
 
 | Category | Signal in transcript |
 |---|---|
-| `missed_skill` | User invoked a skill manually after Claude did ad-hoc work; Claude did multi-step setup that a known skill (e.g. python-env-management, commit-and-verify) would have automated; Claude said "let me check the help" for a tool that has a skill wrapper. |
+| `missed_skill` | User invoked a skill manually after Claude did ad-hoc work; Claude did multi-step setup that a known skill (e.g. python-env-management, commit-and-verify) would have automated; Claude said "let me check the help" for a tool that has a skill wrapper. **Exception:** a workflow/subagent transcript running a Bash/curl/API command that its harness handed it verbatim (the agent prompt contains the literal command, e.g. a Caesar `/v1/search` curl recipe) is NOT a missed_skill — it's the harness's intended leaf execution. Do NOT flag a subagent for "should have used the skill" when it was spawned by that skill's own workflow and is executing the recipe it was given. |
 | `wrong_skill` | Claude invoked a skill that didn't fit; user corrected ("no use X instead"). |
 | `sandbox_friction` | `Operation not permitted`, `dangerouslyDisableSandbox: true` retries, `/tmp` writes failing, permission prompts denied. |
 | `memory_miss` | User says "I told you", "we established", "remember", "the same as last time"; Claude re-discovers a workaround that was used in a previous session. |
