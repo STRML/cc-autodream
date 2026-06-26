@@ -20,6 +20,7 @@ All other inputs you need (treat `<findings-dir>` below as the literal path from
 - **Installed skills**: walk `~/.claude/skills/`, `~/.claude/plugins/*/skills/`, and project `.claude/skills/`. Each has frontmatter `description`/triggers. Use this to validate `missed_skill` findings (skill exists? trigger matches?).
 - **Memory files**: `~/.claude/projects/*/memory/MEMORY.md` (one per project — may not exist).
 - **Global rules**: `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`.
+- **Installed hooks**: `~/.claude/hooks/*.sh` and the `hooks` block of `~/.claude/settings.json`. These are the primary target of "tighten/add a hook" proposals — read the specific hook (including its comments) before proposing a change to it. The reasoning for why a hook behaves as it does usually lives in its header comment, not in git history.
 - **Run self-audit stats**: `<findings-dir>/run-stats.txt`, if present — runtime telemetry the runner captured about *this autodream run itself* (sessions found vs. self-excluded vs. triaged, L1 retry rounds, workers still missing, `.err` count, elapsed). Drives the "Autodream self-audit" report section below.
 - **Changelog window**: `<findings-dir>/changelog-window.md`, if present. The runner already cloned/pulled `anthropics/claude-code` and diffed `CHANGELOG.md` over this report's date window, so this file holds the verbatim new release entries (version headers + bullets) with a few `# `-prefixed comment lines at the top (source, HEAD sha, commit count). Read it and drive the "Upstream Claude Code changes" report section below. The file may say "No changelog commits in this window." or report a clone/fetch failure — handle both per that section.
 
@@ -55,8 +56,11 @@ For each, ordered by (count × max-severity) descending, cap at 10:
 - **Severity**: high | medium | low (worst seen)
 - **Examples**: 1–3 verbatim evidence excerpts with `session_path` references
 - **Proposed action**: concrete sentence — skill to invoke, allowlist line, memory entry to add, or CLAUDE.md edit
+- **Grounded against**: the `file:line` you read to verify the proposal isn't already done or already-rejected, plus what it showed — or "n/a — no concrete artifact". A proposal that touches a concrete artifact with no grounding entry must not ship.
 - **Confidence**: high | medium | low
 - **Auto-applied**: yes/no (and a link to the file you edited)
+
+**Grounding gate (do this before writing any Proposed action that edits a concrete artifact — a hook script, `settings.json`, a skill, `CLAUDE.md`, a rule):** Read that artifact in full first, *including its code comments*. If the change is already implemented, drop the finding or restate it as "already addressed" citing the `file:line`. If the file's comments show a prior attempt was tried and reverted, your proposal must engage with that recorded reason rather than repeat the original idea. This is `verify-spec-against-code` applied to your own recommendation — the report prescribes that check for the sessions it reviews, so it must hold itself to the same bar. Record the result in the **Grounded against** field above.
 
 ## Per-project notes
 For each project with ≥3 findings, a short paragraph: what went well, what hurt.
