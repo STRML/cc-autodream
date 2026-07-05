@@ -24,6 +24,8 @@ Then:
 
 Quote 1-3 sentences of evidence for every finding. Don't synthesize, don't infer — only report what's literally in the transcript.
 
+**HARD RULE — harness-provided tools are never `fabricated_id`.** A tool named `StructuredOutput` (or `SendMessage`, `Task`) appearing in a `tool_use` but NOT in the `skill_listing` attachment is provided by the workflow/subagent harness, not fabricated. Never flag it. This applies regardless of the transcript's path (slimmed copies lose the `/subagents/workflows/` path hint). Only flag a tool invocation as `fabricated_id` if its `tool_result` is an error saying the tool does not exist.
+
 | Category | Signal in transcript |
 |---|---|
 | `missed_skill` | User invoked a skill manually after Claude did ad-hoc work; Claude did multi-step setup that a known skill (e.g. python-env-management, commit-and-verify) would have automated; Claude said "let me check the help" for a tool that has a skill wrapper. **Exception:** a workflow/subagent transcript running a Bash/curl/API command that its harness handed it verbatim (the agent prompt contains the literal command, e.g. a Caesar `/v1/search` curl recipe) is NOT a missed_skill — it's the harness's intended leaf execution. Do NOT flag a subagent for "should have used the skill" when it was spawned by that skill's own workflow and is executing the recipe it was given. |
@@ -32,7 +34,7 @@ Quote 1-3 sentences of evidence for every finding. Don't synthesize, don't infer
 | `memory_miss` | User says "I told you", "we established", "remember", "the same as last time"; Claude re-discovers a workaround that was used in a previous session. |
 | `tool_loop` | Same command retried ≥3 times with minor variants (>2 close-but-different curl/grep/find variants in <10 turns). |
 | `permission_prompt` | Commands the user repeatedly allowed or repeatedly denied that should be in `.claude/settings.json` allowlist/denylist. |
-| `fabricated_id` | Claude quoted a SHA, PR number, line number, function name, or version that wasn't from a just-run command. **Exception:** workflow/subagent transcripts (paths containing `/subagents/workflows/`) may invoke tools provided by the workflow harness (e.g. `StructuredOutput`) that do not appear in the `skill_listing` attachment. Do NOT flag these as `fabricated_id` unless the `tool_result` is an error. |
+| `fabricated_id` | Claude quoted a SHA, PR number, line number, function name, or version that wasn't from a just-run command. See the HARD RULE above: tools like `StructuredOutput` that succeed but aren't in `skill_listing` are harness-provided — never flag them. |
 | `stop_projection` | "you must be tired", "let's pick this back up", "we should stop", any variant. |
 | `drift_after_compaction` | Context summarization happened (look for compaction markers or sudden context loss) and a fact established earlier was forgotten/re-asked. |
 | `assumption_unsurfaced` | Claude proceeded with non-trivial work without an ASSUMPTIONS block when global CLAUDE.md required it. |
