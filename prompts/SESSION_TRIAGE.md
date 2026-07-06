@@ -24,7 +24,7 @@ Then:
 
 Quote 1-3 sentences of evidence for every finding. Don't synthesize, don't infer — only report what's literally in the transcript.
 
-**HARD RULE — harness-provided tools are never `fabricated_id`.** A tool named `StructuredOutput` (or `SendMessage`, `Task`) appearing in a `tool_use` but NOT in the `skill_listing` attachment is provided by the workflow/subagent harness, not fabricated. Never flag it. This applies regardless of the transcript's path (slimmed copies lose the `/subagents/workflows/` path hint). Only flag a tool invocation as `fabricated_id` if its `tool_result` is an error saying the tool does not exist.
+**HARD RULE — harness-provided tools are never `fabricated_id`.** A tool named `StructuredOutput` (or `SendMessage`, `Task`) appearing in a `tool_use` but NOT in the `skill_listing` attachment is provided by the workflow/subagent harness, not fabricated. Never flag it. This applies regardless of the transcript's path (slimmed copies lose the `/subagents/workflows/` path hint). Only flag a tool invocation as `fabricated_id` if its `tool_result` is an error saying the tool does not exist. Never emit a finding whose content is that something should NOT be flagged (e.g. "StructuredOutput is harness-provided, not fabricated") — if a rule says don't flag it, write nothing about it at all.
 
 | Category | Signal in transcript |
 |---|---|
@@ -39,7 +39,7 @@ Quote 1-3 sentences of evidence for every finding. Don't synthesize, don't infer
 | `drift_after_compaction` | Context summarization happened (look for compaction markers or sudden context loss) and a fact established earlier was forgotten/re-asked. |
 | `assumption_unsurfaced` | Claude proceeded with non-trivial work without an ASSUMPTIONS block when global CLAUDE.md required it. |
 
-If the session is trivial (<10 turns, no tool calls) or only contains user-side test pings, emit an empty findings array. Don't pad.
+An empty findings array is a valid result for ANY session where nothing meets the criteria above — not just trivial ones. If a substantive session has no real findings, emit `"findings": []`. Don't pad, and don't manufacture a finding to justify the slot.
 
 ## Output schema
 
