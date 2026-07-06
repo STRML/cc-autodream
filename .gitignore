@@ -5,3 +5,4 @@ findings/
 logs/
 inbox/
 .serena/
+.claude/settings.local.json
