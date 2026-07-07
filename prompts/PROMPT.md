@@ -82,7 +82,7 @@ cc-autodream is its author's own project — turn the lens on the pipeline itsel
 Keep it to what the stats and findings actually show; skip the section's sub-bullets that have nothing to report. If `run-stats.txt` is absent, say so and move on.
 
 ## Open questions for the user
-Anything ambiguous that needs a human call before being acted on. Group by topic.
+Anything ambiguous that needs a human call before being acted on. Group by topic. Format each question as a numbered item (`1.`, `2.`, …); a bold topic lead-in and detail sub-bullets under an item are fine. The morning notifier counts these items to headline its banner, and `review.sh` walks them in order — heading-only or prose-only questions have been miscounted before.
 ```
 
 ### 2. Memory updates (high-confidence only)
@@ -96,7 +96,7 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 - Keep each file ≤200 lines AND ≤25,000 bytes — these are the same caps Anthropic's auto-dream enforces (`MAX_ENTRYPOINT_LINES = 200`, `MAX_ENTRYPOINT_BYTES = 25_000` in `src/memdir/memdir.ts`). If you'd overflow, remove the oldest *non-pinned* entry only.
 - Each MEMORY.md line is an **index entry**, not a full memory body. Hold it under ~150 characters: one-line pointer that can include a markdown link to a topic file. (claude-dream and Anthropic's auto-dream both groom on this contract — staying within it makes your pins survive their passes.)
 - When you write a longer-form memory body, put it in a topic file alongside MEMORY.md with frontmatter `type: feedback` (or `project` / `reference` where applicable — match Anthropic's four-type taxonomy: `user`, `feedback`, `project`, `reference`). cc-autodream's signal almost always maps to `type: feedback`.
-- Record EVERY edit in the report's "Auto-applied: yes" lines.
+- Record EVERY edit in the report's "Auto-applied: yes" lines. Before writing "Auto-applied: yes", Read the edited file back and confirm the change is on disk — never claim an edit you have not verified, and never reference a topic file or `[[pin]]` you did not just write or confirm exists. (A past report cited a pin that was never actually written.)
 - **Sidecar for the GC step**: every time you write to a project's `MEMORY.md`, append the project's encoded directory name (the `<encoded-cwd>` segment of the path) as a new line in a `touched-projects.txt` file inside the findings directory (the literal path from line 1). The runner reads this file after you exit and triggers `claude-memory gc` for each listed project so the consolidator can resettle around your new pins. If you didn't touch any project memory, don't create the file.
 
 ### 3. Anything you may NOT edit
@@ -120,5 +120,6 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 
 - Quote evidence verbatim — never paraphrase.
 - Be specific in proposed actions ("add `mgrep` to allowlist in `.claude/settings.json`" not "improve permissions").
+- A proposed action must be consistent with its own quoted examples. Re-read the excerpts before writing it: if the evidence shows an approach *failing*, propose the approach the sessions actually succeeded with, not a doubling-down on the failing one. (The grounding gate checks the target artifact; this checks the evidence — a past report recommended the exact command form its own examples showed being rejected.)
 - Boring beats clever. Skip findings whose only proposed action is vague.
 - Cap report at ~400 lines. If you have more signal than that, raise the bar for what makes the cut.

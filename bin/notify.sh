@@ -49,10 +49,18 @@ QUESTIONS=$(awk '
   capture { print }
 ' "$REPORT")
 QUESTIONS=$(printf "%s" "$QUESTIONS" | awk 'NF{p=1} p')
-# Count question items: L2 may format them as a numbered list ("1.") or as dash
-# bullets grouped under bold subheadings ("- ..."). Match both, or notify silently
-# no-ops on a report that is actually full of questions.
-COUNT=$(printf "%s\n" "$QUESTIONS" | grep -cE '^[[:space:]]*([0-9]+\.|[-*])[[:space:]]' || true)
+# Count QUESTIONS, not list lines. L2 has emitted this section as a numbered list
+# ("1."), as dash bullets under bold subheadings, as plain bullets, and as bare
+# prose. Counting every list marker in one pass overcounts (sub-bullets under a
+# numbered item, detail bullets under a bold title), and prose counts zero — which
+# silently skips the pop on a report that actually has questions. So: take the
+# first format tier that matches, and treat any other non-empty section as one
+# question — a non-empty section must always pop.
+count_matching(){ printf "%s\n" "$QUESTIONS" | grep -cE "$1" || true; }
+COUNT=$(count_matching '^[[:space:]]*[0-9]+\.[[:space:]]')            # numbered items
+[ "$COUNT" -eq 0 ] && COUNT=$(count_matching '^\*\*.+\*\*')           # bold titles
+[ "$COUNT" -eq 0 ] && COUNT=$(count_matching '^[[:space:]]*[-*][[:space:]]')  # bullets
+[ "$COUNT" -eq 0 ] && [ -n "$QUESTIONS" ] && COUNT=1                  # bare prose
 
 if [ -z "$QUESTIONS" ] || [ "$COUNT" -eq 0 ]; then
   echo "notify.sh: $DATE has 0 open questions; nothing to pop"

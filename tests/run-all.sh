@@ -350,6 +350,88 @@ test_slim_transcript(){
   rm -rf "$root"
 }
 
+test_notify(){
+  echo "# notify.sh counts QUESTIONS (not list lines) across L2's observed formats"
+  local NOTIFY="$REPO/bin/notify.sh"
+  [ -x "$NOTIFY" ] || { no "notify.sh executable"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  # Pre-seed an executable dummy at the branded-notifier path so notify.sh
+  # neither bootstraps a real app bundle nor posts a real banner; OSA backup
+  # off for the same reason. SUBL=true keeps Sublime closed.
+  mkdir -p "$root/cc-autodream.app/Contents/MacOS"
+  printf '#!/bin/sh\nexit 0\n' > "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
+  chmod +x "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
+  run_notify() {  # $1=report
+    AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 SUBL=/usr/bin/true \
+      "$NOTIFY" "$1" > "$root/notify.out" 2>&1
+  }
+
+  # numbered items with dash sub-bullets — count the items, not their details
+  cat > "$root/2020-01-01.md" <<'EOF'
+# Autodream — 2020-01-01
+## Open questions for the user
+1. First question?
+   - supporting detail
+   - more detail
+2. Second question?
+   - supporting detail
+## Trailing section
+EOF
+  run_notify "$root/2020-01-01.md"
+  assert_file "$root/inbox/2020-01-01-open-questions.md" "numbered: inbox file written"
+  assert_grep "$root/inbox/2020-01-01-open-questions.md" '^# 2 open questions' "numbered: 2 items, not 5 list lines"
+
+  # bold-title + bullets (the 2026-07-05 format) — count the titles, not the bullets
+  cat > "$root/2020-01-02.md" <<'EOF'
+# Autodream — 2020-01-02
+## Open questions for the user
+
+**Scrape skill guardrail (pattern 1 + 2)**
+- Update step 3?
+- Add a step-6 check?
+
+**TLS-bypass rule (pattern 3)**
+- Add a rule?
+- Where should it live?
+EOF
+  run_notify "$root/2020-01-02.md"
+  assert_file "$root/inbox/2020-01-02-open-questions.md" "bold-title: inbox file written"
+  assert_grep "$root/inbox/2020-01-02-open-questions.md" '^# 2 open questions' "bold-title: 2 titles, not 4 bullets"
+
+  # plain bullets, no headings — bullets are the questions
+  cat > "$root/2020-01-05.md" <<'EOF'
+# Autodream — 2020-01-05
+## Open questions for the user
+- Raise the fanout?
+- Drop the cache?
+EOF
+  run_notify "$root/2020-01-05.md"
+  assert_grep "$root/inbox/2020-01-05-open-questions.md" '^# 2 open questions' "plain bullets: counted 2"
+
+  # plain prose, no list markers at all — non-empty section must still pop
+  cat > "$root/2020-01-03.md" <<'EOF'
+# Autodream — 2020-01-03
+## Open questions for the user
+Should the fanout be raised to 12 given the recent session volume?
+EOF
+  run_notify "$root/2020-01-03.md"
+  assert_file "$root/inbox/2020-01-03-open-questions.md" "prose: inbox file written"
+  assert_grep "$root/inbox/2020-01-03-open-questions.md" '^# 1 open question$' "prose: fallback count is 1"
+
+  # genuinely empty section — must stay a quiet no-op
+  cat > "$root/2020-01-04.md" <<'EOF'
+# Autodream — 2020-01-04
+## Open questions for the user
+
+## Trailing section
+EOF
+  run_notify "$root/2020-01-04.md"
+  assert_no_file "$root/inbox/2020-01-04-open-questions.md" "empty: nothing written"
+  assert_grep "$root/notify.out" '0 open questions' "empty: reports 0"
+
+  rm -rf "$root"
+}
+
 # ---------------------------------------------------------------------------
 
 [ -x "$RUN" ]  || { echo "FATAL: $RUN not executable"; exit 1; }
@@ -376,6 +458,7 @@ test_self_audit_stats_failure_denominator
 test_self_audit_stats_precached_disambiguation
 test_normalize_project
 test_slim_transcript
+test_notify
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"
