@@ -135,8 +135,10 @@ lean-query pattern, and the "don't eat your own tail" self-pollution defenses â€
 
 ## Caveats
 
-- macOS-only as written (BSD `date`, `launchd`, `osascript`/`subl`). The core pipeline
-  is portable; the scheduling and notify bits are mac-specific.
+- macOS-only as written (BSD `date`, `launchd`, `osascript`/`open`). The core pipeline
+  is portable; the scheduling and notify bits are mac-specific. The morning
+  open-questions file opens with your default `.md` app; set `AUTODREAM_OPEN`
+  (e.g. `subl`, `code -g`, `open -a Obsidian`) to use a specific editor.
 - Runs in `bypassPermissions` mode (workers Write findings; the aggregator Edits
   project `MEMORY.md`). Don't run it in a shared environment.
 - The first run clones `anthropics/claude-code` (small) for the changelog window; it

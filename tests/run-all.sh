@@ -357,12 +357,12 @@ test_notify(){
   local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
   # Pre-seed an executable dummy at the branded-notifier path so notify.sh
   # neither bootstraps a real app bundle nor posts a real banner; OSA backup
-  # off for the same reason. SUBL=true keeps Sublime closed.
+  # off for the same reason. AUTODREAM_OPEN=true keeps any editor closed.
   mkdir -p "$root/cc-autodream.app/Contents/MacOS"
   printf '#!/bin/sh\nexit 0\n' > "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
   chmod +x "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
   run_notify() {  # $1=report
-    AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 SUBL=/usr/bin/true \
+    AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 AUTODREAM_OPEN=/usr/bin/true \
       "$NOTIFY" "$1" > "$root/notify.out" 2>&1
   }
 
@@ -432,6 +432,49 @@ EOF
   rm -rf "$root"
 }
 
+test_notify_open(){
+  echo "# notify.sh opens the inbox via AUTODREAM_OPEN (SUBL honored as deprecated alias)"
+  local NOTIFY="$REPO/bin/notify.sh"
+  [ -x "$NOTIFY" ] || { no "notify.sh executable"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  # Recording dummy notifier: captures argv so we can assert the click action
+  # (-execute) carries the resolved open command instead of a hardcoded editor.
+  mkdir -p "$root/cc-autodream.app/Contents/MacOS"
+  cat > "$root/cc-autodream.app/Contents/MacOS/terminal-notifier" <<EOF
+#!/bin/sh
+printf '%s\n' "\$@" > "$root/notifier.args"
+exit 0
+EOF
+  chmod +x "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
+  # Recorder stands in for the user's open command.
+  cat > "$root/rec.sh" <<EOF
+#!/bin/sh
+printf '%s\n' "\$@" > "$root/rec.args"
+exit 0
+EOF
+  chmod +x "$root/rec.sh"
+  cat > "$root/2020-02-01.md" <<'EOF'
+# Autodream — 2020-02-01
+## Open questions for the user
+1. One question?
+EOF
+
+  # Multi-word AUTODREAM_OPEN must word-split into command + flag, filename intact
+  AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 AUTODREAM_OPEN="$root/rec.sh --flag" \
+    "$NOTIFY" "$root/2020-02-01.md" > "$root/notify.out" 2>&1
+  assert_grep "$root/rec.args" '^--flag$' "AUTODREAM_OPEN: flag word-split through sh -c"
+  assert_grep "$root/rec.args" '2020-02-01-open-questions\.md$' "AUTODREAM_OPEN: opened the inbox file"
+  assert_grep "$root/notifier.args" 'rec\.sh --flag' "click action (-execute) carries AUTODREAM_OPEN"
+
+  # SUBL alone still works as the deprecated alias
+  rm -f "$root/rec.args"
+  AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 SUBL="$root/rec.sh" \
+    "$NOTIFY" "$root/2020-02-01.md" > "$root/notify.out" 2>&1
+  assert_grep "$root/rec.args" '2020-02-01-open-questions\.md$' "SUBL alias: opened the inbox file"
+
+  rm -rf "$root"
+}
+
 # ---------------------------------------------------------------------------
 
 [ -x "$RUN" ]  || { echo "FATAL: $RUN not executable"; exit 1; }
@@ -459,6 +502,7 @@ test_self_audit_stats_precached_disambiguation
 test_normalize_project
 test_slim_transcript
 test_notify
+test_notify_open
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

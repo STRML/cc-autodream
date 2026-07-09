@@ -2,6 +2,11 @@
 
 All notable changes to cc-autodream. Format loosely follows Keep a Changelog.
 
+## 2026-07-09
+
+### Changed
+- **notify.sh is editor-agnostic.** Sublime Text is no longer hardcoded: the notification click action and the direct open both run `$AUTODREAM_OPEN` (a `sh -c` snippet, so flags work — `subl`, `code -g`, `open -a Obsidian`), defaulting to plain `open`, which hands the inbox file to the user's default `.md` app. The Sublime auto-probe chain is gone; `SUBL` is still honored as a deprecated alias for existing setups. New `test_notify_open` covers word-splitting, the click action, and the alias.
+
 ## 2026-07-07
 
 ### Fixed
