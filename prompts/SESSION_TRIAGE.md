@@ -15,7 +15,9 @@ These are plain text values, **not shell variables**. Pass each path directly to
 
 Then:
 
-1. **Read the session transcript** with the Read tool, using the literal path from line 1. It is JSONL — one JSON object per line. If it is larger than ~2000 lines, read it in chunks with the Read tool's `offset`/`limit` (e.g. the first 2000, a middle 2000, and the last 2000 lines) rather than all at once. **Cap: do not retry a failed Read with progressively smaller limits more than once** — if Read still errors, proceed with whatever you have already read rather than looping (the read-shrink-retry loop has wasted entire runs before). Note: an oversized transcript may have been **pre-slimmed** by the runner — long lines truncated, the middle elided, with `...[autodream slimmed/elided ...]...` markers. That is expected; triage what is present and don't treat the markers as session content.
+1. **Read the session transcript** with the Read tool, using the literal path from line 1. It is JSONL — one JSON object per line. If it is larger than ~2000 lines, read it in chunks with the Read tool's `offset`/`limit` (e.g. the first 2000, a middle 2000, and the last 2000 lines) rather than all at once.
+   **If a Read fails with a token-limit error** ("File content exceeds maximum allowed tokens"), the transcript has few but very long lines. Do NOT shrink-and-retry the same full read. Instead, page through the whole file with `offset`/`limit` at `limit: 10` lines per Read until you reach the end (dense files have few lines, so this is only a handful of Reads). If even a 10-line chunk errors, halve to 5 and continue from the same offset. You MUST cover the full file this way — never emit a finding saying the transcript was too large or unreadable; that is an extraction failure, not a session finding. Only if paging at `limit: 5` still errors repeatedly should you triage from what you did read, and then emit findings about the session content only.
+   Note: an oversized transcript may have been **pre-slimmed** by the runner — long lines truncated, the middle elided, with `...[autodream slimmed/elided ...]...` markers. That is expected; triage what is present and don't treat the markers as session content.
 2. **Extract structured findings** per the schema below.
 3. **Write the JSON** with the Write tool to the literal output path from line 2 — exactly one JSON object, no prose around it.
 4. Print `done` and exit. No commentary.
@@ -32,18 +34,20 @@ Quote 1-3 sentences of evidence for every finding. Don't synthesize, don't infer
 | `wrong_skill` | Claude invoked a skill that didn't fit; user corrected ("no use X instead"). |
 | `sandbox_friction` | `Operation not permitted`, `dangerouslyDisableSandbox: true` retries, `/tmp` writes failing, permission prompts denied. |
 | `memory_miss` | User says "I told you", "we established", "remember", "the same as last time"; Claude re-discovers a workaround that was used in a previous session. |
-| `tool_loop` | Same command retried ≥3 times with minor variants (>2 close-but-different curl/grep/find variants in <10 turns). |
+| `tool_loop` | Same command retried ≥3 times with minor variants (>2 close-but-different curl/grep/find variants in <10 turns). **Marker check:** the retry-budget rules require the agent to emit a literal `RETRY-BUDGET: ...` (or `FETCH-PIVOT: ...`) line in its response text when it stops/pivots. A loop that ends WITH such a marker means the rule worked — severity `low`, and say the marker was present. A loop with NO marker is the real finding — note "no RETRY-BUDGET marker" in `what`. |
 | `permission_prompt` | Commands the user repeatedly allowed or repeatedly denied that should be in `.claude/settings.json` allowlist/denylist. |
 | `fabricated_id` | Claude quoted a SHA, PR number, line number, function name, or version that wasn't from a just-run command. See the HARD RULE above: tools like `StructuredOutput` that succeed but aren't in `skill_listing` are harness-provided — never flag them. |
 | `stop_projection` | "you must be tired", "let's pick this back up", "we should stop", any variant. |
 | `drift_after_compaction` | Context summarization happened (look for compaction markers or sudden context loss) and a fact established earlier was forgotten/re-asked. |
-| `assumption_unsurfaced` | Claude proceeded with non-trivial work without an ASSUMPTIONS block when global CLAUDE.md required it. |
+
+**MORATORIUM — never emit `assumption_unsurfaced`.** Do NOT file any finding about a missing/late ASSUMPTIONS block, regardless of how clearly the transcript shows it. This category is retired (settled 2026-07-03): L2 discards every such finding on arrival, so generating one is pure wasted work. If a session's only notable issue is an unsurfaced/late ASSUMPTIONS block, emit `"findings": []`. Do not re-route it into another category (e.g. `missed_skill`) either.
 
 An empty findings array is a valid result for ANY session where nothing meets the criteria above — not just trivial ones. If a substantive session has no real findings, emit `"findings": []`. Don't pad, and don't manufacture a finding to justify the slot.
 
 ## Output schema
 
 Write EXACTLY this shape to `OUTPUT_PATH`. JSON only, no markdown fence, no prose.
+`compliance_markers` holds literal-string counts of `RETRY-BUDGET:` and `FETCH-PIVOT:` occurrences in assistant text (0 when absent — most sessions).
 
 ```json
 {
@@ -56,6 +60,7 @@ Write EXACTLY this shape to `OUTPUT_PATH`. JSON only, no markdown fence, no pros
   "skills_invoked": ["schedule", "python-env-management"],
   "models_used": ["claude-opus-4-7"],
   "notable_initiatives": ["one-line summary of the main thing the user worked on"],
+  "compliance_markers": {"RETRY-BUDGET": 0, "FETCH-PIVOT": 0},
   "findings": [
     {
       "category": "missed_skill",

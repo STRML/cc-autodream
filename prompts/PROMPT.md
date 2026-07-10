@@ -66,7 +66,7 @@ For each, ordered by (count × max-severity) descending, cap at 10:
 For each project with ≥3 findings, a short paragraph: what went well, what hurt.
 
 ## Skill coverage gaps
-Cross-reference `missed_skill` findings against installed skills. If a recurring pattern has NO matching skill, flag it as a "skill to create" recommendation.
+Cross-reference `missed_skill` findings against installed skills. **Before recommending "create skill X", actually list the skills directory (`ls ~/.claude/skills/` and glob `~/.claude/plugins/**/skills/*/SKILL.md`) and confirm no skill with that name or trigger set already exists.** If one exists, the gap is a *triggering* problem, not a missing skill — reframe it as "skill X exists but didn't fire on pattern Y; consider adding trigger phrase Z" and do not propose creating it. Only flag "skill to create" when the filesystem confirms nothing covers the pattern.
 
 ## Triage failures
 Any session whose `.json.err` is non-empty or whose JSON is missing/malformed.
@@ -83,6 +83,13 @@ Keep it to what the stats and findings actually show; skip the section's sub-bul
 
 ## Open questions for the user
 Anything ambiguous that needs a human call before being acted on. Group by topic.
+
+**Triviality gate — every open question must clear all three before it ships. Drop the ones that don't; a report with two grounded questions beats one with six unverified ones:**
+1. **Premise verified.** If the question rests on a factual claim about how something works ("the workers run SessionStart hooks", "path X isn't allowlisted"), read the file that settles it and confirm the claim is true. A question built on an unread assumption is a hallucination — cut it. Do not infer worker/runner behavior from the report's own prose; read `bin/run.sh` and the actual config.
+2. **Not already done.** If the ask is "create/add/enable X", verify X doesn't already exist (skills → list the skills dir; settings → read `settings.json`; hooks → read the hook). If it exists, it's not an open question.
+3. **Not already settled.** Before surfacing a recurring policy question, check whether the user already ruled on it: scan the three most recent prior reports' `## Triage decisions` sections (`~/.claude/dreams/*.md`) and the relevant project's `MEMORY.md` for a `type: feedback` entry or moratorium covering it. If the user already decided, do not re-ask — note it as "settled <date>, see <ref>" in per-project notes at most, or omit entirely. The ASSUMPTIONS-block trigger is under a standing moratorium (settled 2026-07-03); never surface it as an open question.
+
+An open question that would take the user ten seconds to answer with "that already exists" or "we settled this last week" is a triage failure, not a question.
 ```
 
 ### 2. Memory updates (high-confidence only)
@@ -109,7 +116,7 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 ## How to start
 
 1. Read the findings directory's `*.json` files (use Glob then Read).
-2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity).
+2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Also sum each session's `compliance_markers` counts (`RETRY-BUDGET`, `FETCH-PIVOT`) when present: markers measure the retry-budget rules working as designed. When reporting a `tool_loop` pattern, split marker-present sessions (rule fired — healthy) from marker-absent ones (the actual non-compliance) and state both counts.
 3. Walk installed skills (Glob `~/.claude/skills/*/SKILL.md` etc., Read frontmatter).
 4. Read `<findings-dir>/changelog-window.md` (Upstream changes) and `<findings-dir>/run-stats.txt` (Autodream self-audit) if present.
 5. Write the report to the literal report path from line 2.
