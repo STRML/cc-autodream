@@ -20,6 +20,7 @@ All other inputs you need (treat `<findings-dir>` below as the literal path from
 - **Installed skills**: walk `~/.claude/skills/`, `~/.claude/plugins/*/skills/`, and project `.claude/skills/`. Each has frontmatter `description`/triggers. Use this to validate `missed_skill` findings (skill exists? trigger matches?).
 - **Memory files**: `~/.claude/projects/*/memory/MEMORY.md` (one per project — may not exist).
 - **Global rules**: `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`.
+- **Operator notes**: `~/.claude/autodream/notes.md`, if present — free-text notes the user (or an agent) left for you between runs, e.g. "evaluate how often /graphify is used". Each line is dated with an optional `(expires DATE)`. Address the active ones in the **Operator notes** report section; ignore ones whose expiry has passed.
 - **Installed hooks**: `~/.claude/hooks/*.sh` and the `hooks` block of `~/.claude/settings.json`. These are the primary target of "tighten/add a hook" proposals — read the specific hook (including its comments) before proposing a change to it. The reasoning for why a hook behaves as it does usually lives in its header comment, not in git history.
 - **Run self-audit stats**: `<findings-dir>/run-stats.txt`, if present — runtime telemetry the runner captured about *this autodream run itself* (sessions found vs. self-excluded vs. triaged, L1 retry rounds, workers still missing, `.err` count, elapsed). Drives the "Autodream self-audit" report section below.
 - **Changelog window**: `<findings-dir>/changelog-window.md`, if present. The runner already cloned/pulled `anthropics/claude-code` and diffed `CHANGELOG.md` over this report's date window, so this file holds the verbatim new release entries (version headers + bullets) with a few `# `-prefixed comment lines at the top (source, HEAD sha, commit count). Read it and drive the "Upstream Claude Code changes" report section below. The file may say "No changelog commits in this window." or report a clone/fetch failure — handle both per that section.
@@ -80,6 +81,9 @@ cc-autodream is its author's own project — turn the lens on the pipeline itsel
 - **Recurring self-findings**: if cc-autodream sessions themselves surfaced patterns (the author working on the tool), give them first-class weight here rather than burying them in per-project notes.
 
 Keep it to what the stats and findings actually show; skip the section's sub-bullets that have nothing to report. If `run-stats.txt` is absent, say so and move on.
+
+## Operator notes
+Read `~/.claude/autodream/notes.md` (skip this section entirely if it's absent or has no active notes). For each note whose `(expires DATE)` has not passed — a note with no expiry is always active — address it directly using THIS run's findings: usage counts, whether the thing is working or being worked around, concrete evidence. One short paragraph per active note, prefixed with the note's `[added]` date. If a note's expiry has passed, list it once under a trailing "expired — safe to remove from notes.md" line and do not analyze it. Do not invent signal a note asks for but the findings don't contain — say "no sessions this window exercised it" and move on.
 
 ## Open questions for the user
 Anything ambiguous that needs a human call before being acted on. Group by topic.
