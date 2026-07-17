@@ -56,12 +56,20 @@ for arg in "$@"; do
   case "$arg" in
     --force|-f) FORCE=1 ;;
     -h|--help)
-      # Lines 2-15 are the description, usage, and the skip rationale. Keep this
-      # range in sync if the header comment grows.
-      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+      # Print the header comment block verbatim: everything from line 2 until the
+      # first non-comment line. Derived rather than a line range, so growing the
+      # header cannot silently truncate --help mid-sentence.
+      awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
       exit 0 ;;
     -*) echo "review.sh: unknown option: $arg" >&2; exit 2 ;;
-    *)  POSITIONAL="$arg" ;;
+    *)
+      # One report per run. Silently triaging only the last of several dates
+      # would be a confusing way to lose a request.
+      if [ -n "$POSITIONAL" ]; then
+        echo "review.sh: expected one date, got '$POSITIONAL' and '$arg'" >&2
+        exit 2
+      fi
+      POSITIONAL="$arg" ;;
   esac
 done
 
@@ -90,7 +98,7 @@ DATE=$(basename "$REPORT" .md)
 # gate this run."). The fallback only ever recognises a shape it is sure about;
 # everything else is "unknown" rather than a guess.
 report_open_questions(){
-  report="$1"
+  local report="$1" marker section first
 
   marker=$(sed -n 's/.*<!-- *autodream:open-questions=\([0-9][0-9]*\) *-->.*/\1/p' "$report" | head -1)
   if [ -n "$marker" ]; then printf '%s\n' "$marker"; return 0; fi
@@ -124,18 +132,22 @@ skip_notice(){
 }
 
 if [ "$FORCE" -eq 0 ]; then
-  QUESTIONS=$(report_open_questions "$REPORT")
-  if [ "$QUESTIONS" = "0" ]; then
-    skip_notice "no open questions, nothing to triage."
-    exit 0
-  fi
+  # Triage state first: a report can be both empty and already worked through
+  # (an empty-day stub someone closed out), and "already triaged" is the more
+  # informative reason of the two.
   if report_is_triaged "$REPORT"; then
     COUNT=$(report_triage_count "$REPORT" | tr -d ' ')
-    if [ "$COUNT" -gt 0 ] 2>/dev/null; then
+    if [ "$COUNT" -eq 1 ] 2>/dev/null; then
+      skip_notice "already triaged (1 decision logged)."
+    elif [ "$COUNT" -gt 1 ] 2>/dev/null; then
       skip_notice "already triaged ($COUNT decisions logged)."
     else
       skip_notice "already triaged."
     fi
+    exit 0
+  fi
+  if [ "$(report_open_questions "$REPORT")" = "0" ]; then
+    skip_notice "no open questions, nothing to triage."
     exit 0
   fi
 fi
