@@ -350,6 +350,21 @@ test_slim_transcript(){
   rm -rf "$root"
 }
 
+test_facet_fields_plumbed(){
+  echo "# pilot facet fields flow L1 -> findings JSON -> L2 input"
+  # Plumbing only: the L2 mock ignores findings content, so assertions stop at
+  # the findings JSON L2 reads. Behavioral quality is the production pilot's job.
+  local root; root=$(setup_env); mk_session "$root" sess1
+  run_dream "$root"
+  local h j; h=$(hash_of "$root/projects/proj-a/sess1.jsonl"); j="$(fdir "$root")/$h.json"
+  assert_eq "$(jq -r .outcome "$j")"                          "fully_achieved" "outcome facet present in findings JSON"
+  assert_eq "$(jq -r .satisfaction_signals.satisfied "$j")"   "1"              "satisfaction_signals present"
+  assert_eq "$(jq -e 'has("underlying_goal")' "$j")"          "true"           "underlying_goal key present (null allowed)"
+  assert_eq "$(jq -r '.instructions_given[0]' "$j")"          "always run tests after edits" "instructions_given present"
+  assert_file "$root/dreams/$DATE.md" "L2 run completed with facet-bearing findings as input"
+  rm -rf "$root"
+}
+
 # ---------------------------------------------------------------------------
 
 [ -x "$RUN" ]  || { echo "FATAL: $RUN not executable"; exit 1; }
@@ -376,6 +391,7 @@ test_self_audit_stats_failure_denominator
 test_self_audit_stats_precached_disambiguation
 test_normalize_project
 test_slim_transcript
+test_facet_fields_plumbed
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

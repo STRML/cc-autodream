@@ -39,6 +39,7 @@ Write to `REPORT_PATH`. Overwrite if present (idempotent re-runs are fine). Requ
 - Total turns / tool calls (sum from JSONs)
 - Skills invoked (top 5 by count)
 - Models used (with counts)
+- Outcomes: distribution of the per-session `outcome` facet when present (e.g. "18 sessions with outcome: 12 fully, 3 mostly, 1 partial, 2 unclear"), plus any non-zero `satisfaction_signals` totals summed across sessions. Omit the line if no JSON carries the facet fields (pre-pilot findings). This line is descriptive only — it does NOT change the Top-patterns ranking formula.
 
 ## Upstream Claude Code changes
 Read `<findings-dir>/changelog-window.md` (the runner's diff of `anthropics/claude-code`'s `CHANGELOG.md` over this report's date window). For each release entry in it, judge whether it changes how we should operate:
@@ -68,6 +69,10 @@ For each project with ≥3 findings, a short paragraph: what went well, what hur
 
 ## Skill coverage gaps
 Cross-reference `missed_skill` findings against installed skills. **Before recommending "create skill X", actually list the skills directory (`ls ~/.claude/skills/` and glob `~/.claude/plugins/**/skills/*/SKILL.md`) and confirm no skill with that name or trigger set already exists.** If one exists, the gap is a *triggering* problem, not a missing skill — reframe it as "skill X exists but didn't fire on pattern Y; consider adding trigger phrase Z" and do not propose creating it. Only flag "skill to create" when the filesystem confirms nothing covers the pattern.
+
+Two matching rules for that cross-reference:
+- **Namespace-aware matching.** Plugin skills resolve under both the `plugin:skill` display form (`superpowers:brainstorming`) and the bare name (`brainstorming`) — derive the display form from the `plugins/*/skills/*` path segment when you walk it. A finding that references either form of an installed skill matches.
+- **Unresolvable references are triage failures.** A `missed_skill` finding naming a skill your walk cannot resolve under either form is L1 signal error, not a coverage gap: file it under **Triage failures**, do not echo it as a recommendation. A "coverage gap" proposal must state that the walk confirmed nothing matches, and any new-skill name it proposes must not collide with an installed skill under either form.
 
 ## Triage failures
 Any session whose `.json.err` is non-empty or whose JSON is missing/malformed.
@@ -100,6 +105,10 @@ An open question that would take the user ten seconds to answer with "that alrea
 
 For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you MAY edit the relevant project's `MEMORY.md`:
 
+**Pilot quarantine (in effect until the pilot fields are promoted):** `buggy_code_shipped` findings and cross-session `instructions_given` repetition proposals are REPORT-ONLY — never eligible for the memory-write gate above, regardless of confidence/severity/count. They are unvalidated for their first production week; 📌 pins are permanent by design, so an unvalidated category must not write them. This paragraph is removed by the promote decision at the end of the pilot.
+
+**Cross-session instruction repetition (report ranking, not memory writes while quarantined):** aggregate the sessions' `instructions_given` lists. An instruction (or near-paraphrase) appearing in ≥2 of this day's sessions from different projects is a stronger memory candidate than any single-session `memory_miss` — rank it above those in Top patterns and cite both sessions. BEFORE proposing it, check the user's existing memory: if the instruction is already recorded in the relevant `MEMORY.md` or `~/.claude/CLAUDE.md`, it is not a memory candidate at all — it is a `compliance_failure` (the agent ignored a standing rule); report it as such instead.
+
 - Project memory paths follow `~/.claude/projects/<encoded-cwd>/memory/MEMORY.md`.
 - The encoded-cwd comes from `session.project` in the JSON or by inspecting the session path.
 - **Always 📌-pin any entry you add.** A separate memory-consolidation pass (Claude Code's built-in auto-dream, or the `cc-simple-memory` plugin's `gc-memory.sh`) prunes non-pinned entries on a different schedule — the 📌 marker is the contract that keeps cc-autodream's signal from being garbage-collected before the human sees it.
@@ -120,7 +129,7 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 ## How to start
 
 1. Read the findings directory's `*.json` files (use Glob then Read).
-2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Also sum each session's `compliance_markers` counts (`RETRY-BUDGET`, `FETCH-PIVOT`) when present: markers measure the retry-budget rules working as designed. When reporting a `tool_loop` pattern, split marker-present sessions (rule fired — healthy) from marker-absent ones (the actual non-compliance) and state both counts.
+2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Also sum each session's `compliance_markers` counts (`RETRY-BUDGET`, `FETCH-PIVOT`) when present: markers measure the retry-budget rules working as designed. When reporting a `tool_loop` pattern, split marker-present sessions (rule fired — healthy) from marker-absent ones (the actual non-compliance) and state both counts. Also collect the facet fields (`outcome`, `satisfaction_signals`) for the Activity-snapshot outcomes line, and the `instructions_given` lists for the cross-session repetition check (see Memory updates).
 3. Walk installed skills (Glob `~/.claude/skills/*/SKILL.md` etc., Read frontmatter).
 4. Read `<findings-dir>/changelog-window.md` (Upstream changes) and `<findings-dir>/run-stats.txt` (Autodream self-audit) if present.
 5. Write the report to the literal report path from line 2.
