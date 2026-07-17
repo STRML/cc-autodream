@@ -67,13 +67,13 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     # Workspace + tab are named after the triaged date (ISO, i.e. the report's
     # own YYYY-MM-DD — the date of the questions being addressed, not today).
-    TAB_TITLE="autodream triage $DATE"
+    TAB_TITLE="$DATE Autodream Triage"
     echo "review.sh: opening $DATE triage in a new cmux workspace (focus=$AUTODREAM_TRIAGE_FOCUS)"
     # The workspace re-runs this script with the surface forced to inline so it
     # falls through to the exec claude below. CLAUDE_CODE_DISABLE_TERMINAL_TITLE
     # stops claude live-rewriting the tab title over our pinned date.
     WS_OUT=$("$CMUX" workspace create \
-      --name "autodream triage $DATE" \
+      --name "$DATE Autodream Triage" \
       --cwd "$HOME" \
       --command "env AUTODREAM_TRIAGE_SURFACE=inline CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 DREAMS_DIR='$DREAMS_DIR' CLAUDE_BIN='$CLAUDE_BIN' '$SELF' '$DATE'" \
       --focus "$AUTODREAM_TRIAGE_FOCUS" 2>&1)
