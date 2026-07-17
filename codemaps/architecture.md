@@ -40,10 +40,11 @@ bin/run.sh  TARGET_DATE
 | `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); picks the scheduled plist that runs `run.sh` for its label namespace |
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/notify.sh` | extract "Open questions" → inbox file in Sublime |
-| `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`); `AUTODREAM_TRIAGE_SURFACE=cmux` (config/env) launches it in its own cmux workspace instead of inline |
+| `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`); `AUTODREAM_TRIAGE_SURFACE=cmux` (config/env) launches it in its own cmux workspace instead of inline. Skips the session entirely (prints a notice) when the report has 0 open questions or is already triaged — reads the `<!-- autodream:open-questions=N -->` marker, falls back to prose, launches on anything ambiguous; `--force` overrides. Skip check runs before the cmux branch so a skip never spawns a workspace |
 | `prompts/SESSION_TRIAGE.md` | L1 prompt: per-session JSON schema |
 | `prompts/PROMPT.md` | L2 prompt: report sections incl. Upstream changes + Autodream self-audit, memory rules |
-| `tests/run-all.sh` | integration tests vs `mock-claude.sh` (offline) |
+| `tests/run-all.sh` | integration tests for `run.sh` vs `mock-claude.sh` (offline) |
+| `tests/review-skip.sh` | tests for `review.sh`'s skip/launch decision (offline; inline mock claude) |
 | `tests/mock-claude.sh` | stand-in claude; modes: good / l1_incomplete / l1_flaky |
 | `launchd/com.user.autodream.plist.example` | schedule (multi-trigger catch-up + pmset note) |
 | `install.sh` | symlink scripts/prompts into `~/.claude/autodream/`; by default also generates + bootstraps the nightly launchd schedule (auto-detected label/PATH/dirs; `--no-schedule` to skip) |

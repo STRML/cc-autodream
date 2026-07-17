@@ -56,6 +56,12 @@ Three ways you actually interact with it:
   preloaded with the report and walks the open questions one at a time — restate,
   recommend, then **approve / modify / skip / discuss** — executing the ones you
   approve and logging each decision back into the report.
+- **It stays quiet when there's nothing to say.** Most nights the report has no
+  open questions, and opening a session just to be told "nothing to do" costs a
+  session's tokens to print one line. `review.sh` detects that itself and prints
+  the line instead. Same for a report you've already triaged. Anything it can't
+  classify still opens the session — a wasted session is cheaper than a buried
+  question. `--force` overrides.
 
 ## Install
 
@@ -95,7 +101,16 @@ rather install the job yourself.
 ~/.claude/autodream/run.sh $(date -v-1d +%Y-%m-%d)       # process yesterday
 AUTODREAM_FORCE=1 ~/.claude/autodream/run.sh 2026-05-29  # rebuild a date
 ~/.claude/autodream/review.sh                            # solve the latest report's questions
+~/.claude/autodream/review.sh 2026-05-29                 # triage a specific report
+~/.claude/autodream/review.sh --force 2026-05-29         # open it even if there's nothing to triage
 ```
+
+`review.sh` exits without opening a session when the report has no open questions
+or already carries a `## Triage decisions` section, printing where the report is
+and the `--force` line to open it anyway. It reads the
+`<!-- autodream:open-questions=N -->` marker that `PROMPT.md` makes the nightly run
+emit; reports written before that marker existed fall back to a prose check, and
+anything ambiguous opens the session as before.
 
 By default `review.sh` runs the triage session inline in the current terminal —
 and if you launch it as a shell script, macOS hands it to whatever app is the
