@@ -2,8 +2,17 @@
 # Open an interactive Claude session with the latest autodream report preloaded
 # and instructions to walk through the open questions one at a time.
 #
-# Usage: review.sh             # opens latest report
-#        review.sh YYYY-MM-DD  # opens specific report
+# Usage: review.sh                  # opens latest report
+#        review.sh YYYY-MM-DD       # opens specific report
+#        review.sh --force [DATE]   # open even if there is nothing to triage
+#
+# A report with nothing to triage does not get a session. Most nights the
+# report has no open questions, and launching claude just to be told "nothing
+# to do" costs a full session's tokens to print one line. Instead we detect
+# that case here and print the line ourselves. The check is deliberately
+# conservative: anything we cannot classify launches the session, because a
+# false "nothing to do" silently swallows real questions, while a false launch
+# only wastes tokens. --force bypasses it.
 #
 # Where the triage session lands is controlled by AUTODREAM_TRIAGE_SURFACE
 # (set in $AUTODREAM_DIR/config, see config.example):
@@ -41,8 +50,23 @@ CMUX_BIN="${CMUX_BIN:-/Applications/cmux.app/Contents/Resources/bin/cmux}"
 AUTODREAM_TRIAGE_FOCUS="${AUTODREAM_TRIAGE_FOCUS:-false}"
 [ "$AUTODREAM_TRIAGE_FOCUS" = "true" ] || AUTODREAM_TRIAGE_FOCUS="false"
 
-if [ $# -gt 0 ]; then
-  REPORT="$DREAMS_DIR/$1.md"
+FORCE=0
+POSITIONAL=""
+for arg in "$@"; do
+  case "$arg" in
+    --force|-f) FORCE=1 ;;
+    -h|--help)
+      # Lines 2-15 are the description, usage, and the skip rationale. Keep this
+      # range in sync if the header comment grows.
+      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    -*) echo "review.sh: unknown option: $arg" >&2; exit 2 ;;
+    *)  POSITIONAL="$arg" ;;
+  esac
+done
+
+if [ -n "$POSITIONAL" ]; then
+  REPORT="$DREAMS_DIR/$POSITIONAL.md"
 else
   REPORT=$(ls -t "$DREAMS_DIR"/*.md 2>/dev/null | head -1)
 fi
@@ -56,6 +80,66 @@ fi
 
 DATE=$(basename "$REPORT" .md)
 
+# How many open questions the report says need a human call. Prints an integer,
+# or "unknown" when it cannot tell (the caller must then launch the session).
+#
+# The marker is the contract: PROMPT.md makes L2 emit
+# `<!-- autodream:open-questions=N -->` in the Open questions section. Reports
+# written before that contract existed have no marker, so we fall back to
+# reading the prose L2 has used consistently ("None that clear the triviality
+# gate this run."). The fallback only ever recognises a shape it is sure about;
+# everything else is "unknown" rather than a guess.
+report_open_questions(){
+  report="$1"
+
+  marker=$(sed -n 's/.*<!-- *autodream:open-questions=\([0-9][0-9]*\) *-->.*/\1/p' "$report" | head -1)
+  if [ -n "$marker" ]; then printf '%s\n' "$marker"; return 0; fi
+
+  # Empty-day stub: run.sh writes this when no sessions were modified at all.
+  if grep -q '^No Claude Code sessions were modified' "$report"; then echo 0; return 0; fi
+
+  section=$(awk '/^## Open questions/{f=1;next} /^## /{f=0} f' "$report")
+  first=$(printf '%s\n' "$section" | grep -v '^[[:space:]]*$' | head -1)
+  # No section at all, or an empty one: not a shape we recognise. Launch.
+  [ -n "$first" ] || { echo unknown; return 0; }
+
+  case "$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')" in
+    none*) echo 0; return 0 ;;
+  esac
+  echo unknown
+}
+
+report_is_triaged(){ grep -q '^## Triage decisions' "$1"; }
+
+# Decisions have been written as both bullets and numbered lists across the
+# report history, so count either. Used only to flavour the notice text.
+report_triage_count(){
+  awk '/^## Triage decisions/{f=1;next} /^## /{f=0} f' "$1" | grep -cE '^([-*]|[0-9]+\.) '
+}
+
+skip_notice(){
+  echo "autodream $DATE: $1"
+  echo "  report:      $REPORT"
+  echo "  open anyway: $(basename "$0") --force $DATE"
+}
+
+if [ "$FORCE" -eq 0 ]; then
+  QUESTIONS=$(report_open_questions "$REPORT")
+  if [ "$QUESTIONS" = "0" ]; then
+    skip_notice "no open questions, nothing to triage."
+    exit 0
+  fi
+  if report_is_triaged "$REPORT"; then
+    COUNT=$(report_triage_count "$REPORT" | tr -d ' ')
+    if [ "$COUNT" -gt 0 ] 2>/dev/null; then
+      skip_notice "already triaged ($COUNT decisions logged)."
+    else
+      skip_notice "already triaged."
+    fi
+    exit 0
+  fi
+fi
+
 # Hand the triage session off to its own cmux workspace when configured. We do
 # this only after resolving + validating the report above, so a missing-report
 # error surfaces in this terminal rather than in a detached workspace. The new
@@ -68,6 +152,10 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     # Workspace + tab are named after the triaged date (ISO, i.e. the report's
     # own YYYY-MM-DD — the date of the questions being addressed, not today).
     TAB_TITLE="$DATE Autodream Triage"
+    # Carry --force through: the workspace re-runs this script, and without it
+    # the inner run would re-check, decide there is nothing to triage, and exit
+    # immediately — leaving a workspace that dies on open.
+    FORCE_ARG=""; [ "$FORCE" -eq 1 ] && FORCE_ARG=" --force"
     echo "review.sh: opening $DATE triage in a new cmux workspace (focus=$AUTODREAM_TRIAGE_FOCUS)"
     # The workspace re-runs this script with the surface forced to inline so it
     # falls through to the exec claude below. CLAUDE_CODE_DISABLE_TERMINAL_TITLE
@@ -75,7 +163,7 @@ if [ "$AUTODREAM_TRIAGE_SURFACE" = "cmux" ]; then
     WS_OUT=$("$CMUX" workspace create \
       --name "$DATE Autodream Triage" \
       --cwd "$HOME" \
-      --command "env AUTODREAM_TRIAGE_SURFACE=inline CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 DREAMS_DIR='$DREAMS_DIR' CLAUDE_BIN='$CLAUDE_BIN' '$SELF' '$DATE'" \
+      --command "env AUTODREAM_TRIAGE_SURFACE=inline CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 DREAMS_DIR='$DREAMS_DIR' CLAUDE_BIN='$CLAUDE_BIN' '$SELF' '$DATE'$FORCE_ARG" \
       --focus "$AUTODREAM_TRIAGE_FOCUS" 2>&1)
     echo "$WS_OUT"
     # Pin the tab title to the date. The shell sets a startup title (the cwd) a

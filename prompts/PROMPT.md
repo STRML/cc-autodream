@@ -94,6 +94,12 @@ Anything ambiguous that needs a human call before being acted on. Group by topic
 3. **Not already settled.** Before surfacing a recurring policy question, check whether the user already ruled on it: scan the three most recent prior reports' `## Triage decisions` sections (`~/.claude/dreams/*.md`) and the relevant project's `MEMORY.md` for a `type: feedback` entry or moratorium covering it. If the user already decided, do not re-ask — note it as "settled <date>, see <ref>" in per-project notes at most, or omit entirely. The ASSUMPTIONS-block trigger is under a standing moratorium (settled 2026-07-03); never surface it as an open question.
 
 An open question that would take the user ten seconds to answer with "that already exists" or "we settled this last week" is a triage failure, not a question.
+
+**End this section with a count marker on its own line — required, even when the count is zero:**
+
+`<!-- autodream:open-questions=N -->`
+
+N is how many questions survived the triviality gate above. Count the questions you are actually asking the user to decide, not the notes you kept for context: a section that says "None that clear the triviality gate" followed by three explanatory bullets is `N=0`, because none of those bullets is a question. `review.sh` reads this marker to decide whether the morning triage session is worth opening at all, so an inflated N costs a pointless session and a deflated N silently buries a real question.
 ```
 
 ### 2. Memory updates (high-confidence only)
