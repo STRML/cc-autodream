@@ -56,6 +56,18 @@ run_review(){ # $1=root ; rest = args
   [ -f "$root/launched" ] && printf 'launched' || printf 'skipped'
 }
 
+# Same invocation, but returns review.sh's own exit code instead of a verdict.
+# run_review cannot be used for this: its exit status is the verdict printf's.
+run_review_rc(){ # $1=root ; rest = args
+  local root="$1"; shift
+  LAUNCH_MARKER="$root/launched" \
+  AUTODREAM_CONFIG="$root/nonexistent-config" \
+  AUTODREAM_TRIAGE_SURFACE=inline \
+  DREAMS_DIR="$root/dreams" \
+  CLAUDE_BIN="$root/bin/claude" \
+  bash "$REVIEW" "$@" > "$root/out" 2>&1
+}
+
 # --- fixture bodies --------------------------------------------------------
 
 REPORT_MARKER_ZERO='# Autodream — 2020-01-02
@@ -93,6 +105,16 @@ REPORT_STUB='# Autodream — 2020-01-02
 No Claude Code sessions were modified on this date.
 
 (Generated 2020-01-03T07:00:06Z)'
+
+# An empty day that someone already closed out (see the real 2026-06-27). Both
+# skip reasons apply; "already triaged" is the one worth printing.
+REPORT_STUB_TRIAGED='# Autodream — 2020-01-02
+
+No Claude Code sessions were modified on this date.
+
+## Triage decisions
+
+- 2020-01-03: No sessions modified. Nothing to triage; session closed.'
 
 REPORT_NO_SECTION='# Autodream — 2020-01-02
 
@@ -192,8 +214,38 @@ test_latest_report_default(){
   local root; root=$(setup_env)
   mk_report "$root" 2020-01-01 "$REPORT_MARKER_THREE"
   mk_report "$root" 2020-01-02 "$REPORT_MARKER_ZERO"
-  touch "$root/dreams/2020-01-02.md"   # ensure it is newest
+  # Stamp both explicitly. Writing them in order is not enough: review.sh picks
+  # the latest with `ls -t`, and two files written in the same instant tie —
+  # BSD ls then breaks the tie by name, which would pick the wrong report.
+  touch -t 202001011200 "$root/dreams/2020-01-01.md"
+  touch -t 202001021200 "$root/dreams/2020-01-02.md"
   assert_eq "$(run_review "$root")" skipped "no-arg run resolves the latest report and skips it"
+}
+
+test_stub_triaged_prefers_triaged_reason(){
+  local root; root=$(setup_env)
+  mk_report "$root" 2020-01-02 "$REPORT_STUB_TRIAGED"
+  assert_eq "$(run_review "$root" 2020-01-02)" skipped "stub that was already triaged skips"
+  assert_grep "$root/out" 'already triaged (1 decision logged)' "prefers the triaged reason, and says decision not decisions"
+}
+
+test_two_dates_error(){
+  local root; root=$(setup_env)
+  mk_report "$root" 2020-01-01 "$REPORT_MARKER_THREE"
+  mk_report "$root" 2020-01-02 "$REPORT_MARKER_THREE"
+  local rc=0
+  run_review_rc "$root" 2020-01-01 2020-01-02 || rc=$?
+  assert_grep "$root/out" 'expected one date' "two dates is an error, not a silent pick"
+  assert_eq "$rc" 2 "two dates exits 2"
+}
+
+# --help is built from the header comment block, so it must not stop mid-thought.
+test_help_is_complete(){
+  local root; root=$(setup_env)
+  run_review_rc "$root" --help
+  assert_grep "$root/out" 'Usage: review.sh' "help includes the usage block"
+  assert_grep "$root/out" 'force bypasses it' "help includes the end of the skip rationale"
+  assert_grep "$root/out" 'config overrides defaults' "help runs to the end of the header"
 }
 
 test_missing_report_errors(){
@@ -216,6 +268,9 @@ test_stub_skips
 test_unknown_launches
 test_triaged_skips
 test_triaged_numbered_skips
+test_stub_triaged_prefers_triaged_reason
+test_two_dates_error
+test_help_is_complete
 test_force_overrides
 test_latest_report_default
 test_missing_report_errors
