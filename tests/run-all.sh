@@ -331,6 +331,9 @@ test_normalize_project(){
   assert_nogrep "$fj" 'WRONG-PROJECT'     "model's wrong project value was overwritten"
   assert_grep   "$fj" '"project": "proj-a"' "project normalized to the session dir basename"
   assert_grep   "$root/run.out" 'normalized project field' "run log reports normalization"
+  # l1_badproject emits the pre-pilot JSON shape (no facet fields) — the report
+  # landing proves L2 still accepts legacy findings.
+  assert_file   "$root/dreams/$DATE.md" "L2 completed on facet-free legacy findings"
   rm -rf "$root"
 }
 
@@ -347,6 +350,21 @@ test_slim_transcript(){
   [ "$osz" -lt 300000 ] && ok "slimmed far below original ($osz bytes < 300k, orig ~9M)" || no "slim output too big ($osz)"
   assert_grep "$out" 'elided by autodream'     "elides the middle"
   assert_grep "$out" 'slimmed this transcript' "appends the slim note"
+  rm -rf "$root"
+}
+
+test_facet_fields_plumbed(){
+  echo "# pilot facet fields flow L1 -> findings JSON -> L2 input"
+  # Plumbing only: the L2 mock ignores findings content, so assertions stop at
+  # the findings JSON L2 reads. Behavioral quality is the production pilot's job.
+  local root; root=$(setup_env); mk_session "$root" sess1
+  run_dream "$root"
+  local h j; h=$(hash_of "$root/projects/proj-a/sess1.jsonl"); j="$(fdir "$root")/$h.json"
+  assert_eq "$(jq -r .outcome "$j")"                          "fully_achieved" "outcome facet present in findings JSON"
+  assert_eq "$(jq -r .satisfaction_signals.satisfied "$j")"   "1"              "satisfaction_signals present"
+  assert_eq "$(jq -e 'has("underlying_goal")' "$j")"          "true"           "underlying_goal key present (null allowed)"
+  assert_eq "$(jq -r '.instructions_given[0]' "$j")"          "always run tests after edits" "instructions_given present"
+  assert_file "$root/dreams/$DATE.md" "L2 run completed with facet-bearing findings as input"
   rm -rf "$root"
 }
 
@@ -376,6 +394,7 @@ test_self_audit_stats_failure_denominator
 test_self_audit_stats_precached_disambiguation
 test_normalize_project
 test_slim_transcript
+test_facet_fields_plumbed
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"
