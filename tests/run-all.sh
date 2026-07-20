@@ -37,7 +37,7 @@ setup_env(){
 }
 mk_session(){ # $1=root $2=name
   local f="$1/projects/proj-a/$2.jsonl"
-  printf '{"type":"user","cwd":"/tmp/proj-a"}\n{"type":"assistant"}\n' > "$f"
+  printf '{"type":"user","cwd":"/tmp/proj-a"}\n{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}\n' > "$f"
   touch -t "$STAMP" "$f"
 }
 hash_of(){ printf '%s' "$1" | shasum -a 1 | cut -c1-12; }
@@ -54,12 +54,74 @@ fdir(){ printf '%s' "$1/autodream/findings/$DATE"; }   # findings dir for a root
 
 # ---------------------------------------------------------------------------
 
+test_session_stats(){
+  echo "# deterministic session stats pre-pass acceptance fixtures"
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  local fixture out
+
+  fixture="$root/carriers.jsonl"; out="$root/carriers.stats.json"
+  printf '%s\n' \
+    '{"type":"user","message":{"role":"user","content":"human question"}}' \
+    '{"type":"assistant","message":{"model":"claude-haiku","content":[{"type":"tool_use","name":"Read"}]}}' \
+    '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"result"}]}}' \
+    'not json' \
+    '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b","content":"result"}]}}' > "$fixture"
+  "$REPO/bin/session-stats.sh" "$fixture" "$out"
+  assert_eq "$(jq -r 'keys | sort | join(",")' "$out")" \
+    "compliance_markers,duration_minutes,isSidechain,models_used,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count" \
+    "stats output has exactly the specified fields"
+  assert_eq "$(jq -r .user_message_count "$out")" "1" "tool_result carriers are excluded from user message count"
+  assert_eq "$(jq -r .turn_count "$out")" "4" "turn count includes tool_result carriers"
+
+  fixture="$root/timestamps.jsonl"; out="$root/timestamps.stats.json"
+  printf '%s\n' \
+    '{"type":"user","timestamp":"2026-07-20T10:00:00.500Z","message":{"content":"start"}}' \
+    '{"type":"system","message":{"content":"no timestamp needed"}}' \
+    '{"type":"assistant","message":{"model":"claude-opus","content":"middle"}}' \
+    '{"type":"progress","timestamp":"2026-07-20T10:01:00.250Z"}' \
+    '{"type":"assistant","timestamp":"2026-07-20T10:02:30.750Z","message":{"model":"<synthetic>","content":"end"}}' > "$fixture"
+  "$REPO/bin/session-stats.sh" "$fixture" "$out"
+  assert_eq "$(jq -r .duration_minutes "$out")" "2.5" "duration uses available fractional timestamps"
+  assert_eq "$(jq -r .models_used[0] "$out")" "claude-opus" "synthetic model is dropped"
+
+  fixture="$root/markers.jsonl"; out="$root/markers.stats.json"
+  printf '%s\n' \
+    '{"type":"user","message":{"content":"user pasted RETRY-BUDGET: not a marker"}}' \
+    '{"type":"user","message":{"content":[{"type":"tool_result","content":"payload RETRY-BUDGET: not a marker"}]}}' \
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"RETRY-BUDGET: real"}]}}' > "$fixture"
+  "$REPO/bin/session-stats.sh" "$fixture" "$out"
+  assert_eq "$(jq -r '.compliance_markers["RETRY-BUDGET"]' "$out")" "1" "only assistant text counts RETRY-BUDGET"
+
+  fixture="$root/text-image.jsonl"; out="$root/text-image.stats.json"
+  printf '%s\n' \
+    '{"type":"user","message":{"content":[{"type":"text","text":"caption"},{"type":"image","source":{"type":"base64","data":"abc"}}]}}' > "$fixture"
+  "$REPO/bin/session-stats.sh" "$fixture" "$out"
+  assert_eq "$(jq -r .user_message_count "$out")" "1" "text plus image human turn counts"
+
+  fixture="$root/sidechain.jsonl"; out="$root/sidechain.stats.json"
+  printf '%s\n' \
+    '{"type":"user","isSidechain":true,"message":{"content":"subagent task"}}' \
+    '{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku","content":[{"type":"tool_use","name":"Write"},{"type":"tool_use","name":"Bash"},{"type":"tool_use","name":"Read"}]}}' \
+    '{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","content":"one"}]}}' \
+    '{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","content":"two"}]}}' \
+    '{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","content":"three"}]}}' > "$fixture"
+  "$REPO/bin/session-stats.sh" "$fixture" "$out"
+  assert_eq "$(jq -r .user_message_count "$out")" "1" "sidechain has one human message"
+  assert_eq "$(jq -r .turn_count "$out")" "5" "sidechain turn count includes carriers"
+  assert_eq "$(jq -r .tool_call_count "$out")" "3" "sidechain tool calls are counted mechanically"
+  assert_eq "$(jq -r '.tools_used | join(",")' "$out")" "Bash,Read,Write" "sidechain tools are sorted and unique"
+  assert_eq "$(jq -r .isSidechain "$out")" "true" "sidechain marker is copied"
+  rm -rf "$root"
+}
+
 test_happy(){
   echo "# happy path"
   local root; root=$(setup_env); mk_session "$root" sess1
   run_dream "$root"
   local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
   assert_file    "$(fdir "$root")/$h.json"     "L1 wrote findings JSON"
+  assert_file    "$(fdir "$root")/$h.stats.json" "mechanical stats sidecar written"
+  assert_eq      "$(jq -r .tool_call_count "$(fdir "$root")/$h.stats.json")" "1" "sidecar has plausible tool_call_count"
   assert_no_file "$(fdir "$root")/$h.json.err" "no .err on success"
   assert_file    "$root/dreams/$DATE.md"       "L2 wrote the report"
   rm -rf "$root"
@@ -191,6 +253,13 @@ test_framing(){
   case "$l2" in "Write your findings JSON to this literal absolute path: /"*) ok "line 2 = literal output path" ;; *) no "line 2 framing (got [$l2])" ;; esac
   assert_eq "$l3" "" "line 3 = blank separator (doc not glued onto the path)"
   case "$l4" in "# Session Triage"*) ok "line 4 = SESSION_TRIAGE.md begins" ;; *) no "line 4 doc start (got [$l4])" ;; esac
+  local doc_line stats_line
+  doc_line=$(grep -n '^## Output schema' "$cap" | head -n 1 | cut -d: -f1)
+  stats_line=$(grep -n '^## Precomputed session stats' "$cap" | head -n 1 | cut -d: -f1)
+  [ -n "$doc_line" ] && [ -n "$stats_line" ] && [ "$stats_line" -gt "$doc_line" ] \
+    && ok "precomputed stats block follows the full SESSION_TRIAGE.md body" \
+    || no "precomputed stats block follows the full SESSION_TRIAGE.md body"
+  assert_grep "$cap" '"tool_call_count": 1' "captured L1 prompt contains the sidecar JSON"
   if printf '%s\n%s\n' "$l1" "$l2" | grep -qE 'SESSION_PATH=|OUTPUT_PATH=|[$]SESSION_PATH|[$]OUTPUT_PATH'; then
     no "no legacy KEY=value / \$VAR framing in the inlined header"
   else
@@ -376,6 +445,7 @@ test_facet_fields_plumbed(){
 echo "cc-autodream integration tests (mock claude)"
 echo
 test_happy
+test_session_stats
 test_unreadable
 test_incomplete
 test_idempotent

@@ -15,7 +15,7 @@ These are plain text values, **not shell variables**. Use them as literal paths 
 
 All other inputs you need (treat `<findings-dir>` below as the literal path from line 1):
 
-- **Per-session findings JSONs**: every file matching `<findings-dir>/*.json` (Glob it) is one session's structured output (schema in `SESSION_TRIAGE.md`). Read them all.
+- **Per-session findings JSONs**: every file matching `<findings-dir>/*.json` except `*.stats.json` (Glob it) is one session's structured output (schema in `SESSION_TRIAGE.md`). Read them all.
 - **Per-session stderr**: `<findings-dir>/*.json.err` if a triage call failed — note in your report.
 - **Installed skills**: walk `~/.claude/skills/`, `~/.claude/plugins/*/skills/`, and project `.claude/skills/`. Each has frontmatter `description`/triggers. Use this to validate `missed_skill` findings (skill exists? trigger matches?).
 - **Memory files**: `~/.claude/projects/*/memory/MEMORY.md` (one per project — may not exist).
@@ -84,6 +84,7 @@ cc-autodream is its author's own project — turn the lens on the pipeline itsel
 - **Pipeline capacity**: `l1_findings_with_error` counts sessions that ran to completion but returned empty `findings` with an `error` (transcript too big to fit, even after slimming) — a silent failure that `l1_err_files` (crashed-worker `.err` files) does NOT capture. If it is a meaningful fraction of `sessions_triaged`, call out the extraction-failure rate and propose the next cc-autodream fix (a `jq` pre-summarizer that strips verbose `tool_result` payloads, a lower `AUTODREAM_SLIM_BYTES`, or a metadata-only fallback pass).
 - **Retry/sleep health**: if `l1_rounds_used` approached `l1_rounds_max` or `l1_missing_after_retries > 0`, the run fought the network/sleep — note it (the laptop likely slept mid-run) and whether the report is complete.
 - **Recurring self-findings**: if cc-autodream sessions themselves surfaced patterns (the author working on the tool), give them first-class weight here rather than burying them in per-project notes.
+- **Turn-count semantics**: changed on 2026-07-20; `turn_count` now includes tool_result-carrier user lines. Do not flag the jump in Total turns as an anomaly.
 
 Keep it to what the stats and findings actually show; skip the section's sub-bullets that have nothing to report. If `run-stats.txt` is absent, say so and move on.
 
@@ -135,7 +136,7 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 ## How to start
 
 1. Read the findings directory's `*.json` files (use Glob then Read).
-2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Also sum each session's `compliance_markers` counts (`RETRY-BUDGET`, `FETCH-PIVOT`) when present: markers measure the retry-budget rules working as designed. When reporting a `tool_loop` pattern, split marker-present sessions (rule fired — healthy) from marker-absent ones (the actual non-compliance) and state both counts. Also collect the facet fields when present: `outcome` and `satisfaction_signals` for the Activity-snapshot outcomes line, `underlying_goal` for Per-project notes, and the `instructions_given` lists for the cross-session repetition check (see Memory updates).
+2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Exclude `*.stats.json` sidecars from the findings aggregate. Also sum each session's `compliance_markers` counts (`RETRY-BUDGET`, `FETCH-PIVOT`) when present: markers measure the retry-budget rules working as designed. When reporting a `tool_loop` pattern, split marker-present sessions (rule fired — healthy) from marker-absent ones (the actual non-compliance) and state both counts. Also collect the facet fields when present: `outcome` and `satisfaction_signals` for the Activity-snapshot outcomes line, `underlying_goal` for Per-project notes, and the `instructions_given` lists for the cross-session repetition check (see Memory updates).
 3. Walk installed skills (Glob `~/.claude/skills/*/SKILL.md` etc., Read frontmatter).
 4. Read `<findings-dir>/changelog-window.md` (Upstream changes) and `<findings-dir>/run-stats.txt` (Autodream self-audit) if present.
 5. Write the report to the literal report path from line 2.
