@@ -39,7 +39,7 @@ Quote 1-3 sentences of evidence for every finding. Don't synthesize, don't infer
 | `fabricated_id` | Claude quoted a SHA, PR number, line number, function name, or version that wasn't from a just-run command. See the HARD RULE above: tools like `StructuredOutput` that succeed but aren't in `skill_listing` are harness-provided — never flag them. |
 | `stop_projection` | "you must be tired", "let's pick this back up", "we should stop", any variant. |
 | `drift_after_compaction` | Context summarization happened (look for compaction markers or sudden context loss) and a fact established earlier was forgotten/re-asked. |
-| `buggy_code_shipped` | **PILOT category (week-long trial; L2 discard rate decides if it stays).** Claude declared something done/working and a later turn shows it broken: a test failure on the "finished" code, the user pasting an error from it. The signal is the premature success claim, NOT the debugging that follows. Normal iterative debugging — try, fail, fix, with no "done"/"working"/"tests pass" claim in between — is NOT this category; emit nothing for it. |
+| `buggy_code_shipped` | **PILOT category.** Claude declared something done/working and a later turn shows it broken: a test failure on the "finished" code, the user pasting an error from it. The signal is the premature success claim, NOT the debugging that follows. Normal iterative debugging — try, fail, fix, with no "done"/"working"/"tests pass" claim in between — is NOT this category; emit nothing for it. |
 
 **MORATORIUM — never emit `assumption_unsurfaced`.** Do NOT file any finding about a missing/late ASSUMPTIONS block, regardless of how clearly the transcript shows it. This category is retired (settled 2026-07-03): L2 discards every such finding on arrival, so generating one is pure wasted work. If a session's only notable issue is an unsurfaced/late ASSUMPTIONS block, emit `"findings": []`. Do not re-route it into another category (e.g. `missed_skill`) either.
 
@@ -53,6 +53,8 @@ Alongside findings, emit three judgment facets about the session as a whole, plu
 - `outcome` — judged from the transcript's end state: `fully_achieved`, `mostly_achieved`, `partially_achieved`, `not_achieved`, or `unclear_from_transcript`. When genuinely ambiguous, use `unclear_from_transcript` — never guess.
 - `satisfaction_signals` — count ONLY explicit user signals: "great!"/"perfect!" → `happy`; "thanks"/"looks good"/"that works" → `satisfied`; "that's not right"/"try again" → `dissatisfied`; "this is broken"/"I give up" → `frustrated`. A user continuing without comment counts as nothing. All-zero counts are the normal case for many sessions.
 - `instructions_given` — up to 3 one-line paraphrases of explicit STANDING instructions the user stated ("always run tests after edits", "use fish syntax", "never push to main directly"). Standing directives only — not one-off task requests. Empty array when there are none.
+
+For a trivial session (a handful of turns, no substantive work), emit the facets without deliberation: `underlying_goal: null`, `outcome: "unclear_from_transcript"`, all-zero `satisfaction_signals`, empty `instructions_given`.
 
 ## Output schema
 

@@ -331,6 +331,9 @@ test_normalize_project(){
   assert_nogrep "$fj" 'WRONG-PROJECT'     "model's wrong project value was overwritten"
   assert_grep   "$fj" '"project": "proj-a"' "project normalized to the session dir basename"
   assert_grep   "$root/run.out" 'normalized project field' "run log reports normalization"
+  # l1_badproject emits the pre-pilot JSON shape (no facet fields) — the report
+  # landing proves L2 still accepts legacy findings.
+  assert_file   "$root/dreams/$DATE.md" "L2 completed on facet-free legacy findings"
   rm -rf "$root"
 }
 
