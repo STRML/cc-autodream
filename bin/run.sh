@@ -517,6 +517,38 @@ EOF
     -exec grep -l '"skipped": *"below_noise_gate"' {} + 2>/dev/null | wc -l | tr -d " ")
   log "L1 done in ${L1_ELAPSED}s: $L1_OK done ($L1_ERRORED with errors, $GATED gated), $MISSING missing (.err files: $L1_FAIL)"
 
+  # ---- Oversized-transcript measurement gate (#12) ----
+  # Issue #12 proposes chunk-summarizing oversized transcripts instead of slimming them;
+  # that implementation is BLOCKED pending evidence it's actually needed. These two
+  # counters are the measurement: how many triaged sessions exceeded AUTODREAM_SLIM_BYTES
+  # (the same threshold dispatch_l1 checks before calling slim-transcript.sh), and of
+  # those, how many still ended in an in-band failure (the same top-level "error" key
+  # L1_ERRORED checks above) despite the existing fallback stack (slimming, chunked-Read
+  # guidance, metadata-stub path). Gate: if oversized_errored/oversized_total sustains
+  # >= 5% over a trailing week, that's the signal issue #12's gate has opened; below that
+  # the fallback stack is doing its job. This script only records the counters — the L2
+  # self-audit and the human do the trailing-week judgment.
+  # Computed post-hoc from the *.stats.json sidecars' transcript_bytes field, same
+  # post-hoc pattern as GATED/L1_ERRORED above: the per-worker sz variable at dispatch
+  # time (line ~309) lives in an xargs subshell with no shared state to increment
+  # directly, so this re-derives it from the sidecar written before dispatch instead.
+  OVERSIZED_TOTAL=0
+  OVERSIZED_ERRORED=0
+  for statsfile in "$FINDINGS_DIR"/*.stats.json; do
+    [ -e "$statsfile" ] || continue
+    sz=$(jq -r '.transcript_bytes // 0' "$statsfile" 2>/dev/null)
+    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    if [ "$sz" -gt "${AUTODREAM_SLIM_BYTES:-262144}" ]; then
+      OVERSIZED_TOTAL=$((OVERSIZED_TOTAL + 1))
+      hash=$(basename "$statsfile" .stats.json)
+      findingsfile="$FINDINGS_DIR/$hash.json"
+      if [ -f "$findingsfile" ] && grep -q '"error":' "$findingsfile" 2>/dev/null; then
+        OVERSIZED_ERRORED=$((OVERSIZED_ERRORED + 1))
+      fi
+    fi
+  done
+  log "oversized: $OVERSIZED_TOTAL session(s) over ${AUTODREAM_SLIM_BYTES:-262144} bytes ($OVERSIZED_ERRORED errored)"
+
   # ---- Normalize the project field deterministically from the session path ----
   # SESSION_TRIAGE.md asks the L1 worker to emit "project" by hand, and haiku does it
   # nondeterministically: one run surfaced the SAME -Users-sean dir as "-Users-sean",
@@ -589,6 +621,10 @@ PY
     printf 'l1_rounds_max: %s\n' "$L1_ROUNDS"
     printf 'l1_findings_written: %s\n' "$L1_OK"
     printf 'l1_findings_with_error: %s\n' "$L1_ERRORED"
+    # Oversized-transcript measurement gate (#12) — see the computation above L1_ERRORED
+    # for the gate meaning (M/N >= 5% over a trailing week opens issue #12).
+    printf 'oversized_total: %s\n' "$OVERSIZED_TOTAL"
+    printf 'oversized_errored: %s\n' "$OVERSIZED_ERRORED"
     printf 'l1_missing_after_retries: %s\n' "$MISSING"
     printf 'l1_err_files: %s\n' "$L1_FAIL"
     # Cached vs. fresh: lets the aggregator distinguish a sub-second "elapsed"
