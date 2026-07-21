@@ -64,6 +64,9 @@ PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
 # Oversized-transcript slimmer (resolved the same way; exported to the L1 workers).
 SLIM="$SCRIPT_DIR/slim-transcript.sh"
 [ -x "$SLIM" ] || SLIM="$AUTODREAM_DIR/slim-transcript.sh"
+# Deterministic session-stat pre-pass (resolved like the other helper scripts).
+STATS="$SCRIPT_DIR/session-stats.sh"
+[ -x "$STATS" ] || STATS="$AUTODREAM_DIR/session-stats.sh"
 
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
@@ -200,6 +203,28 @@ l1_missing_count() { # count sessions in $SESSIONS_LIST that still have no findi
   printf '%s' "$m"
 }
 
+findings_json_count() {
+  find "$FINDINGS_DIR" -type f -name '*.json' ! -name '*.stats.json' 2>/dev/null \
+    | wc -l | tr -d ' '
+}
+
+compute_session_stats() {
+  local session hash stats
+  while IFS= read -r session; do
+    [ -n "$session" ] || continue
+    hash=$(printf "%s" "$session" | shasum -a 1 | cut -c1-12)
+    stats="$FINDINGS_DIR/$hash.stats.json"
+    rm -f "$stats"
+    if [ -x "$STATS" ] && "$STATS" "$session" "$stats" >/dev/null 2>&1 \
+      && [ -s "$stats" ] && jq -e 'type == "object"' "$stats" >/dev/null 2>&1; then
+      echo "stats: $session ($hash)" >&2
+    else
+      rm -f "$stats"
+      echo "stats failed: $session ($hash); continuing without precomputed stats" >&2
+    fi
+  done < "$SESSIONS_LIST"
+}
+
 dispatch_l1() { # one parallel pass; idempotent worker → only the still-missing sessions run
   < "$SESSIONS_LIST" xargs -P "$FANOUT" -I {} bash -c '
     session="$1"
@@ -256,6 +281,11 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       printf "Session transcript to analyze (literal absolute path): %s\n" "$readpath"
       printf "Write your findings JSON to this literal absolute path: %s\n\n" "$output"
       cat "$AUTODREAM_DIR/SESSION_TRIAGE.md"
+      if [ -s "$FINDINGS_DIR/$hash.stats.json" ]; then
+        printf "\n## Precomputed session stats (authoritative — copy these into your output)\n\n\`\`\`json\n"
+        cat "$FINDINGS_DIR/$hash.stats.json"
+        printf "\n\`\`\`\n"
+      fi
     } | "$CLAUDE_BIN" \
       --print \
       --permission-mode bypassPermissions \
@@ -366,6 +396,10 @@ EOF
     return 0
   fi
 
+  # Compute once from the final enumeration. Retry rounds reuse these sidecars;
+  # they are intentionally not regenerated during dispatch retries.
+  compute_session_stats
+
   # ---- Layer 1: haiku triage, parallel, retried across sleep/network gaps ----
   # Lean-query env (claude-cells internal/claude/query.go pattern): keep subscription
   # OAuth auth but strip per-call bloat — no CLAUDE.md auto-load, no telemetry/error
@@ -401,7 +435,7 @@ EOF
     export AUTODREAM_CURRENT_ROUND="$round"
     dispatch_l1
     MISSING=$(l1_missing_count)
-    L1_DONE=$(ls -1 "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
+    L1_DONE=$(findings_json_count)
     log "L1 round $round: $L1_DONE done, $MISSING still missing"
     [ "$MISSING" -eq 0 ] && break
     if [ "$round" -lt "$L1_ROUNDS" ]; then
@@ -411,13 +445,14 @@ EOF
     fi
   done
   L1_ELAPSED=$(( $(date +%s) - L1_START ))
-  L1_OK=$(ls -1 "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
+  L1_OK=$(findings_json_count)
   L1_FAIL=$(ls -1 "$FINDINGS_DIR"/*.json.err 2>/dev/null | wc -l | tr -d " ")
   # In-band failures: a worker that ran to completion but couldn't fit the transcript
   # writes a findings JSON carrying a top-level "error" key (empty findings). These are
   # NOT .json.err files, so l1_err_files=0 masked them — count them explicitly so the
   # self-audit can alarm on a high extraction-failure rate (slimming should drive →0).
-  L1_ERRORED=$(grep -l '"error":' "$FINDINGS_DIR"/*.json 2>/dev/null | wc -l | tr -d " ")
+  L1_ERRORED=$(find "$FINDINGS_DIR" -type f -name '*.json' ! -name '*.stats.json' \
+    -exec grep -l '"error":' {} + 2>/dev/null | wc -l | tr -d " ")
   log "L1 done in ${L1_ELAPSED}s: $L1_OK done ($L1_ERRORED with errors), $MISSING missing (.err files: $L1_FAIL)"
 
   # ---- Normalize the project field deterministically from the session path ----
