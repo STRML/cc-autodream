@@ -552,6 +552,46 @@ test_noise_gate_env_override(){
   rm -rf "$root"
 }
 
+test_oversized_gate_zero(){
+  echo "# oversized gate (#12 measurement): both keys present at 0 on a normal run"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'oversized_total: 0'   "no oversized sessions under the default threshold"
+  assert_grep "$stats" 'oversized_errored: 0' "no oversized-errored sessions under the default threshold"
+  rm -rf "$root"
+}
+
+test_oversized_gate_total(){
+  echo "# oversized gate (#12 measurement): a session over a lowered AUTODREAM_SLIM_BYTES counts as oversized"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # mk_session's fixture is 205 bytes; a threshold of 100 puts it over the line
+  # without needing a multi-KB fixture. slim-transcript.sh also fires at this
+  # size (harmless — the mock still writes findings regardless of readpath).
+  export AUTODREAM_SLIM_BYTES=100
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'oversized_total: 1'   "one session counted as oversized"
+  assert_grep "$stats" 'oversized_errored: 0' "the oversized session still triaged cleanly (no error key)"
+  rm -rf "$root"
+}
+
+test_oversized_gate_errored(){
+  echo "# oversized gate (#12 measurement): an oversized session that still errors is paired correctly"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # Force the final-round metadata stub (carries a top-level "error" key) on an
+  # oversized session, and verify oversized_errored pairs the right hash's
+  # stats sidecar to the right findings JSON (not just a raw count).
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_incomplete AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'oversized_total: 1'   "the incomplete session still counted as oversized"
+  assert_grep "$stats" 'oversized_errored: 1' "its final-round error stub is paired and counted"
+  rm -rf "$root"
+}
+
 test_overlap_pair(){
   echo "# overlap (#14): two alternating-close sessions count as ONE pair regardless of qualifying turn-pairs"
   local root; root=$(setup_env)
@@ -626,6 +666,9 @@ test_noise_gate_short_duration
 test_noise_gate_subagent_carveout
 test_noise_gate_stats
 test_noise_gate_env_override
+test_oversized_gate_zero
+test_oversized_gate_total
+test_oversized_gate_errored
 test_overlap_pair
 test_overlap_triple
 test_overlap_none
