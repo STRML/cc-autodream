@@ -28,6 +28,8 @@
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
 #   AUTODREAM_L2_MODEL   override the L2 aggregator model            default: fable-5 until 2026-06-20, claude-opus-4-7 from 2026-06-21
+#   AUTODREAM_MIN_USER_TURNS  noise-gate floor on user_message_count  default: 2
+#   AUTODREAM_MIN_MINUTES     noise-gate floor on duration_minutes    default: 1
 
 set -u
 
@@ -250,6 +252,26 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       exit 0
     fi
 
+    # ---- Noise gate: skip the L1 model call for low-signal sessions ----
+    # Uses the mechanical stats sidecar (session-stats.sh, computed once during
+    # enumeration) so gating never needs a model call of its own. Subagent
+    # transcripts (isSidechain) and high tool-count sessions are never gated;
+    # they are legitimate work, just often short on user turns (see CLAUDE.md).
+    # An uncomputable duration (0, meaning zero or one timestamped line) never
+    # gates on the duration rule alone; bias to triage when it cannot be
+    # measured. A missing or unparseable stats sidecar also never gates; bias
+    # to triage. Defaults: 2 user turns, 1 minute; either condition alone gates.
+    statsfile="$FINDINGS_DIR/$hash.stats.json"
+    if [ -s "$statsfile" ]; then
+      gate=$(jq -r --argjson min_turns "${AUTODREAM_MIN_USER_TURNS:-2}" --argjson min_minutes "${AUTODREAM_MIN_MINUTES:-1}" "if (.isSidechain == true) or ((.tool_call_count // 0) >= 5) then 0 elif (.user_message_count // 0) < \$min_turns then 1 elif ((.duration_minutes // 0) > 0) and ((.duration_minutes // 0) < \$min_minutes) then 1 else 0 end" "$statsfile" 2>/dev/null)
+      if [ "$gate" = "1" ]; then
+        printf "{\"session_path\":\"%s\",\"skipped\":\"below_noise_gate\",\"findings\":[]}\n" "$session" > "$output"
+        rm -f "$errlog"
+        echo "gated (below noise threshold): $session ($hash)" >&2
+        exit 0
+      fi
+    fi
+
     # Oversized transcripts (multi-MB, base64 images, giant tool outputs) blow the
     # worker token budget so it errors out instead of triaging. Slim those first and
     # point the worker at the reduced copy; small sessions are read verbatim. The
@@ -453,7 +475,13 @@ EOF
   # self-audit can alarm on a high extraction-failure rate (slimming should drive →0).
   L1_ERRORED=$(find "$FINDINGS_DIR" -type f -name '*.json' ! -name '*.stats.json' \
     -exec grep -l '"error":' {} + 2>/dev/null | wc -l | tr -d " ")
-  log "L1 done in ${L1_ELAPSED}s: $L1_OK done ($L1_ERRORED with errors), $MISSING missing (.err files: $L1_FAIL)"
+  # Noise-gated sessions: dispatch_l1 wrote a stub instead of calling the model
+  # (see the "Noise gate" comment in dispatch_l1). Counted from the findings
+  # dir rather than a shared counter, since each gate decision happens inside
+  # an independent xargs subshell with no shared state to increment.
+  GATED=$(find "$FINDINGS_DIR" -type f -name '*.json' ! -name '*.stats.json' \
+    -exec grep -l '"skipped": *"below_noise_gate"' {} + 2>/dev/null | wc -l | tr -d " ")
+  log "L1 done in ${L1_ELAPSED}s: $L1_OK done ($L1_ERRORED with errors, $GATED gated), $MISSING missing (.err files: $L1_FAIL)"
 
   # ---- Normalize the project field deterministically from the session path ----
   # SESSION_TRIAGE.md asks the L1 worker to emit "project" by hand, and haiku does it
@@ -514,6 +542,11 @@ PY
     printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
     printf 'sessions_skipped_empty: %s\n' "$SKIPPED_EMPTY"
     printf 'sessions_triaged: %s\n' "$COUNT"
+    # Sessions within sessions_triaged that were skipped before any model call
+    # (noise gate). Structurally cannot appear in l1_findings_with_error since
+    # they never reached a model; the self-audit denominator for the
+    # extraction-failure rate must subtract this out.
+    printf 'gated: %s\n' "$GATED"
     # vs.-raw denominator: a session lost to ANY path (prune mis-classification,
     # silent worker death, slim leftovers) shows up here. Always >= 0; if
     # nonzero, the aggregator should investigate even when l1_missing=0.

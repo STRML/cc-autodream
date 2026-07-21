@@ -36,8 +36,37 @@ setup_env(){
   printf '%s' "$root"
 }
 mk_session(){ # $1=root $2=name
+  # Two real user turns (no timestamps -> duration_minutes 0, uncomputable and
+  # so exempt from the duration gate rule) so this fixture clears the noise
+  # gate's default AUTODREAM_MIN_USER_TURNS=2 floor and every existing test
+  # that expects real L1 triage keeps getting it.
   local f="$1/projects/proj-a/$2.jsonl"
-  printf '{"type":"user","cwd":"/tmp/proj-a"}\n{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}\n' > "$f"
+  printf '%s\n' \
+    '{"type":"user","cwd":"/tmp/proj-a","message":{"content":"start the task"}}' \
+    '{"type":"user","message":{"content":"keep going"}}' \
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}' \
+    > "$f"
+  touch -t "$STAMP" "$f"
+}
+mk_trivial_session(){ # $1=root $2=name — single user turn, no tool calls: below the noise gate
+  local f="$1/projects/proj-a/$2.jsonl"
+  printf '{"type":"user","message":{"content":"quick question"}}\n' > "$f"
+  touch -t "$STAMP" "$f"
+}
+mk_short_duration_session(){ # $1=root $2=name — 2 user turns, 5s apart: gates on duration alone
+  local f="$1/projects/proj-a/$2.jsonl"
+  printf '%s\n' \
+    '{"type":"user","timestamp":"2026-07-20T10:00:00Z","message":{"content":"quick check"}}' \
+    '{"type":"user","timestamp":"2026-07-20T10:00:05Z","message":{"content":"thanks bye"}}' \
+    > "$f"
+  touch -t "$STAMP" "$f"
+}
+mk_subagent_session(){ # $1=root $2=name — isSidechain + >=5 tool calls: carve-out, never gated
+  local f="$1/projects/proj-a/$2.jsonl"
+  printf '%s\n' \
+    '{"type":"user","isSidechain":true,"timestamp":"2026-07-20T10:00:00Z","message":{"content":"subagent task"}}' \
+    '{"type":"assistant","isSidechain":true,"timestamp":"2026-07-20T10:00:05Z","message":{"content":[{"type":"tool_use","name":"Read"},{"type":"tool_use","name":"Write"},{"type":"tool_use","name":"Bash"},{"type":"tool_use","name":"Grep"},{"type":"tool_use","name":"Edit"}]}}' \
+    > "$f"
   touch -t "$STAMP" "$f"
 }
 hash_of(){ printf '%s' "$1" | shasum -a 1 | cut -c1-12; }
@@ -437,6 +466,81 @@ test_facet_fields_plumbed(){
   rm -rf "$root"
 }
 
+test_noise_gate_trivial(){
+  echo "# noise gate: a trivial (1-user-turn) session is stubbed, not sent to the model"
+  local root; root=$(setup_env)
+  mk_session "$root" real1
+  mk_trivial_session "$root" trivial1
+  export MOCK_CALL_LOG="$root/calls.log"
+  run_dream "$root"
+  unset MOCK_CALL_LOG
+  local hr ht
+  hr=$(hash_of "$root/projects/proj-a/real1.jsonl")
+  ht=$(hash_of "$root/projects/proj-a/trivial1.jsonl")
+  assert_file    "$(fdir "$root")/$ht.json"     "gated session still got a findings JSON (the stub)"
+  # Whitespace-tolerant like test_incomplete: the project-field normalization
+  # pass rewrites this stub via json.dump (it has a real session_path + no
+  # project), reformatting "skipped":"below_noise_gate" -> "skipped": "..." etc.
+  assert_grep    "$(fdir "$root")/$ht.json"     '"skipped": *"below_noise_gate"' "gated stub carries the skip reason"
+  assert_grep    "$(fdir "$root")/$ht.json"     '"findings": *\[\]'              "gated stub has an empty findings array"
+  assert_no_file "$(fdir "$root")/$ht.json.err" "no .err for a gated session (clean skip, not a failure)"
+  assert_grep    "$root/calls.log" "$hr" "model was called for the real session"
+  assert_nogrep  "$root/calls.log" "$ht" "model was NOT called for the gated session"
+  rm -rf "$root"
+}
+
+test_noise_gate_short_duration(){
+  echo "# noise gate: duration alone gates even with enough user turns"
+  local root; root=$(setup_env)
+  mk_short_duration_session "$root" short1
+  run_dream "$root"
+  local h; h=$(hash_of "$root/projects/proj-a/short1.jsonl")
+  assert_grep "$(fdir "$root")/$h.json" '"skipped": *"below_noise_gate"' "short-duration session gated despite 2 user turns"
+  rm -rf "$root"
+}
+
+test_noise_gate_subagent_carveout(){
+  echo "# noise gate: subagent / high-tool-count sessions are never gated"
+  local root; root=$(setup_env)
+  mk_subagent_session "$root" subagent1
+  run_dream "$root"
+  local h; h=$(hash_of "$root/projects/proj-a/subagent1.jsonl")
+  assert_nogrep "$(fdir "$root")/$h.json" 'below_noise_gate' "subagent session was not gated"
+  assert_grep   "$(fdir "$root")/$h.json" 'fully_achieved'    "subagent session got real findings from the model"
+  rm -rf "$root"
+}
+
+test_noise_gate_stats(){
+  echo "# noise gate: gated count in run-stats.txt; precache count stays truthful alongside gating"
+  local root; root=$(setup_env)
+  mk_session "$root" real1
+  mk_trivial_session "$root" trivial1
+  mk_session "$root" cached1
+  local hc; hc=$(hash_of "$root/projects/proj-a/cached1.jsonl")
+  mkdir -p "$(fdir "$root")"
+  printf '{"session_path":"CACHED","findings":[]}' > "$(fdir "$root")/$hc.json"
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'gated: 1'                        "gated count recorded"
+  assert_grep "$stats" 'sessions_triaged: 3'              "all three sessions counted as triaged"
+  assert_grep "$stats" 'l1_sessions_already_done_at_start: 1' "precache count unaffected by gating (only cached1 was precached)"
+  local ht; ht=$(hash_of "$root/projects/proj-a/trivial1.jsonl")
+  assert_grep "$(fdir "$root")/$ht.json" 'below_noise_gate' "gated session got the stub"
+  rm -rf "$root"
+}
+
+test_noise_gate_env_override(){
+  echo "# noise gate: AUTODREAM_MIN_USER_TURNS override changes the threshold"
+  local root; root=$(setup_env)
+  mk_trivial_session "$root" trivial1
+  export AUTODREAM_MIN_USER_TURNS=1
+  run_dream "$root"
+  unset AUTODREAM_MIN_USER_TURNS
+  local h; h=$(hash_of "$root/projects/proj-a/trivial1.jsonl")
+  assert_nogrep "$(fdir "$root")/$h.json" 'below_noise_gate' "lowering the threshold keeps the 1-turn session out of the gate"
+  rm -rf "$root"
+}
+
 # ---------------------------------------------------------------------------
 
 [ -x "$RUN" ]  || { echo "FATAL: $RUN not executable"; exit 1; }
@@ -465,6 +569,11 @@ test_self_audit_stats_precached_disambiguation
 test_normalize_project
 test_slim_transcript
 test_facet_fields_plumbed
+test_noise_gate_trivial
+test_noise_gate_short_duration
+test_noise_gate_subagent_carveout
+test_noise_gate_stats
+test_noise_gate_env_override
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

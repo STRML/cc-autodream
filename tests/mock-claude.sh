@@ -12,6 +12,10 @@
 #                            without producing JSON); L2 still writes its report.
 #   MOCK_CAPTURE_DIR=<dir>   dump each layer's stdin + argv to <dir>/l{1,2}-*.txt
 #                            so tests can assert on the exact prompt framing.
+#   MOCK_CALL_LOG=<file>     append the L1 output path for every invocation of
+#                            this mock, one per line — lets a test prove the
+#                            model was (or was not) invoked for a given session
+#                            (e.g. a noise-gated session should never appear).
 
 input=$(cat)
 mode="${MOCK_MODE:-good}"
@@ -26,6 +30,7 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
   fi
   out=$(printf '%s' "$line2" | sed 's/^Write your findings JSON to this literal absolute path: //')
   sess=$(printf '%s' "$line1" | sed 's/^Session transcript to analyze (literal absolute path): //')
+  [ -n "${MOCK_CALL_LOG:-}" ] && printf '%s\n' "$out" >> "$MOCK_CALL_LOG"
   write_findings() { printf '{"session_path":"x","project":"proj-a","turn_count":2,"tool_call_count":0,"tools_used":[],"skills_invoked":[],"models_used":[],"notable_initiatives":[],"underlying_goal":null,"outcome":"fully_achieved","satisfaction_signals":{"happy":0,"satisfied":1,"dissatisfied":0,"frustrated":0},"instructions_given":["always run tests after edits"],"findings":[]}' > "$out"; }
   # Emit a real session_path but a deliberately WRONG project (what nondeterministic
   # haiku does), so run.sh's path-based normalization pass has something to correct.
