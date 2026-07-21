@@ -40,6 +40,7 @@ Write to `REPORT_PATH`. Overwrite if present (idempotent re-runs are fine). Requ
 - Skills invoked (top 5 by count)
 - Models used (with counts)
 - Outcomes: distribution of the per-session `outcome` facet when present (e.g. "18 sessions with outcome: 12 fully, 3 mostly, 1 partial, 2 unclear"), plus any non-zero `satisfaction_signals` totals summed across sessions. Omit the line if no JSON carries the facet fields (pre-pilot findings). This line is descriptive only — it does NOT change the Top-patterns ranking formula.
+- Multi-clauding: read `<findings-dir>/run-stats.txt`'s `overlap_events` and `sessions_with_overlap` fields — how many sessions had a user turn within 30 minutes of a user turn in a *different* session that day (concurrent human activity across sessions, not a quality signal). When either field is present and greater than 0, add a line like "Multi-clauding: 3 sessions overlapped in 2 pairs." Omit the line entirely when both fields are 0, or when the keys are absent (findings dirs predating #14).
 
 ## Upstream Claude Code changes
 Read `<findings-dir>/changelog-window.md` (the runner's diff of `anthropics/claude-code`'s `CHANGELOG.md` over this report's date window). For each release entry in it, judge whether it changes how we should operate:

@@ -48,6 +48,7 @@ link "$REPO_DIR/bin/make-notifier.sh"   "$TARGET/make-notifier.sh"
 link "$REPO_DIR/bin/prune-self-sessions.sh" "$TARGET/prune-self-sessions.sh"
 link "$REPO_DIR/bin/slim-transcript.sh"     "$TARGET/slim-transcript.sh"
 link "$REPO_DIR/bin/session-stats.sh"        "$TARGET/session-stats.sh"
+link "$REPO_DIR/bin/overlap-stats.sh"        "$TARGET/overlap-stats.sh"
 link "$REPO_DIR/prompts/PROMPT.md"      "$TARGET/PROMPT.md"
 link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 

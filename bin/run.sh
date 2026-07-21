@@ -69,6 +69,9 @@ SLIM="$SCRIPT_DIR/slim-transcript.sh"
 # Deterministic session-stat pre-pass (resolved like the other helper scripts).
 STATS="$SCRIPT_DIR/session-stats.sh"
 [ -x "$STATS" ] || STATS="$AUTODREAM_DIR/session-stats.sh"
+# Global cross-session overlap pass (#14; resolved like the other helper scripts).
+OVERLAP="$SCRIPT_DIR/overlap-stats.sh"
+[ -x "$OVERLAP" ] || OVERLAP="$AUTODREAM_DIR/overlap-stats.sh"
 
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
@@ -225,6 +228,31 @@ compute_session_stats() {
       echo "stats failed: $session ($hash); continuing without precomputed stats" >&2
     fi
   done < "$SESSIONS_LIST"
+}
+
+# ---- Global overlap pass (#14): cross-session "multi-clauding" stat ----
+# Runs once compute_session_stats has written every session's *.stats.json sidecar
+# (each carries the mechanical user_turn_timestamps array). Overlap is a GLOBAL,
+# cross-session computation — it can't be done per-session inside compute_session_stats
+# or dispatch_l1's xargs subshells, which only ever see one session at a time. Sets
+# OVERLAP_EVENTS / SESSIONS_WITH_OVERLAP (default "0"/"0" on any failure/absence so the
+# run-stats.txt writer always has a value, never aborts the pipeline).
+compute_overlap_stats() {
+  OVERLAP_EVENTS=0
+  SESSIONS_WITH_OVERLAP=0
+  if [ ! -x "$OVERLAP" ]; then
+    log "overlap-stats.sh not found/executable; skipping overlap computation (0/0)"
+    return 0
+  fi
+  local json events involved
+  json=$("$OVERLAP" "$FINDINGS_DIR" 2>>"$RUN_LOG")
+  if [ -n "$json" ]; then
+    events=$(printf '%s' "$json" | jq -r '.overlap_events // 0' 2>/dev/null)
+    involved=$(printf '%s' "$json" | jq -r '.sessions_with_overlap // 0' 2>/dev/null)
+    [ -n "$events" ] && OVERLAP_EVENTS="$events"
+    [ -n "$involved" ] && SESSIONS_WITH_OVERLAP="$involved"
+  fi
+  log "overlap: $OVERLAP_EVENTS pair(s), $SESSIONS_WITH_OVERLAP session(s) involved"
 }
 
 dispatch_l1() { # one parallel pass; idempotent worker → only the still-missing sessions run
@@ -422,6 +450,12 @@ EOF
   # they are intentionally not regenerated during dispatch retries.
   compute_session_stats
 
+  # Global pass: must run AFTER every session's sidecar exists (overlap is a
+  # cross-session computation, not per-session). Deliberately BEFORE the noise gate
+  # runs inside dispatch_l1 below — gated sessions' sidecars still exist and still
+  # participate in overlap (see the comment in bin/overlap-stats.sh).
+  compute_overlap_stats
+
   # ---- Layer 1: haiku triage, parallel, retried across sleep/network gaps ----
   # Lean-query env (claude-cells internal/claude/query.go pattern): keep subscription
   # OAuth auth but strip per-call bloat — no CLAUDE.md auto-load, no telemetry/error
@@ -562,6 +596,9 @@ PY
     printf 'l1_sessions_already_done_at_start: %s\n' "$L1_PRECACHED"
     printf 'l1_sessions_freshly_processed: %s\n' "$L1_FRESHLY_PROCESSED"
     printf 'l1_elapsed_seconds: %s\n' "$L1_ELAPSED"
+    # Global cross-session overlap stat (#14) — see compute_overlap_stats above.
+    printf 'overlap_events: %s\n' "$OVERLAP_EVENTS"
+    printf 'sessions_with_overlap: %s\n' "$SESSIONS_WITH_OVERLAP"
   } > "$FINDINGS_DIR/run-stats.txt"
 
   # ---- Upstream changelog window (writes changelog-window.md for L2 to read) ----
