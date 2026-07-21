@@ -69,6 +69,15 @@ mk_subagent_session(){ # $1=root $2=name — isSidechain + >=5 tool calls: carve
     > "$f"
   touch -t "$STAMP" "$f"
 }
+mk_timed_session(){ # $1=root $2=name $3.. = ISO8601 timestamps, one user turn each (#14 overlap fixtures)
+  local root="$1" name="$2"; shift 2
+  local f="$root/projects/proj-a/$name.jsonl" ts
+  : > "$f"
+  for ts in "$@"; do
+    printf '{"type":"user","timestamp":"%s","message":{"content":"turn"}}\n' "$ts" >> "$f"
+  done
+  touch -t "$STAMP" "$f"
+}
 hash_of(){ printf '%s' "$1" | shasum -a 1 | cut -c1-12; }
 run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog knobs from env
   # Changelog check defaults OFF so the suite never touches the network; the dedicated
@@ -97,8 +106,9 @@ test_session_stats(){
     '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b","content":"result"}]}}' > "$fixture"
   "$REPO/bin/session-stats.sh" "$fixture" "$out"
   assert_eq "$(jq -r 'keys | sort | join(",")' "$out")" \
-    "compliance_markers,duration_minutes,isSidechain,models_used,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count" \
+    "compliance_markers,duration_minutes,isSidechain,models_used,tool_call_count,tools_used,transcript_bytes,transcript_mtime,turn_count,user_message_count,user_turn_timestamps" \
     "stats output has exactly the specified fields"
+  assert_eq "$(jq -r '.user_turn_timestamps | length' "$out")" "0" "no timestamped user turns in this fixture -> empty user_turn_timestamps"
   assert_eq "$(jq -r .user_message_count "$out")" "1" "tool_result carriers are excluded from user message count"
   assert_eq "$(jq -r .turn_count "$out")" "4" "turn count includes tool_result carriers"
 
@@ -112,6 +122,7 @@ test_session_stats(){
   "$REPO/bin/session-stats.sh" "$fixture" "$out"
   assert_eq "$(jq -r .duration_minutes "$out")" "2.5" "duration uses available fractional timestamps"
   assert_eq "$(jq -r .models_used[0] "$out")" "claude-opus" "synthetic model is dropped"
+  assert_eq "$(jq -r '.user_turn_timestamps | join(",")' "$out")" "1784541600" "user_turn_timestamps holds only the (fractional-second-truncated) real user turn's epoch"
 
   fixture="$root/markers.jsonl"; out="$root/markers.stats.json"
   printf '%s\n' \
@@ -541,6 +552,47 @@ test_noise_gate_env_override(){
   rm -rf "$root"
 }
 
+test_overlap_pair(){
+  echo "# overlap (#14): two alternating-close sessions count as ONE pair regardless of qualifying turn-pairs"
+  local root; root=$(setup_env)
+  # A: 10:00, 10:20   B: 10:05, 10:25 — every A/B turn combo is within 30 min
+  # (A0-B0=5m, A0-B1=25m, A1-B0=15m, A1-B1=5m), so four turn-pairs qualify but
+  # the {A,B} pair must be counted exactly once.
+  mk_timed_session "$root" sessA "2026-07-20T10:00:00Z" "2026-07-20T10:20:00Z"
+  mk_timed_session "$root" sessB "2026-07-20T10:05:00Z" "2026-07-20T10:25:00Z"
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'overlap_events: 1'         "exactly one distinct pair counted"
+  assert_grep "$stats" 'sessions_with_overlap: 2'  "both sessions counted as involved"
+  rm -rf "$root"
+}
+
+test_overlap_triple(){
+  echo "# overlap (#14): three pairwise-overlapping sessions -> 3 pairs, 3 sessions"
+  local root; root=$(setup_env)
+  # A@10:00, B@10:10, C@10:20 — every pair (A-B=10m, B-C=10m, A-C=20m) is within 30 min.
+  mk_timed_session "$root" sessA "2026-07-20T10:00:00Z"
+  mk_timed_session "$root" sessB "2026-07-20T10:10:00Z"
+  mk_timed_session "$root" sessC "2026-07-20T10:20:00Z"
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'overlap_events: 3'         "all three pairs counted"
+  assert_grep "$stats" 'sessions_with_overlap: 3'  "all three sessions counted as involved"
+  rm -rf "$root"
+}
+
+test_overlap_none(){
+  echo "# overlap (#14): sessions more than 30 minutes apart -> both stats 0, keys still present"
+  local root; root=$(setup_env)
+  mk_timed_session "$root" sessA "2026-07-20T10:00:00Z"
+  mk_timed_session "$root" sessB "2026-07-20T11:00:00Z"
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'overlap_events: 0'         "no pairs when sessions are far apart"
+  assert_grep "$stats" 'sessions_with_overlap: 0'  "no sessions involved when sessions are far apart"
+  rm -rf "$root"
+}
+
 # ---------------------------------------------------------------------------
 
 [ -x "$RUN" ]  || { echo "FATAL: $RUN not executable"; exit 1; }
@@ -574,6 +626,9 @@ test_noise_gate_short_duration
 test_noise_gate_subagent_carveout
 test_noise_gate_stats
 test_noise_gate_env_override
+test_overlap_pair
+test_overlap_triple
+test_overlap_none
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

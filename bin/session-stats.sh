@@ -46,6 +46,24 @@ jq -R -s \
           )
         )
     ] as $user_messages
+  | (
+      [
+        $lines[]
+        | select(.type == "user" and .isMeta != true)
+        | select(
+            (.message.content) as $c
+            | ($c | type) == "string"
+            or (
+              ($c | type) == "array"
+              and any($c[]?; .type == "text")
+              and all($c[]?; .type != "tool_result")
+            )
+          )
+        | .timestamp
+        | select(type == "string")
+        | try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch empty
+      ] | sort
+    ) as $user_turn_timestamps
   | [
       $lines[]
       | select(.isMeta != true and (.type == "user" or .type == "assistant"))
@@ -100,6 +118,7 @@ jq -R -s \
       },
       transcript_bytes: $transcript_bytes,
       transcript_mtime: $transcript_mtime,
-      isSidechain: (any($lines[]?; .isSidechain == true))
+      isSidechain: (any($lines[]?; .isSidechain == true)),
+      user_turn_timestamps: $user_turn_timestamps
     }
   ' "$transcript" > "$output"
