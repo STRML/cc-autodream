@@ -61,7 +61,14 @@ For a trivial session (a handful of turns, no substantive work), emit the facets
 ## Output schema
 
 Write EXACTLY this shape to `OUTPUT_PATH`. JSON only, no markdown fence, no prose.
-`compliance_markers` holds literal-string counts of `RETRY-BUDGET:` and `FETCH-PIVOT:` occurrences in assistant text (0 when absent — most sessions).
+`compliance_markers` holds counts of `RETRY-BUDGET:`, `FETCH-PIVOT:`, `DELEGATED:`,
+and `DIRECT-OK:` marker lines in assistant text (0 when absent — most sessions).
+Counting rule (all four markers, same rule): count only lines that BEGIN with the
+marker string, in the top-level session's assistant text. Do NOT count markers that
+appear inside quoted or fenced blocks, markers quoted from rule files, or markers
+inside subagent transcripts — a main-loop message quoting a returned report does not
+count. (This line-start rule replaced substring counting for RETRY-BUDGET/FETCH-PIVOT
+on 2026-07-20; historical comparisons may shift once.)
 
 ```json
 {
@@ -74,7 +81,7 @@ Write EXACTLY this shape to `OUTPUT_PATH`. JSON only, no markdown fence, no pros
   "skills_invoked": ["schedule", "python-env-management"],
   "models_used": ["claude-opus-4-7"],
   "notable_initiatives": ["one-line summary of the main thing the user worked on"],
-  "compliance_markers": {"RETRY-BUDGET": 0, "FETCH-PIVOT": 0},
+  "compliance_markers": {"RETRY-BUDGET": 0, "FETCH-PIVOT": 0, "DELEGATED": 0, "DIRECT-OK": 0},
   "underlying_goal": "one line of user intent, or null if it duplicates notable_initiatives",
   "outcome": "fully_achieved|mostly_achieved|partially_achieved|not_achieved|unclear_from_transcript",
   "satisfaction_signals": {"happy": 0, "satisfied": 0, "dissatisfied": 0, "frustrated": 0},
