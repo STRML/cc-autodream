@@ -30,6 +30,9 @@
 #   AUTODREAM_L2_MODEL   override the L2 aggregator model            default: fable-5 until 2026-06-20, claude-opus-4-7 from 2026-06-21
 #   AUTODREAM_MIN_USER_TURNS  noise-gate floor on user_message_count  default: 2
 #   AUTODREAM_MIN_MINUTES     noise-gate floor on duration_minutes    default: 1
+#   AUTODREAM_OVERLAP_BIN     override the resolved overlap-stats.sh path, authoritative
+#                             (no existability fallback — lets tests force the "not
+#                             measured" paths)                        default: unset
 
 set -u
 
@@ -70,8 +73,17 @@ SLIM="$SCRIPT_DIR/slim-transcript.sh"
 STATS="$SCRIPT_DIR/session-stats.sh"
 [ -x "$STATS" ] || STATS="$AUTODREAM_DIR/session-stats.sh"
 # Global cross-session overlap pass (#14; resolved like the other helper scripts).
-OVERLAP="$SCRIPT_DIR/overlap-stats.sh"
-[ -x "$OVERLAP" ] || OVERLAP="$AUTODREAM_DIR/overlap-stats.sh"
+# AUTODREAM_OVERLAP_BIN overrides the resolved path outright (no fallback) so tests can
+# point it at a nonexistent or stubbed binary and exercise compute_overlap_stats' "not
+# measured" paths deterministically — the normal `[ -x ... ] ||` fallback chain would
+# otherwise rescue a nonexistent override back to the working repo copy and defeat the
+# whole point of the override (#26).
+if [ -n "${AUTODREAM_OVERLAP_BIN:-}" ]; then
+  OVERLAP="$AUTODREAM_OVERLAP_BIN"
+else
+  OVERLAP="$SCRIPT_DIR/overlap-stats.sh"
+  [ -x "$OVERLAP" ] || OVERLAP="$AUTODREAM_DIR/overlap-stats.sh"
+fi
 
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
@@ -236,22 +248,38 @@ compute_session_stats() {
 # cross-session computation — it can't be done per-session inside compute_session_stats
 # or dispatch_l1's xargs subshells, which only ever see one session at a time. Sets
 # OVERLAP_EVENTS / SESSIONS_WITH_OVERLAP (default "0"/"0" on any failure/absence so the
-# run-stats.txt writer always has a value, never aborts the pipeline).
+# run-stats.txt writer always has a value, never aborts the pipeline) AND OVERLAP_MEASURED,
+# a tri-state marker (#26) so a genuine zero-overlap night can't be confused with a
+# non-measurement:
+#   1 = a real measurement happened (overlap-stats.sh ran and produced parseable output,
+#       even if the answer is 0 pairs / 0 sessions — that is a legitimate result)
+#   0 = no measurement happened: the script was missing/not executable, produced no
+#       output, or produced output jq couldn't extract both fields from. Each of these
+#       gets its own explicit "not measured" log line so a non-measurement is never
+#       silently reported as the same "overlap: 0 pair(s)" line as a real zero.
 compute_overlap_stats() {
   OVERLAP_EVENTS=0
   SESSIONS_WITH_OVERLAP=0
+  OVERLAP_MEASURED=0
   if [ ! -x "$OVERLAP" ]; then
-    log "overlap-stats.sh not found/executable; skipping overlap computation (0/0)"
+    log "overlap not measured: overlap-stats.sh not found/executable (counts left at 0/0)"
     return 0
   fi
   local json events involved
   json=$("$OVERLAP" "$FINDINGS_DIR" 2>>"$RUN_LOG")
-  if [ -n "$json" ]; then
-    events=$(printf '%s' "$json" | jq -r '.overlap_events // 0' 2>/dev/null)
-    involved=$(printf '%s' "$json" | jq -r '.sessions_with_overlap // 0' 2>/dev/null)
-    [ -n "$events" ] && OVERLAP_EVENTS="$events"
-    [ -n "$involved" ] && SESSIONS_WITH_OVERLAP="$involved"
+  if [ -z "$json" ]; then
+    log "overlap not measured: overlap-stats.sh produced no output (counts left at 0/0)"
+    return 0
   fi
+  events=$(printf '%s' "$json" | jq -r '.overlap_events // empty' 2>/dev/null)
+  involved=$(printf '%s' "$json" | jq -r '.sessions_with_overlap // empty' 2>/dev/null)
+  if [ -z "$events" ] || [ -z "$involved" ]; then
+    log "overlap not measured: overlap-stats.sh output was unparseable (counts left at 0/0)"
+    return 0
+  fi
+  OVERLAP_EVENTS="$events"
+  SESSIONS_WITH_OVERLAP="$involved"
+  OVERLAP_MEASURED=1
   log "overlap: $OVERLAP_EVENTS pair(s), $SESSIONS_WITH_OVERLAP session(s) involved"
 }
 
@@ -633,6 +661,10 @@ PY
     printf 'l1_sessions_freshly_processed: %s\n' "$L1_FRESHLY_PROCESSED"
     printf 'l1_elapsed_seconds: %s\n' "$L1_ELAPSED"
     # Global cross-session overlap stat (#14) — see compute_overlap_stats above.
+    # overlap_measured (#26) disambiguates a genuine zero-overlap night from the
+    # script not running/producing usable output; the two count keys are always
+    # emitted (0 when unmeasured) so existing consumers never hit a missing key.
+    printf 'overlap_measured: %s\n' "$([ "$OVERLAP_MEASURED" = "1" ] && echo yes || echo no)"
     printf 'overlap_events: %s\n' "$OVERLAP_EVENTS"
     printf 'sessions_with_overlap: %s\n' "$SESSIONS_WITH_OVERLAP"
   } > "$FINDINGS_DIR/run-stats.txt"

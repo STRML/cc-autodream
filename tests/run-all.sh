@@ -608,6 +608,7 @@ test_overlap_pair(){
   mk_timed_session "$root" sessB "2026-07-20T10:05:00Z" "2026-07-20T10:25:00Z"
   run_dream "$root"
   local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'overlap_measured: yes'     "a real overlap measurement happened"
   assert_grep "$stats" 'overlap_events: 1'         "exactly one distinct pair counted"
   assert_grep "$stats" 'sessions_with_overlap: 2'  "both sessions counted as involved"
   rm -rf "$root"
@@ -622,6 +623,7 @@ test_overlap_triple(){
   mk_timed_session "$root" sessC "2026-07-20T10:20:00Z"
   run_dream "$root"
   local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'overlap_measured: yes'     "a real overlap measurement happened"
   assert_grep "$stats" 'overlap_events: 3'         "all three pairs counted"
   assert_grep "$stats" 'sessions_with_overlap: 3'  "all three sessions counted as involved"
   rm -rf "$root"
@@ -634,8 +636,57 @@ test_overlap_none(){
   mk_timed_session "$root" sessB "2026-07-20T11:00:00Z"
   run_dream "$root"
   local stats="$(fdir "$root")/run-stats.txt"
+  # This is the genuine-zero case (#26): the pass DID run, it just found nothing to
+  # pair. overlap_measured must positively say so — that's the whole point of the fix,
+  # distinguishing this from a pass that never ran.
+  assert_grep "$stats" 'overlap_measured: yes'     "genuine zero overlap is still a real measurement"
   assert_grep "$stats" 'overlap_events: 0'         "no pairs when sessions are far apart"
   assert_grep "$stats" 'sessions_with_overlap: 0'  "no sessions involved when sessions are far apart"
+  rm -rf "$root"
+}
+
+test_overlap_not_measured_missing_bin(){
+  echo "# overlap (#26): AUTODREAM_OVERLAP_BIN pointed at a nonexistent path -> not measured, counts still 0"
+  local root; root=$(setup_env)
+  mk_timed_session "$root" sessA "2026-07-20T10:00:00Z"
+  mk_timed_session "$root" sessB "2026-07-20T10:05:00Z"
+  export AUTODREAM_OVERLAP_BIN="$root/does-not-exist.sh"; run_dream "$root"; unset AUTODREAM_OVERLAP_BIN
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'overlap_measured: no'      "missing overlap-stats.sh binary is not a measurement"
+  assert_grep "$stats" 'overlap_events: 0'          "count key still present at 0"
+  assert_grep "$stats" 'sessions_with_overlap: 0'   "count key still present at 0"
+  rm -rf "$root"
+}
+
+test_overlap_not_measured_empty_output(){
+  echo "# overlap (#26): overlap-stats.sh stub that prints nothing -> not measured"
+  local root; root=$(setup_env)
+  mk_timed_session "$root" sessA "2026-07-20T10:00:00Z"
+  mk_timed_session "$root" sessB "2026-07-20T10:05:00Z"
+  local stub="$root/overlap-empty.sh"
+  printf '#!/bin/bash\nexit 0\n' > "$stub"
+  chmod +x "$stub"
+  export AUTODREAM_OVERLAP_BIN="$stub"; run_dream "$root"; unset AUTODREAM_OVERLAP_BIN
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'overlap_measured: no'      "empty overlap-stats.sh output is not a measurement"
+  assert_grep "$stats" 'overlap_events: 0'          "count key still present at 0"
+  assert_grep "$stats" 'sessions_with_overlap: 0'   "count key still present at 0"
+  rm -rf "$root"
+}
+
+test_overlap_not_measured_malformed_output(){
+  echo "# overlap (#26): overlap-stats.sh stub that prints non-JSON -> not measured"
+  local root; root=$(setup_env)
+  mk_timed_session "$root" sessA "2026-07-20T10:00:00Z"
+  mk_timed_session "$root" sessB "2026-07-20T10:05:00Z"
+  local stub="$root/overlap-malformed.sh"
+  printf '#!/bin/bash\necho "not json at all"\n' > "$stub"
+  chmod +x "$stub"
+  export AUTODREAM_OVERLAP_BIN="$stub"; run_dream "$root"; unset AUTODREAM_OVERLAP_BIN
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'overlap_measured: no'      "malformed overlap-stats.sh output is not a measurement"
+  assert_grep "$stats" 'overlap_events: 0'          "count key still present at 0"
+  assert_grep "$stats" 'sessions_with_overlap: 0'   "count key still present at 0"
   rm -rf "$root"
 }
 
@@ -678,6 +729,9 @@ test_oversized_gate_errored
 test_overlap_pair
 test_overlap_triple
 test_overlap_none
+test_overlap_not_measured_missing_bin
+test_overlap_not_measured_empty_output
+test_overlap_not_measured_malformed_output
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"
