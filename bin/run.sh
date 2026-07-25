@@ -30,6 +30,9 @@
 #   AUTODREAM_L2_MODEL   override the L2 aggregator model            default: fable-5 until 2026-06-20, claude-opus-4-7 from 2026-06-21
 #   AUTODREAM_MIN_USER_TURNS  noise-gate floor on user_message_count  default: 2
 #   AUTODREAM_MIN_MINUTES     noise-gate floor on duration_minutes    default: 1
+#   AUTODREAM_STATS_BIN       override the resolved session-stats.sh path, authoritative
+#                             (no existability fallback — lets tests force missing or
+#                             malformed stats sidecars)                default: unset
 #   AUTODREAM_OVERLAP_BIN     override the resolved overlap-stats.sh path, authoritative
 #                             (no existability fallback — lets tests force the "not
 #                             measured" paths)                        default: unset
@@ -70,8 +73,16 @@ PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
 SLIM="$SCRIPT_DIR/slim-transcript.sh"
 [ -x "$SLIM" ] || SLIM="$AUTODREAM_DIR/slim-transcript.sh"
 # Deterministic session-stat pre-pass (resolved like the other helper scripts).
-STATS="$SCRIPT_DIR/session-stats.sh"
-[ -x "$STATS" ] || STATS="$AUTODREAM_DIR/session-stats.sh"
+# AUTODREAM_STATS_BIN overrides the resolved path outright, with no existability
+# fallback, for the same reason AUTODREAM_OVERLAP_BIN does below (#26): tests need to
+# force a missing or deliberately broken sidecar generator, and the `[ -x ... ] ||`
+# chain would rescue a nonexistent override back to the working repo copy (#27).
+if [ -n "${AUTODREAM_STATS_BIN:-}" ]; then
+  STATS="$AUTODREAM_STATS_BIN"
+else
+  STATS="$SCRIPT_DIR/session-stats.sh"
+  [ -x "$STATS" ] || STATS="$AUTODREAM_DIR/session-stats.sh"
+fi
 # Global cross-session overlap pass (#14; resolved like the other helper scripts).
 # AUTODREAM_OVERLAP_BIN overrides the resolved path outright (no fallback) so tests can
 # point it at a nonexistent or stubbed binary and exercise compute_overlap_stats' "not
@@ -560,22 +571,54 @@ EOF
   # post-hoc pattern as GATED/L1_ERRORED above: the per-worker sz variable at dispatch
   # time (line ~309) lives in an xargs subshell with no shared state to increment
   # directly, so this re-derives it from the sidecar written before dispatch instead.
+  #
+  # Iterate the SESSION LIST, not the *.stats.json glob (#27). A sidecar that was never
+  # written — compute_session_stats deletes the file whenever session-stats.sh fails —
+  # is absent from the glob entirely, so the session it belonged to used to drop out of
+  # oversized_total without appearing anywhere. Walking the worklist means every triaged
+  # session is accounted for exactly once, whatever state its sidecar is in, and stale
+  # sidecars left by an earlier enumeration no longer sneak into the count.
+  #
+  # STATS_SIDECARS_UNPARSEABLE is the shared health signal for every sidecar consumer
+  # (#27). One broken sidecar corrupts several counters at once — the noise gate reads
+  # the same file inside dispatch_l1 — so the failures are counted once here rather than
+  # each stat carrying its own measured/not-measured flag. A sidecar counts as
+  # unparseable when it is missing, empty, not valid JSON, or carries no numeric
+  # transcript_bytes. The noise gate's own read is deliberately left alone: it already
+  # biases to triage on an unreadable sidecar (worst case, a wasted model call), and the
+  # only thing missing there was the signal, which this counter now supplies.
   OVERSIZED_TOTAL=0
   OVERSIZED_ERRORED=0
-  for statsfile in "$FINDINGS_DIR"/*.stats.json; do
-    [ -e "$statsfile" ] || continue
-    sz=$(jq -r '.transcript_bytes // 0' "$statsfile" 2>/dev/null)
-    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+  STATS_SIDECARS_UNPARSEABLE=0
+  while IFS= read -r session; do
+    [ -n "$session" ] || continue
+    hash=$(printf "%s" "$session" | shasum -a 1 | cut -c1-12)
+    statsfile="$FINDINGS_DIR/$hash.stats.json"
+    sz=""
+    [ -s "$statsfile" ] && sz=$(jq -r '.transcript_bytes | numbers | floor' "$statsfile" 2>/dev/null)
+    case "$sz" in ''|*[!0-9]*) sz="" ;; esac
+    if [ -z "$sz" ]; then
+      STATS_SIDECARS_UNPARSEABLE=$((STATS_SIDECARS_UNPARSEABLE + 1))
+      # Measure the transcript directly rather than letting the session fall out of the
+      # count. transcript_bytes is only ever `wc -c` of this same file (session-stats.sh),
+      # and dispatch_l1 sizes it exactly this way before slimming, so this is the same
+      # quantity from its original source — not an estimate. A clamped 0 here would bias
+      # the #12 gate toward staying closed, which is the whole point of the issue.
+      sz=$(wc -c < "$session" 2>/dev/null | tr -d ' ')
+      case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    fi
     if [ "$sz" -gt "${AUTODREAM_SLIM_BYTES:-262144}" ]; then
       OVERSIZED_TOTAL=$((OVERSIZED_TOTAL + 1))
-      hash=$(basename "$statsfile" .stats.json)
       findingsfile="$FINDINGS_DIR/$hash.json"
       if [ -f "$findingsfile" ] && grep -q '"error":' "$findingsfile" 2>/dev/null; then
         OVERSIZED_ERRORED=$((OVERSIZED_ERRORED + 1))
       fi
     fi
-  done
+  done < "$SESSIONS_LIST"
   log "oversized: $OVERSIZED_TOTAL session(s) over ${AUTODREAM_SLIM_BYTES:-262144} bytes ($OVERSIZED_ERRORED errored)"
+  if [ "$STATS_SIDECARS_UNPARSEABLE" -gt 0 ]; then
+    log "stats sidecars unparseable: $STATS_SIDECARS_UNPARSEABLE of $COUNT (sizes fell back to a live read; gated/oversized counts are degraded)"
+  fi
 
   # ---- Normalize the project field deterministically from the session path ----
   # SESSION_TRIAGE.md asks the L1 worker to emit "project" by hand, and haiku does it
@@ -653,6 +696,13 @@ PY
     # for the gate meaning (M/N >= 5% over a trailing week opens issue #12).
     printf 'oversized_total: %s\n' "$OVERSIZED_TOTAL"
     printf 'oversized_errored: %s\n' "$OVERSIZED_ERRORED"
+    # Sidecar health (#27): how many of sessions_triaged had a stats sidecar that was
+    # missing, empty, or carried no numeric transcript_bytes. Every consumer of the
+    # sidecars degrades when this is non-zero — `gated` under-counts (an unreadable
+    # sidecar never gates, by design) and the oversized sizes came from a live read
+    # rather than the sidecar — so it caveats those two keys rather than duplicating
+    # a flag onto each of them.
+    printf 'stats_sidecars_unparseable: %s\n' "$STATS_SIDECARS_UNPARSEABLE"
     printf 'l1_missing_after_retries: %s\n' "$MISSING"
     printf 'l1_err_files: %s\n' "$L1_FAIL"
     # Cached vs. fresh: lets the aggregator distinguish a sub-second "elapsed"
