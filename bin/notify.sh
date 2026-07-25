@@ -49,10 +49,43 @@ QUESTIONS=$(awk '
   capture { print }
 ' "$REPORT")
 QUESTIONS=$(printf "%s" "$QUESTIONS" | awk 'NF{p=1} p')
-# Count question items: L2 may format them as a numbered list ("1.") or as dash
-# bullets grouped under bold subheadings ("- ..."). Match both, or notify silently
-# no-ops on a report that is actually full of questions.
-COUNT=$(printf "%s\n" "$QUESTIONS" | grep -cE '^[[:space:]]*([0-9]+\.|[-*])[[:space:]]' || true)
+# How many questions the report is actually ASKING. PROMPT.md requires L2 to close the
+# Open questions section with `<!-- autodream:open-questions=N -->`, where N is the count
+# that survived its triviality gate — the same marker review.sh reads to decide whether
+# the morning triage session is worth opening. That marker is authoritative because it is
+# the only source that knows which candidates L2 considered and dropped; everything else
+# is counting list markers and hoping they line up with questions.
+#
+# They don't. Measured against the 14 reports on disk when this was written, the old
+# single-pass grep disagreed with the marker on 4 of the 9 reports that carry one. The
+# 2026-07-24 report is the clearest: 1 real question, counted as 6, because the "Other
+# findings dropped by the gate" bullets below it each scored. A banner claiming six
+# questions over one is how you teach someone to stop reading banners.
+#
+# Reports written before the marker contract have none, so they fall back to a tiered
+# heuristic — take the FIRST format tier that matches, since L2 has emitted this section
+# as a numbered list, as bullets under bold subheadings, as plain bullets, and as bare
+# prose, and counting every tier at once double-counts the sub-bullets under an item.
+# A "None ..." lead-in is the shape review.sh already recognises as zero and must stay
+# silent; without that case the prose tier turns every quiet night into a false pop.
+MARKER=$(sed -n 's/.*<!-- *autodream:open-questions=\([0-9][0-9]*\) *-->.*/\1/p' "$REPORT" | head -1)
+count_matching(){ printf "%s\n" "$QUESTIONS" | grep -cE "$1" || true; }
+if [ -n "$MARKER" ]; then
+  COUNT="$MARKER"
+elif [ -z "$QUESTIONS" ]; then
+  COUNT=0
+else
+  first=$(printf '%s\n' "$QUESTIONS" | grep -v '^[[:space:]]*$' | head -1 | tr '[:upper:]' '[:lower:]')
+  case "$first" in
+    none*) COUNT=0 ;;
+    *)
+      COUNT=$(count_matching '^[[:space:]]*[0-9]+\.[[:space:]]')                # numbered items
+      [ "$COUNT" -eq 0 ] && COUNT=$(count_matching '^\*\*.+\*\*')               # bold titles
+      [ "$COUNT" -eq 0 ] && COUNT=$(count_matching '^[[:space:]]*[-*][[:space:]]')  # bullets
+      [ "$COUNT" -eq 0 ] && COUNT=1                                             # bare prose
+      ;;
+  esac
+fi
 
 if [ -z "$QUESTIONS" ] || [ "$COUNT" -eq 0 ]; then
   echo "notify.sh: $DATE has 0 open questions; nothing to pop"
