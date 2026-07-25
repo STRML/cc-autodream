@@ -882,6 +882,67 @@ EOF
   rm -rf "$root"
 }
 
+test_notify_open_command(){
+  echo "# notify.sh opens the inbox via AUTODREAM_OPEN (multi-word commands, deprecated SUBL alias)"
+  local NOTIFY="$REPO/bin/notify.sh"
+  [ -x "$NOTIFY" ] || { no "notify.sh executable"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$root/cc-autodream.app/Contents/MacOS"
+  printf '#!/bin/sh\nexit 0\n' > "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
+  chmod +x "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
+  # A recorder standing in for an editor: logs every argument it was handed, one per
+  # line, so the test can prove word-splitting and quoting rather than just exit status.
+  printf '#!/bin/sh\nfor a in "$@"; do echo "$a"; done >> "%s/opened.log"\n' "$root" > "$root/fake-editor"
+  chmod +x "$root/fake-editor"
+
+  printf '# Autodream — 2020-03-01\n\n## Open questions for the user\n1. A question?\n\n<!-- autodream:open-questions=1 -->\n' \
+    > "$root/2020-03-01.md"
+
+  # single-word command
+  AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 AUTODREAM_OPEN="$root/fake-editor" \
+    "$NOTIFY" "$root/2020-03-01.md" > "$root/notify.out" 2>&1
+  assert_grep "$root/opened.log" "2020-03-01-open-questions.md" "AUTODREAM_OPEN received the inbox path"
+  assert_grep "$root/notify.out" 'opened .* with:' "log names the command it opened with"
+
+  # multi-word command: the flag and the path must arrive as separate arguments
+  : > "$root/opened.log"
+  AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 AUTODREAM_OPEN="$root/fake-editor --flag" \
+    "$NOTIFY" "$root/2020-03-01.md" > "$root/notify.out" 2>&1
+  assert_grep "$root/opened.log" '^--flag$'    "multi-word command word-splits into its own argument"
+  assert_eq "$(wc -l < "$root/opened.log" | tr -d ' ')" "2" "exactly two arguments: the flag and the path"
+
+  # a path with a space must stay ONE argument, not split by sh -c
+  : > "$root/opened.log"
+  mkdir -p "$root/dir with space"
+  printf '# Autodream — 2020-03-02\n\n## Open questions for the user\n1. A question?\n\n<!-- autodream:open-questions=1 -->\n' \
+    > "$root/dir with space/2020-03-02.md"
+  AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 AUTODREAM_OPEN="$root/fake-editor" \
+    "$NOTIFY" "$root/dir with space/2020-03-02.md" > "$root/notify.out" 2>&1
+  assert_eq "$(wc -l < "$root/opened.log" | tr -d ' ')" "1" "a spaced path arrives as a single argument"
+
+  # SUBL still honored as the deprecated alias, so existing setups keep working
+  : > "$root/opened.log"
+  AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 SUBL="$root/fake-editor" \
+    "$NOTIFY" "$root/2020-03-01.md" > "$root/notify.out" 2>&1
+  assert_grep "$root/opened.log" "2020-03-01-open-questions.md" "deprecated SUBL alias still opens the file"
+
+  # AUTODREAM_OPEN wins when both are set
+  : > "$root/opened.log"
+  AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 \
+    AUTODREAM_OPEN="$root/fake-editor --winner" SUBL=/usr/bin/false \
+    "$NOTIFY" "$root/2020-03-01.md" > "$root/notify.out" 2>&1
+  assert_grep "$root/opened.log" '^--winner$' "AUTODREAM_OPEN takes precedence over SUBL"
+
+  # a broken open command must not fail the run — the inbox file is the durable output
+  AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 AUTODREAM_OPEN="$root/does-not-exist" \
+    "$NOTIFY" "$root/2020-03-01.md" > "$root/notify.out" 2>&1
+  assert_eq "$?" "0" "a failing open command still exits 0"
+  assert_grep "$root/notify.out" 'failed to open' "and says so instead of pretending it opened"
+  assert_file "$root/inbox/2020-03-01-open-questions.md" "inbox file written regardless"
+
+  rm -rf "$root"
+}
+
 test_overlap_pair(){
   echo "# overlap (#14): two alternating-close sessions count as ONE pair regardless of qualifying turn-pairs"
   local root; root=$(setup_env)
@@ -1022,6 +1083,7 @@ test_oversized_gate_script_open
 test_oversized_gate_script_empty
 test_oversized_gate_script_args
 test_notify_count
+test_notify_open_command
 test_overlap_pair
 test_overlap_triple
 test_overlap_none

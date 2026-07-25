@@ -1,18 +1,21 @@
 #!/bin/bash
 # Write the "Open questions" section of an autodream report to a text file, post a
-# persistent macOS notification, and pop it open in Sublime Text. Quiet no-op if there
-# are no questions.
+# persistent macOS notification, and pop it open in the user's editor. Quiet no-op if
+# there are no questions.
 #
 # The banner is the reliable signal: the nightly run fires ~3am under launchd, when a
-# GUI window open (subl) silently fails to surface. `display notification` posts to
+# GUI window open silently fails to surface. `display notification` posts to
 # Notification Center, which persists until dismissed, so the alert is waiting whenever
-# the Mac is next used. The subl open stays as a best-effort convenience on top.
+# the Mac is next used. The direct open stays as a best-effort convenience on top.
 #
 # Usage: notify.sh <report.md>
 #
 # Environment overrides:
-#   AUTODREAM_DIR  scripts + state           default: $HOME/.claude/autodream
-#   SUBL           path to subl binary       default: tries $HOME/bin/subl then PATH
+#   AUTODREAM_DIR   scripts + state           default: $HOME/.claude/autodream
+#   AUTODREAM_OPEN  command that opens the inbox file. Run through `sh -c`, so flags
+#                   work: "subl", "code -g", "open -a Obsidian".
+#                   default: open (macOS hands the file to the default .md app)
+#   SUBL            deprecated alias for AUTODREAM_OPEN, honored for existing setups
 
 set -u
 
@@ -20,8 +23,13 @@ REPORT="${1:?Usage: notify.sh <report.md>}"
 DATE=$(basename "$REPORT" .md)
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 INBOX_DIR="$AUTODREAM_DIR/inbox"
-SUBL="${SUBL:-$HOME/bin/subl}"
-[ -x "$SUBL" ] || SUBL=$(command -v subl || echo /Applications/Sublime\ Text.app/Contents/SharedSupport/bin/subl)
+# How the inbox file gets opened. This is a shell snippet, not a binary path, so an
+# editor that needs flags ("code -g") works without a wrapper. The default is plain
+# `open`, which hands the file to whatever the user's Mac already opens .md with —
+# the tool ships with a LICENSE and an install script, so the out-of-the-box path
+# cannot assume one particular editor is installed. SUBL stays honored as a
+# deprecated alias so setups that predate this keep working untouched.
+OPEN_CMD="${AUTODREAM_OPEN:-${SUBL:-open}}"
 
 # Resolve the notifier. Prefer our rebranded bundle so banners read "cc-autodream"
 # instead of "terminal-notifier"; bootstrap it once via make-notifier.sh if it's
@@ -131,7 +139,7 @@ if [ -n "$NOTIFIER" ]; then
   "$NOTIFIER" \
     -title "Autodream — $DATE" \
     -message "$COUNT open question$plural — click to open" \
-    -execute "open -a 'Sublime Text' '$OUT'" \
+    -execute "$OPEN_CMD '$OUT'" \
     -group "autodream-$DATE" \
     -sound Glass >/dev/null 2>&1 \
     && { echo "notify.sh: posted clickable notification for $DATE ($COUNT open question$plural)"; posted=1; } \
@@ -148,9 +156,10 @@ fi
 
 [ "$posted" -eq 1 ] || echo "notify.sh: WARNING no banner posted for $DATE (inbox written to $OUT)"
 
-if [ -x "$SUBL" ]; then
-  "$SUBL" "$OUT"
-  echo "notify.sh: opened $OUT in Sublime"
+# sh -c word-splits a multi-word command ("open -a Obsidian") while $OUT is passed as
+# a positional and stays a single argument no matter what is in the path.
+if sh -c "$OPEN_CMD \"\$1\"" _ "$OUT" 2>/dev/null; then
+  echo "notify.sh: opened $OUT with: $OPEN_CMD"
 else
-  echo "notify.sh: subl not found; wrote $OUT but did not open"
+  echo "notify.sh: '$OPEN_CMD' failed to open $OUT (file still written)"
 fi
