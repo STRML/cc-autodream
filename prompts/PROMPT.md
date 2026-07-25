@@ -19,7 +19,11 @@ All other inputs you need (treat `<findings-dir>` below as the literal path from
 - **Per-session stderr**: `<findings-dir>/*.json.err` if a triage call failed — note in your report.
 - **Installed skills**: walk `~/.claude/skills/`, `~/.claude/plugins/*/skills/`, and project `.claude/skills/`. Each has frontmatter `description`/triggers. Use this to validate `missed_skill` findings (skill exists? trigger matches?).
 - **Memory files**: `~/.claude/projects/*/memory/MEMORY.md` (one per project — may not exist).
-- **Global rules**: `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`.
+- **Global rules**: `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`, and the lazy-loaded
+  playbooks in `~/.claude/docs/guardrails/*.md` (dev-workflow, advisor-mode,
+  failure-discipline, pr-workflow, claude-code-lore). The guardrails moved out of `rules/`
+  on 2026-07-24 and are no longer auto-loaded into sessions, so read them explicitly — a
+  `rules/*.md` glob alone now matches only `global-memory.md`.
 - **Operator notes**: `~/.claude/autodream/notes.md`, if present — free-text notes the user (or an agent) left for you between runs, e.g. "evaluate how often /graphify is used". Each line is dated with an optional `(expires DATE)`. Address the active ones in the **Operator notes** report section; ignore ones whose expiry has passed.
 - **Installed hooks**: `~/.claude/hooks/*.sh` and the `hooks` block of `~/.claude/settings.json`. These are the primary target of "tighten/add a hook" proposals — read the specific hook (including its comments) before proposing a change to it. The reasoning for why a hook behaves as it does usually lives in its header comment, not in git history.
 - **Run self-audit stats**: `<findings-dir>/run-stats.txt`, if present — runtime telemetry the runner captured about *this autodream run itself* (sessions found vs. self-excluded vs. triaged, L1 retry rounds, workers still missing, `.err` count, elapsed). Drives the "Autodream self-audit" report section below.
@@ -131,7 +135,7 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 
 ### 3. Anything you may NOT edit
 
-- `~/.claude/CLAUDE.md` or `~/.claude/rules/*.md` — propose in report, human applies
+- `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`, or `~/.claude/docs/guardrails/*.md` — propose in report, human applies
 - Any project source code outside `.claude/` dirs
 - Existing skills — propose changes, don't edit
 - Other users' files
@@ -139,7 +143,7 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 ## How to start
 
 1. Read the findings directory's `*.json` files (use Glob then Read).
-2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Exclude `*.stats.json` sidecars from the findings aggregate. Also sum each session's `compliance_markers` counts (`RETRY-BUDGET`, `FETCH-PIVOT`, `DELEGATED`, `DIRECT-OK`) when present — a finding missing the newer keys defaults them to 0 (older findings predate them). RETRY-BUDGET/FETCH-PIVOT measure the retry-budget rules working as designed. (One-time discontinuity: these two switched from substring to line-start counting on 2026-07-20, so totals compared across that date may shift once — don't flag that shift as drift.) DELEGATED/DIRECT-OK measure advisor-mode delegation compliance (`~/.claude/rules/advisor-mode.md`): report the day's totals and flag drift (a sustained fall in DELEGATED across heavy sessions suggests the rule is eroding). Note: `DELEGATED` counts dispatches, not workers — a swarm is ONE marker; per-child health lives in manager reports and is out of marker-telemetry scope. When reporting a `tool_loop` pattern, split marker-present sessions (rule fired — healthy) from marker-absent ones (the actual non-compliance) and state both counts. Also collect the facet fields when present: `outcome` and `satisfaction_signals` for the Activity-snapshot outcomes line, `underlying_goal` for Per-project notes, and the `instructions_given` lists for the cross-session repetition check (see Memory updates).
+2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Exclude `*.stats.json` sidecars from the findings aggregate. Also sum each session's `compliance_markers` counts (`RETRY-BUDGET`, `FETCH-PIVOT`, `DELEGATED`, `DIRECT-OK`) when present — a finding missing the newer keys defaults them to 0 (older findings predate them). RETRY-BUDGET/FETCH-PIVOT measure the retry-budget rules working as designed. (One-time discontinuity: these two switched from substring to line-start counting on 2026-07-20, so totals compared across that date may shift once — don't flag that shift as drift.) DELEGATED/DIRECT-OK measure advisor-mode delegation compliance (`~/.claude/docs/guardrails/advisor-mode.md`; it lived at `~/.claude/rules/advisor-mode.md` and was auto-loaded until 2026-07-24, so a drop in DELEGATED right after that date may reflect the move to lazy loading rather than rule erosion): report the day's totals and flag drift (a sustained fall in DELEGATED across heavy sessions suggests the rule is eroding). Note: `DELEGATED` counts dispatches, not workers — a swarm is ONE marker; per-child health lives in manager reports and is out of marker-telemetry scope. When reporting a `tool_loop` pattern, split marker-present sessions (rule fired — healthy) from marker-absent ones (the actual non-compliance) and state both counts. Also collect the facet fields when present: `outcome` and `satisfaction_signals` for the Activity-snapshot outcomes line, `underlying_goal` for Per-project notes, and the `instructions_given` lists for the cross-session repetition check (see Memory updates).
 3. Walk installed skills (Glob `~/.claude/skills/*/SKILL.md` etc., Read frontmatter).
 4. Read `<findings-dir>/changelog-window.md` (Upstream changes) and `<findings-dir>/run-stats.txt` (Autodream self-audit) if present.
 5. Write the report to the literal report path from line 2.
