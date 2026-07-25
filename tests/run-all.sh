@@ -668,6 +668,103 @@ test_stats_sidecar_non_numeric_counted(){
   rm -rf "$root"
 }
 
+test_runner_provenance(){
+  echo "# runner provenance (#29): run-stats.txt records which code produced it"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  # The suite runs run.sh from the repo checkout, so HEAD resolves and the stamp must be
+  # the real short SHA rather than the "unknown" degradation path.
+  local head; head=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
+  assert_grep "$stats" "runner_commit: $head" "stamps the commit the runner was checked out at"
+  assert_grep "$stats" 'runner_dirty: \(yes\|no\)' "records whether the tree had uncommitted changes"
+  assert_grep "$root/run.out" "runner: $head" "run log names the runner up front"
+  rm -rf "$root"
+}
+
+test_runner_provenance_no_git(){
+  echo "# runner provenance (#29): a non-git install degrades to unknown, never fails the run"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # Copy the scripts out of the repo so SCRIPT_DIR resolves somewhere with no git
+  # history at all — the tarball-install case, which must still produce a report.
+  local bin="$root/bin"; mkdir -p "$bin"
+  cp "$REPO"/bin/*.sh "$bin/"
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
+  PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+  bash "$bin/run.sh" "$DATE" > "$root/run.out" 2>&1
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'runner_commit: unknown' "no git history degrades to unknown"
+  assert_grep "$stats" 'runner_dirty: no'       "dirty is not claimed when the commit is unknown"
+  assert_file "$root/dreams/$DATE.md"           "the run still produced a report"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script(){
+  echo "# oversized-gate.sh (#29): recomputes the #12 window from artifacts, including dates whose run-stats.txt lacks the keys"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES
+  local fd; fd=$(fdir "$root")
+  # Strip the keys to simulate a pre-#25 runner: the script must still recover the
+  # numbers from the sidecars, which is the whole point of it existing.
+  grep -v '^oversized_' "$fd/run-stats.txt" > "$fd/run-stats.tmp" && mv "$fd/run-stats.tmp" "$fd/run-stats.txt"
+  assert_nogrep "$fd/run-stats.txt" 'oversized_total' "precondition: the keys really are gone"
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$fd" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_grep "$root/gate.out" 'GATE CLOSED'  "a clean window reports the gate closed"
+  assert_grep "$root/gate.out" '1 oversized'  "recovered the oversized count without run-stats.txt"
+  assert_grep "$root/gate.out" 'rule of three' "quotes the upper bound rather than implying 0% is certain"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script_open(){
+  echo "# oversized-gate.sh (#29): an errored oversized session pushes the window over the threshold"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export AUTODREAM_SLIM_BYTES=100 MOCK_MODE=l1_incomplete AUTODREAM_L1_ROUNDS=1
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES MOCK_MODE AUTODREAM_L1_ROUNDS
+  local out; out=$(AUTODREAM_SLIM_BYTES=100 bash "$GATE" "$(fdir "$root")" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_grep "$root/gate.out" 'GATE OPEN'    "1 of 1 errored is 100%, well over the 5% threshold"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script_empty(){
+  echo "# oversized-gate.sh (#29): an empty window is not reported as a measured 0%"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  run_dream "$root"
+  local out; out=$(bash "$GATE" "$(fdir "$root")" 2>&1)
+  printf '%s' "$out" > "$root/gate.out"
+  assert_grep  "$root/gate.out" 'nothing to measure' "no oversized sessions is not evidence either way"
+  assert_nogrep "$root/gate.out" 'GATE CLOSED'       "and must not be reported as a closed gate"
+  rm -rf "$root"
+}
+
+test_oversized_gate_script_args(){
+  echo "# oversized-gate.sh (#29): argument validation, including the --days spin found in review"
+  local GATE="$REPO/bin/oversized-gate.sh"
+  [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
+  # `--days` with no value left $# at 1 while `shift 2` refused to shift, looping forever.
+  # A hang in a nightly-adjacent script is worse than a wrong number, so it gets a test.
+  local out rc
+  out=$( { timeout 10 bash "$GATE" --days; } 2>&1 ); rc=$?
+  assert_eq "$rc" "2" "--days with no value exits 2 instead of hanging (124 would be the hang)"
+  out=$( { timeout 10 bash "$GATE" --days abc; } 2>&1 ); rc=$?
+  assert_eq "$rc" "2" "--days with a non-integer exits 2"
+  out=$( { timeout 10 bash "$GATE" --days 0; } 2>&1 ); rc=$?
+  assert_eq "$rc" "2" "--days 0 exits 2"
+  out=$( { timeout 10 bash "$GATE" --bogus; } 2>&1 ); rc=$?
+  assert_eq "$rc" "2" "an unknown option exits 2 rather than being read as a findings dir"
+}
+
 test_overlap_pair(){
   echo "# overlap (#14): two alternating-close sessions count as ONE pair regardless of qualifying turn-pairs"
   local root; root=$(setup_env)
@@ -801,6 +898,12 @@ test_stats_sidecar_missing_counted
 test_stats_sidecar_missing_keeps_oversized_count
 test_stats_sidecar_malformed_counted
 test_stats_sidecar_non_numeric_counted
+test_runner_provenance
+test_runner_provenance_no_git
+test_oversized_gate_script
+test_oversized_gate_script_open
+test_oversized_gate_script_empty
+test_oversized_gate_script_args
 test_overlap_pair
 test_overlap_triple
 test_overlap_none

@@ -96,6 +96,21 @@ else
   [ -x "$OVERLAP" ] || OVERLAP="$AUTODREAM_DIR/overlap-stats.sh"
 fi
 
+# Provenance of the code actually executing (#29), stamped into run-stats.txt below.
+# Resolved against SCRIPT_DIR (which follows the ~/.claude/autodream symlink back into
+# the working tree) rather than $PWD, since launchd starts the job from an unrelated cwd.
+# Everything degrades to "unknown"/"no": a tarball install with no git, or no git binary
+# at all, is a supported way to run this and must not fail the run.
+RUNNER_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null) || RUNNER_COMMIT=""
+: "${RUNNER_COMMIT:=unknown}"
+if [ "$RUNNER_COMMIT" = "unknown" ]; then
+  RUNNER_DIRTY=no
+elif [ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]; then
+  RUNNER_DIRTY=yes
+else
+  RUNNER_DIRTY=no
+fi
+
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -423,6 +438,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
 
 run() {
   log "===== autodream start: $(date) ====="
+  log "runner: $RUNNER_COMMIT$([ "$RUNNER_DIRTY" = "yes" ] && echo " (dirty)")"
   log "target date: $TARGET_DATE"
   log "findings:    $FINDINGS_DIR"
   log "report:      $REPORT_PATH"
@@ -675,6 +691,17 @@ PY
   [ "$L1_FRESHLY_PROCESSED" -lt 0 ] && L1_FRESHLY_PROCESSED=0
   {
     printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
+    # Which code produced this file (#29). install.sh symlinks ~/.claude/autodream/*.sh
+    # straight at the repo working tree, so the nightly executes whatever is checked out
+    # at 03:15 — a tree sitting behind origin runs old code even though the fix is merged.
+    # That has now cost real data twice: the 2026-07-24 overlap-stats.sh dangle, and a
+    # tree stuck on a local commit from 2026-07-20 to 2026-07-24 that wrote four nights
+    # of run-stats.txt with no oversized_*/gated/overlap_* keys at all. Absent keys are a
+    # terrible signal — they read as "this stat did not apply" rather than "this runner
+    # predates the stat", and telling those apart took a reflog dig both times. Stamping
+    # the commit makes the runner's age legible from the artifact itself.
+    printf 'runner_commit: %s\n' "$RUNNER_COMMIT"
+    printf 'runner_dirty: %s\n' "$RUNNER_DIRTY"
     printf 'sessions_found_raw: %s\n' "$RAW"
     printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
     printf 'sessions_skipped_empty: %s\n' "$SKIPPED_EMPTY"
