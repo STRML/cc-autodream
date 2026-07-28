@@ -28,7 +28,7 @@ bin/run.sh  TARGET_DATE
       │       reads all findings/<date>/*.json + changelog-window.md + run-stats.txt
       │       writes dreams/<date>.md; may edit project MEMORY.md (📌) + touched-projects.txt
       │
-      ├─ notify.sh → open-questions inbox file (Sublime)
+      ├─ notify.sh → open-questions inbox file ($AUTODREAM_OPEN, default `open`)
       └─ optional: claude-memory gc per touched project
 ```
 
@@ -40,7 +40,7 @@ bin/run.sh  TARGET_DATE
 | `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); picks the scheduled plist that runs `run.sh` for its label namespace |
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/oversized-gate.sh` | recompute the #12 measurement gate over a trailing window from the sidecars/findings on disk (`--days N`, or explicit findings dirs). Recovers dates whose `run-stats.txt` predates the counters; artifacts only, no model calls |
-| `bin/notify.sh` | extract "Open questions" → inbox file in Sublime |
+| `bin/notify.sh` | extract "Open questions" → inbox file, counted from the `open-questions=N` marker, opened via `$AUTODREAM_OPEN` |
 | `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`); `AUTODREAM_TRIAGE_SURFACE=cmux` (config/env) launches it in its own cmux workspace instead of inline. Skips the session entirely (prints a notice) when the report has 0 open questions or is already triaged — reads the `<!-- autodream:open-questions=N -->` marker, falls back to prose, launches on anything ambiguous; `--force` overrides. Skip check runs before the cmux branch so a skip never spawns a workspace |
 | `prompts/SESSION_TRIAGE.md` | L1 prompt: per-session JSON schema |
 | `prompts/PROMPT.md` | L2 prompt: report sections incl. Upstream changes + Autodream self-audit, memory rules |
@@ -74,7 +74,7 @@ All optional; full list (with defaults) is documented in `bin/run.sh`'s header. 
 | `AUTODREAM_L1_ROUNDS` / `AUTODREAM_L2_ATTEMPTS` | `5` / `3` | sleep-resilient retry bounds |
 | `AUTODREAM_NETCHECK` / `AUTODREAM_RETRY_WAIT` | `1` / `60` | network-wait between retry rounds |
 | `AUTODREAM_SLIM_BYTES` | `262144` | sessions larger than this are slimmed for L1 |
-| `SUBL` | `$HOME/bin/subl` then PATH | Sublime CLI for `notify.sh` |
+| `AUTODREAM_OPEN` | `open` | how `notify.sh` opens the inbox file; a `sh -c` snippet, so flags work (`subl`, `code -g`, `open -a Obsidian`). `SUBL` is a deprecated alias |
 | `AUTODREAM_TRIAGE_SURFACE` | `inline` | `review.sh` triage surface: `inline` (current terminal) or `cmux` (own workspace) |
 | `AUTODREAM_TRIAGE_FOCUS` | `false` | cmux surface only: `true` switches to the new workspace on launch, `false` opens it in the background |
 | `CMUX_BIN` | `/Applications/cmux.app/.../bin/cmux` then PATH | cmux CLI, used when surface is `cmux` |

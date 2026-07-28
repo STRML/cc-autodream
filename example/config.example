@@ -10,6 +10,15 @@
 #   cmux               launch it in its own dedicated cmux workspace.
 AUTODREAM_TRIAGE_SURFACE=cmux
 
+# How notify.sh opens the morning open-questions file. A shell snippet, not a bare
+# binary path, so flags work. Defaults to `open`, which hands the file to whatever
+# your Mac already opens .md with. Set it if you want a specific editor.
+#   AUTODREAM_OPEN=subl
+#   AUTODREAM_OPEN="code -g"
+#   AUTODREAM_OPEN="open -a Obsidian"
+# `SUBL` is still read as a deprecated alias if you set it.
+# AUTODREAM_OPEN=open
+
 # Whether the cmux triage workspace grabs focus when it launches.
 #   false (default)  open it in the background; don't yank you out of your work
 #   true             switch to the new workspace immediately
