@@ -101,11 +101,15 @@ fi
 # the working tree) rather than $PWD, since launchd starts the job from an unrelated cwd.
 # Everything degrades to "unknown"/"no": a tarball install with no git, or no git binary
 # at all, is a supported way to run this and must not fail the run.
+# --untracked-files=no on the dirty check: "dirty" is meant to warn that the run used code
+# that exists in nobody's history, which only tracked modifications can cause. Counting
+# untracked files made the first production run report runner_dirty: yes over a stray
+# scratch directory, which is exactly the kind of false alarm that gets a signal ignored.
 RUNNER_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null) || RUNNER_COMMIT=""
 : "${RUNNER_COMMIT:=unknown}"
 if [ "$RUNNER_COMMIT" = "unknown" ]; then
   RUNNER_DIRTY=no
-elif [ -n "$(git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null)" ]; then
+elif [ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
   RUNNER_DIRTY=yes
 else
   RUNNER_DIRTY=no

@@ -943,6 +943,82 @@ test_notify_open_command(){
   rm -rf "$root"
 }
 
+test_notify_dryrun(){
+  echo "# notify.sh dry run reports the count without writing, posting, or opening anything"
+  local NOTIFY="$REPO/bin/notify.sh"
+  [ -x "$NOTIFY" ] || { no "notify.sh executable"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  # Deliberately NO stub notifier here. That is the whole point: a real sweep pointed
+  # AUTODREAM_DIR at a temp dir and assumed that was enough, but with no branded bundle
+  # present the resolution falls through to a system terminal-notifier and posts for
+  # real. Dry run has to be safe without any stubbing at all.
+  printf '#!/bin/sh\necho "$@" >> "%s/opened.log"\n' "$root" > "$root/fake-editor"
+  chmod +x "$root/fake-editor"
+  printf '# Autodream — 2020-04-01\n\n## Open questions for the user\n1. One?\n2. Two?\n\n<!-- autodream:open-questions=2 -->\n' \
+    > "$root/2020-04-01.md"
+
+  local out; out=$(AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_DRYRUN=1 AUTODREAM_OPEN="$root/fake-editor" \
+    "$NOTIFY" "$root/2020-04-01.md" 2>&1)
+  printf '%s' "$out" > "$root/dry.out"
+  assert_grep    "$root/dry.out" 'dry run'          "says it was a dry run"
+  assert_grep    "$root/dry.out" '2 open questions' "still reports the real count"
+  assert_no_file "$root/inbox/2020-04-01-open-questions.md" "dry run writes no inbox file"
+  assert_no_file "$root/opened.log"                 "dry run opens nothing"
+
+  # And the same report without the flag DOES do the work, so the guard isn't just off.
+  # NOW seed the stub notifier: this call reaches the posting code, and without a stub at
+  # the branded path the resolution falls through to a system terminal-notifier and fires
+  # a real banner. That is the very accident this feature exists to prevent, and writing
+  # the test without the stub reproduced it — the suite posted a live notification for a
+  # fixture dated 2020-04-01. The dry-run assertions above stay stub-free on purpose.
+  mkdir -p "$root/cc-autodream.app/Contents/MacOS"
+  printf '#!/bin/sh\nexit 0\n' > "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
+  chmod +x "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
+  AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 AUTODREAM_OPEN="$root/fake-editor" \
+    "$NOTIFY" "$root/2020-04-01.md" > "$root/wet.out" 2>&1
+  assert_file "$root/inbox/2020-04-01-open-questions.md" "without the flag the inbox file is written"
+  assert_file "$root/opened.log"                         "without the flag the open command runs"
+
+  # A zero-question report is quiet either way, and must not claim to be a dry run.
+  printf '# Autodream — 2020-04-02\n\n## Open questions for the user\nNone that clear the gate.\n\n<!-- autodream:open-questions=0 -->\n' \
+    > "$root/2020-04-02.md"
+  out=$(AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_DRYRUN=1 "$NOTIFY" "$root/2020-04-02.md" 2>&1)
+  printf '%s' "$out" > "$root/dry0.out"
+  assert_grep   "$root/dry0.out" '0 open questions' "zero-count report still reports zero"
+  assert_nogrep "$root/dry0.out" 'dry run'          "the zero path exits before the dry-run notice"
+
+  rm -rf "$root"
+}
+
+test_runner_dirty_ignores_untracked(){
+  echo "# runner_dirty (#29 follow-up): an untracked scratch file is not a dirty runner"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # A clean checkout with a stray untracked file reported runner_dirty: yes on the first
+  # production run. Only tracked modifications mean "code that exists in nobody's history".
+  local repo="$root/repo"; mkdir -p "$repo"
+  cp -R "$REPO/bin" "$repo/bin"; cp -R "$REPO/prompts" "$repo/prompts"
+  git -C "$repo" init -q 2>/dev/null
+  git -C "$repo" add -A 2>/dev/null
+  git -C "$repo" -c user.email=t@t -c user.name=t commit -qm init 2>/dev/null
+  printf 'scratch\n' > "$repo/untracked-scratch.txt"
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
+  PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+  bash "$repo/bin/run.sh" "$DATE" > "$root/run.out" 2>&1
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'runner_dirty: no' "an untracked file alone does not mark the runner dirty"
+
+  # A tracked modification still does.
+  printf '\n# tracked edit\n' >> "$repo/bin/session-stats.sh"
+  rm -rf "$(fdir "$root")" "$root/dreams/$DATE.md"
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
+  PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+  bash "$repo/bin/run.sh" "$DATE" > "$root/run2.out" 2>&1
+  assert_grep "$(fdir "$root")/run-stats.txt" 'runner_dirty: yes' "a tracked modification still marks the runner dirty"
+  rm -rf "$root"
+}
+
 test_overlap_pair(){
   echo "# overlap (#14): two alternating-close sessions count as ONE pair regardless of qualifying turn-pairs"
   local root; root=$(setup_env)
@@ -1084,6 +1160,8 @@ test_oversized_gate_script_empty
 test_oversized_gate_script_args
 test_notify_count
 test_notify_open_command
+test_notify_dryrun
+test_runner_dirty_ignores_untracked
 test_overlap_pair
 test_overlap_triple
 test_overlap_none

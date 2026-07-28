@@ -16,6 +16,9 @@
 #                   work: "subl", "code -g", "open -a Obsidian".
 #                   default: open (macOS hands the file to the default .md app)
 #   SUBL            deprecated alias for AUTODREAM_OPEN, honored for existing setups
+#   AUTODREAM_NOTIFY_DRYRUN
+#                   1 = report the question count and exit. Writes no inbox file, posts
+#                   no banner, opens nothing. Use this to check what a report WOULD do.
 
 set -u
 
@@ -97,6 +100,20 @@ fi
 
 if [ -z "$QUESTIONS" ] || [ "$COUNT" -eq 0 ]; then
   echo "notify.sh: $DATE has 0 open questions; nothing to pop"
+  exit 0
+fi
+
+# Everything above is pure computation; everything below has side effects a human sees.
+# The split matters because verifying the count is a thing people legitimately want to do
+# over a pile of OLD reports — replaying the counter across the archive is how the marker
+# logic was validated in the first place — and doing that with the real script posts a
+# real banner per report. That happened on 2026-07-28: a verification sweep fired banners
+# for reports up to eleven days old, and because the sweep had pointed the open command at
+# a stub, clicking them did nothing. Pointing AUTODREAM_DIR at a temp dir is NOT enough to
+# make this safe: the branded bundle is absent there, so the notifier resolution falls
+# through to a system terminal-notifier and posts for real.
+if [ "${AUTODREAM_NOTIFY_DRYRUN:-0}" = "1" ]; then
+  echo "notify.sh: [dry run] $DATE has $COUNT open question$([ "$COUNT" -eq 1 ] || echo s); nothing written or posted"
   exit 0
 fi
 
