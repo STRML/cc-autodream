@@ -765,6 +765,123 @@ test_oversized_gate_script_args(){
   assert_eq "$rc" "2" "an unknown option exits 2 rather than being read as a findings dir"
 }
 
+test_notify_count(){
+  echo "# notify.sh counts from the open-questions marker, falling back to shape for older reports"
+  local NOTIFY="$REPO/bin/notify.sh"
+  [ -x "$NOTIFY" ] || { no "notify.sh executable"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  # Pre-seed an executable stub at the branded-notifier path so the test neither
+  # bootstraps a real app bundle nor posts a real banner. OSA backup off for the same
+  # reason; SUBL points at true so no editor opens.
+  mkdir -p "$root/cc-autodream.app/Contents/MacOS"
+  printf '#!/bin/sh\nexit 0\n' > "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
+  chmod +x "$root/cc-autodream.app/Contents/MacOS/terminal-notifier"
+  run_notify(){
+    AUTODREAM_DIR="$root" AUTODREAM_NOTIFY_OSA_BACKUP=0 SUBL=/usr/bin/true \
+      "$NOTIFY" "$1" > "$root/notify.out" 2>&1
+  }
+  mk_report(){ # $1=date, stdin=Open questions section body
+    local f="$root/$1.md"
+    { printf '# Autodream — %s\n\n## Open questions for the user\n' "$1"; cat; printf '\n## Trailing section\n'; } > "$f"
+    printf '%s' "$f"
+  }
+
+  # --- marker is authoritative, even when the section's shape says otherwise ---
+  # This is the real 2026-07-24 shape: one numbered question, then a "dropped by the
+  # gate" list. The old counter scored 6 here; the marker says 1.
+  local f
+  f=$(mk_report 2020-02-01 <<'EOF'
+**One question survived the triviality gate.**
+
+1. **A real question** — should we do the thing?
+
+Other findings dropped by the gate:
+- Pattern 1 already addressed on disk.
+- Pattern 2 settled last week.
+- Pattern 3 below threshold.
+- Pattern 4 quarantined.
+
+<!-- autodream:open-questions=1 -->
+EOF
+)
+  run_notify "$f"
+  assert_grep "$root/inbox/2020-02-01-open-questions.md" '^# 1 open question$' "marker wins over the 6 list lines in the section"
+
+  # --- marker of 0 must stay silent even though the section has prose and bullets ---
+  f=$(mk_report 2020-02-02 <<'EOF'
+None that clear the triviality gate this run.
+
+- Pattern 1 was already fixed on disk.
+- Pattern 2 is under a standing moratorium.
+
+<!-- autodream:open-questions=0 -->
+EOF
+)
+  run_notify "$f"
+  assert_no_file "$root/inbox/2020-02-02-open-questions.md" "marker=0 writes no inbox file despite a non-empty section"
+  assert_grep "$root/notify.out" '0 open questions' "marker=0 reports zero"
+
+  # --- no marker (pre-contract report): numbered items win over their sub-bullets ---
+  f=$(mk_report 2020-02-03 <<'EOF'
+1. First question?
+   - supporting detail
+   - more detail
+2. Second question?
+   - supporting detail
+EOF
+)
+  run_notify "$f"
+  assert_grep "$root/inbox/2020-02-03-open-questions.md" '^# 2 open questions$' "no marker: 2 items, not 5 list lines"
+
+  # --- no marker: bold topic titles beat the bullets underneath them ---
+  f=$(mk_report 2020-02-04 <<'EOF'
+**Scrape skill guardrail**
+- Update step 3?
+- Add a step-6 check?
+
+**TLS-bypass rule**
+- Add a rule?
+- Where should it live?
+EOF
+)
+  run_notify "$f"
+  assert_grep "$root/inbox/2020-02-04-open-questions.md" '^# 2 open questions$' "no marker: 2 titles, not 4 bullets"
+
+  # --- no marker: plain bullets are the questions ---
+  f=$(mk_report 2020-02-05 <<'EOF'
+- Raise the fanout?
+- Drop the cache?
+EOF
+)
+  run_notify "$f"
+  assert_grep "$root/inbox/2020-02-05-open-questions.md" '^# 2 open questions$' "no marker: plain bullets counted"
+
+  # --- no marker: bare prose still pops, since a non-empty section has something to say ---
+  f=$(mk_report 2020-02-06 <<'EOF'
+Should the fanout be raised to 12 given the recent session volume?
+EOF
+)
+  run_notify "$f"
+  assert_grep "$root/inbox/2020-02-06-open-questions.md" '^# 1 open question$' "no marker: prose falls back to 1"
+
+  # --- no marker: a "None ..." lead-in is zero, not a prose question ---
+  # Without this case the prose tier turns every quiet pre-marker night into a false pop.
+  f=$(mk_report 2020-02-07 <<'EOF'
+None that clear the triviality gate this run.
+EOF
+)
+  run_notify "$f"
+  assert_no_file "$root/inbox/2020-02-07-open-questions.md" "no marker: a None lead-in stays silent"
+
+  # --- genuinely empty section stays a quiet no-op ---
+  f=$(mk_report 2020-02-08 </dev/null)
+  run_notify "$f"
+  assert_no_file "$root/inbox/2020-02-08-open-questions.md" "empty section writes nothing"
+  assert_grep "$root/notify.out" '0 open questions' "empty section reports zero"
+
+  rm -rf "$root"
+}
+
 test_overlap_pair(){
   echo "# overlap (#14): two alternating-close sessions count as ONE pair regardless of qualifying turn-pairs"
   local root; root=$(setup_env)
@@ -904,6 +1021,7 @@ test_oversized_gate_script
 test_oversized_gate_script_open
 test_oversized_gate_script_empty
 test_oversized_gate_script_args
+test_notify_count
 test_overlap_pair
 test_overlap_triple
 test_overlap_none
