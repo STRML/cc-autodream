@@ -598,6 +598,76 @@ test_oversized_gate_errored(){
   rm -rf "$root"
 }
 
+test_stats_sidecar_ok(){
+  echo "# sidecar health (#27): a normal run reports zero unparseable sidecars"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  run_dream "$root"
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'stats_sidecars_unparseable: 0' "healthy sidecars report a real zero"
+  rm -rf "$root"
+}
+
+test_stats_sidecar_missing_counted(){
+  echo "# sidecar health (#27): a session-stats.sh that never runs is counted, not silently absorbed"
+  local root; root=$(setup_env)
+  mk_session "$root" sess1
+  mk_session "$root" sess2
+  # compute_session_stats deletes and regenerates every sidecar each run, so the
+  # only way to force the broken-sidecar path is to break the generator itself.
+  export AUTODREAM_STATS_BIN="$root/does-not-exist.sh"
+  run_dream "$root"
+  unset AUTODREAM_STATS_BIN
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'stats_sidecars_unparseable: 2' "both missing sidecars counted"
+  rm -rf "$root"
+}
+
+test_stats_sidecar_missing_keeps_oversized_count(){
+  echo "# sidecar health (#27): an oversized session does NOT vanish from oversized_total when its sidecar is missing"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # This is the issue's exact reproduction: a genuinely oversized session whose
+  # sidecar never got written used to drop straight out of oversized_total, the
+  # counter that gates #12, with nothing recording that it happened.
+  export AUTODREAM_SLIM_BYTES=100 AUTODREAM_STATS_BIN="$root/does-not-exist.sh"
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES AUTODREAM_STATS_BIN
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'oversized_total: 1'            "oversized session still counted via the live-size fallback"
+  assert_grep "$stats" 'stats_sidecars_unparseable: 1' "and the sidecar failure is recorded alongside it"
+  rm -rf "$root"
+}
+
+test_stats_sidecar_malformed_counted(){
+  echo "# sidecar health (#27): a sidecar that is a valid object but has no usable transcript_bytes is counted"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # compute_session_stats only validates `type == "object"`, so this stub survives
+  # generation intact and breaks at read time instead — the quieter of the two paths.
+  local stub="$root/stats-no-bytes.sh"
+  printf '%s\n' '#!/bin/bash' 'printf %s "{\"user_message_count\":5,\"tool_call_count\":9}" > "$2"' > "$stub"
+  chmod +x "$stub"
+  export AUTODREAM_SLIM_BYTES=100 AUTODREAM_STATS_BIN="$stub"
+  run_dream "$root"
+  unset AUTODREAM_SLIM_BYTES AUTODREAM_STATS_BIN
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'stats_sidecars_unparseable: 1' "missing transcript_bytes counts as unparseable"
+  assert_grep "$stats" 'oversized_total: 1'            "oversized session still counted via the live-size fallback"
+  rm -rf "$root"
+}
+
+test_stats_sidecar_non_numeric_counted(){
+  echo "# sidecar health (#27): a non-numeric transcript_bytes is counted, not clamped to 0 in silence"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local stub="$root/stats-bad-bytes.sh"
+  printf '%s\n' '#!/bin/bash' 'printf %s "{\"transcript_bytes\":\"lots\"}" > "$2"' > "$stub"
+  export AUTODREAM_STATS_BIN="$stub"
+  chmod +x "$stub"
+  run_dream "$root"
+  unset AUTODREAM_STATS_BIN
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'stats_sidecars_unparseable: 1' "a string transcript_bytes is not a measurement"
+  rm -rf "$root"
+}
+
 test_overlap_pair(){
   echo "# overlap (#14): two alternating-close sessions count as ONE pair regardless of qualifying turn-pairs"
   local root; root=$(setup_env)
@@ -726,6 +796,11 @@ test_noise_gate_env_override
 test_oversized_gate_zero
 test_oversized_gate_total
 test_oversized_gate_errored
+test_stats_sidecar_ok
+test_stats_sidecar_missing_counted
+test_stats_sidecar_missing_keeps_oversized_count
+test_stats_sidecar_malformed_counted
+test_stats_sidecar_non_numeric_counted
 test_overlap_pair
 test_overlap_triple
 test_overlap_none
