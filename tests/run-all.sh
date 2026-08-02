@@ -352,6 +352,34 @@ test_partial_report_does_not_consume(){
   rm -rf "$root"
 }
 
+test_partial_report_does_not_block_retry(){
+  echo "# regression: a truncated report must not satisfy the idempotency guard forever"
+  local root; root=$(setup_env); mk_session "$root" s1
+  # Every attempt dies mid-write. Without the move-aside, the next launchd catch-up
+  # trigger sees a non-empty file, says "nothing to do", and the half-written report
+  # becomes the permanent output for the date.
+  export MOCK_MODE=l2_partial AUTODREAM_L2_ATTEMPTS=1
+  vault_run "$root"
+  unset MOCK_MODE AUTODREAM_L2_ATTEMPTS
+  assert_no_file "$root/dreams/$DATE.md" "the truncated report was moved off the report path"
+  ls "$root/dreams/$DATE.md.partial-"* >/dev/null 2>&1 \
+    && ok "it was preserved as .partial-<epoch>, not deleted" \
+    || no "the partial report was lost"
+  # The next trigger must actually re-run rather than no-op on the leftover.
+  vault_run "$root"
+  assert_nonempty "$root/dreams/$DATE.md" "a later trigger produced a real report"
+  assert_grep "$root/dreams/$DATE.md" "autodream:open-questions=" "and it is a complete one"
+  rm -rf "$root"
+}
+
+test_no_sessions_stub_carries_marker(){
+  echo "# the no-sessions stub is a complete report and must carry the marker"
+  local root; root=$(setup_env)     # no sessions at all
+  run_dream "$root"
+  assert_grep "$root/dreams/$DATE.md" "autodream:open-questions=" "the stub carries the marker"
+  rm -rf "$root"
+}
+
 test_partial_report_keeps_previous(){
   echo "# regression: a truncated rebuild must not discard the previous good report"
   local root; root=$(setup_env); mk_session "$root" s1
@@ -1487,6 +1515,8 @@ test_force_rebuild_failed_l2_does_not_consume
 test_unmovable_stale_report_disarms_consuming
 test_partial_report_does_not_consume
 test_partial_report_keeps_previous
+test_partial_report_does_not_block_retry
+test_no_sessions_stub_carries_marker
 test_old_date_reprocess_does_not_consume
 test_config_unbound_var_does_not_kill_run
 echo
