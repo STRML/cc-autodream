@@ -119,6 +119,21 @@ test_stale_queryid_clears_cache(){
   rm -rf "$root"
 }
 
+test_queryid_source_is_recorded(){
+  echo "# every collect records where the queryId came from, including when it never looked"
+  local root; root=$(setup)
+  # The seeded cache means the bundle walk is not exercised — which is the state #38
+  # exists to make visible, since the fetch works either way.
+  run_bm "$root" collect "$root/findings"
+  assert_grep "$root/findings/x-bookmarks-queryid.txt" "^cache$" "a reused id is recorded as cache, not as a working walk"
+  rm -f "$root/state/query-id"
+  run_bm "$root" collect "$root/findings2"
+  assert_grep "$root/findings2/x-bookmarks-queryid.txt" "^failed$" "a walk that found nothing is recorded as failed"
+  X_CREDS_FILE="$root/does-not-exist" run_bm "$root" collect "$root/findings3"
+  assert_grep "$root/findings3/x-bookmarks-queryid.txt" "^not_attempted$" "and an unconfigured run says the walk never ran"
+  rm -rf "$root"
+}
+
 test_parse_and_emit(){
   echo "# a real-shaped response parses into markdown, a manifest, and state"
   local root; root=$(setup)
@@ -277,6 +292,7 @@ echo "x-bookmarks.sh tests"
 test_not_configured
 test_auth_failure
 test_stale_queryid_clears_cache
+test_queryid_source_is_recorded
 test_parse_and_emit
 test_newest_first
 test_mark_read_then_not_relisted

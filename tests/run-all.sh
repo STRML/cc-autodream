@@ -94,6 +94,21 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
   PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
+  # An unattended run logs to its file rather than through a pipe, so that stdout carries
+  # only a pointer now. Fold the real log in, so every assertion below still reads what a
+  # nightly run actually recorded rather than what a tty run happens to echo.
+  cat "$1/autodream/logs/run-$DATE.log" >> "$1/run.out" 2>/dev/null || true
+}
+# Same run, but piped into a reader that closes immediately, so any write run.sh makes to
+# stdout lands on a dead pipe. This is the shape of the real 2026-08-02 failure.
+run_dream_broken_pipe(){ # $1=root
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CONFIG="$1/autodream/config" \
+  AUTODREAM_CONSUME_DATE="$DATE" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
+  PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
+  bash "$RUN" "$DATE" 2>&1 | true
+  cat "$1/autodream/logs/run-$DATE.log" > "$1/run.out" 2>/dev/null || true
 }
 fdir(){ printf '%s' "$1/autodream/findings/$DATE"; }   # findings dir for a root
 
@@ -372,6 +387,71 @@ test_partial_report_does_not_block_retry(){
   rm -rf "$root"
 }
 
+test_unassembled_dates_are_surfaced(){
+  echo "# a date triaged but never assembled must be named, not left for someone to find"
+  local root; root=$(setup_env); mk_session "$root" s1
+  local prior="$root/autodream/findings/2020-01-01"
+  mkdir -p "$prior"
+  printf '{"findings":[]}\n' > "$prior/abc123def456.json"
+  printf '{"transcript_bytes":10}\n' > "$prior/abc123def456.stats.json"
+  # A second dir holding only a sidecar: never triaged, so nothing to assemble.
+  mkdir -p "$root/autodream/findings/2020-01-03"
+  printf '{"transcript_bytes":10}\n' > "$root/autodream/findings/2020-01-03/dead.stats.json"
+  run_dream "$root"
+  assert_grep "$root/run.out" "findings but no complete report: 2020-01-01" "the log names the abandoned date"
+  assert_grep "$(fdir "$root")/run-stats.txt" "unassembled_dates: 2020-01-01" "and the stat carries it into the next report"
+  assert_nogrep "$(fdir "$root")/run-stats.txt" "2020-01-03" "a sidecar-only dir was never triaged and is not a failure"
+  rm -rf "$root"
+}
+
+test_unassembled_ignores_a_finished_date(){
+  echo "# a date with a complete report is not an abandoned one"
+  local root; root=$(setup_env); mk_session "$root" s1
+  local prior="$root/autodream/findings/2020-01-01"
+  mkdir -p "$prior" "$root/dreams"
+  printf '{"findings":[]}\n' > "$prior/abc123def456.json"
+  printf '# report\n\nautodream:open-questions=0\n' > "$root/dreams/2020-01-01.md"
+  run_dream "$root"
+  assert_grep "$(fdir "$root")/run-stats.txt" "unassembled_dates: *$" "the finished date is not listed"
+  # A truncated report is not a finished one, and must come back onto the list.
+  printf '# report with no marker\n' > "$root/dreams/2020-01-01.md"
+  rm -f "$root/dreams/$DATE.md"
+  run_dream "$root"
+  assert_grep "$(fdir "$root")/run-stats.txt" "unassembled_dates: 2020-01-01" "but a marker-less one is"
+  rm -rf "$root"
+}
+
+test_dead_stdout_does_not_kill_the_run(){
+  echo "# regression: losing the log reader must cost the run its output, not its life"
+  local root; root=$(setup_env); mk_session "$root" s1
+  # Three runs died this way on 2026-08-02: tee was killed, the next log line SIGPIPEd the
+  # run, and everything after L2 — the retry loop, the move-aside, the consume gate — was
+  # never reached. No error line said so, because saying so was the thing that died.
+  run_dream_broken_pipe "$root"
+  assert_grep "$root/dreams/$DATE.md" "autodream:open-questions=" "the run finished and wrote a complete report"
+  assert_grep "$root/run.out" "autodream end" "and its log reached the end on disk"
+  rm -rf "$root"
+}
+
+test_complete_report_retires_partials(){
+  echo "# a complete report supersedes the partials left by the nights that failed"
+  local root; root=$(setup_env); mk_session "$root" s1
+  # Two failed nights, so the second run has to retire a partial it did not itself create.
+  export MOCK_MODE=l2_partial AUTODREAM_L2_ATTEMPTS=1
+  vault_run "$root"
+  vault_run "$root"
+  unset MOCK_MODE AUTODREAM_L2_ATTEMPTS
+  ls "$root/dreams/$DATE.md.partial-"* >/dev/null 2>&1 \
+    && ok "the failed nights left partials behind" \
+    || no "setup failed: no partial report to retire"
+  vault_run "$root"                                   # the night that finally works
+  assert_grep "$root/dreams/$DATE.md" "autodream:open-questions=" "a complete report landed"
+  ls "$root/dreams/$DATE.md.partial-"* >/dev/null 2>&1 \
+    && no "partials survived the complete report that supersedes them" \
+    || ok "every partial for the date was discarded"
+  rm -rf "$root"
+}
+
 test_no_sessions_stub_carries_marker(){
   echo "# the no-sessions stub is a complete report and must carry the marker"
   local root; root=$(setup_env)     # no sessions at all
@@ -551,6 +631,9 @@ test_self_audit_stats(){
   assert_grep  "$stats" 'sessions_dropped_after_failures: 0'   "no dropped sessions on a clean happy-path run"
   assert_grep  "$stats" 'l1_sessions_already_done_at_start: 0' "no precached findings on a fresh run"
   assert_grep  "$stats" 'l1_sessions_freshly_processed: 1'     "the one session was freshly processed this run"
+  # #38: the key is always emitted, even with no bookmark credentials anywhere near the
+  # sandbox, so a consumer never has to tell "absent" from "the walk did not run".
+  assert_grep  "$stats" 'x_queryid_source: not_attempted'      "the queryId source is recorded even when the walk never ran"
   rm -rf "$root"
 }
 
@@ -1516,6 +1599,10 @@ test_unmovable_stale_report_disarms_consuming
 test_partial_report_does_not_consume
 test_partial_report_keeps_previous
 test_partial_report_does_not_block_retry
+test_complete_report_retires_partials
+test_dead_stdout_does_not_kill_the_run
+test_unassembled_dates_are_surfaced
+test_unassembled_ignores_a_finished_date
 test_no_sessions_stub_carries_marker
 test_old_date_reprocess_does_not_consume
 test_config_unbound_var_does_not_kill_run
