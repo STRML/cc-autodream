@@ -101,6 +101,24 @@ It didn't until this feature; only `review.sh` did, which was fine while every k
 
 `AUTODREAM_DIR` is resolved before the source and therefore cannot be set from the config. That is not an oversight — it names the file's own location.
 
+### What the consume gate actually has to check (PR #37 review)
+
+"Only consume after a real report" turned out to need three conditions, not one. A review found the first version satisfied by things that are not a real report at all:
+
+- **`-s "$REPORT_PATH"` is not proof this run wrote it.** Under `AUTODREAM_FORCE=1` the idempotency guard is bypassed while the *previous* run's report is still on disk, and nothing ever truncates that path. A sleep-killed L2 then left the old file standing, which both broke the retry loop out after one attempt and let the consume step archive an unread note. The fix is to move an existing report aside *before* the L2 loop, so the path being non-empty means what the code always assumed it meant. The copy is kept and logged on failure, discarded on success so `--force` doesn't litter `.stale-<epoch>` files forever.
+- **The date matters.** Both collectors are date-agnostic — they read the *current* inbox and the *currently* unread bookmarks regardless of which date's findings dir they write into. Reprocessing an old date therefore consumed today's pending input. Consuming is now gated on `TARGET_DATE` matching the date a normal nightly run would process. `AUTODREAM_CONSUME_DATE` overrides that authoritatively, because the suite pins a fixed historical date and without the override every archive assertion would pass while testing nothing.
+- **Publishing is not consuming.** Copying the report into the vault stays outside the date gate; only `archive` and `mark-read` destroy the user's only copy.
+
+### Bash traps this feature hit, all of them silent
+
+Each of these passed a smoke test and failed in a way that produced no error:
+
+- **`$(grep -c ... || echo 0)` yields `"0\n0"`.** `grep -c` prints `0` *and* exits 1 on no match, so the fallback fires too. The arithmetic that follows then dies under `set -e`. Triggered by a `notes.md` holding only its header — exactly what the user is left with after deleting notes a report said were addressed.
+- **A variable set inside `$(...)` never comes back.** `fail()` assigned `FAIL_REASON` from inside nested command substitutions (`qid=$(get_query_id)` → `qid=$(detect_query_id)`), so the cookie-expiry remediation text died with the subshell and the report said a fetch failed for no reason. The reason now goes to a file, which crosses the boundary.
+- **An iCloud-evicted file is not a zero-byte file.** macOS replaces it outright with a dot-prefixed `.<name>.icloud` placeholder, so a `-name '*.md'` walk matches *nothing* and the unreadable-note branch was unreachable for the only case it existed for. Placeholders get their own pass and are never manifested, so the note stays in the inbox to retry.
+- **Sourcing a user-edited config under `set -u` kills the shell.** Not the source — the shell, so `|| echo WARNING` cannot fire. `run.sh` now probes the config in a throwaway subshell purely to capture bash's own error naming the bad variable, then sources for real with nounset off. Both helper scripts need the same guard; fixing only `run.sh` left them dying instead.
+- **`mv` across filesystems is a copy, not a rename.** State staged in `$TMPDIR` and moved onto `$STATE_DIR` was never the atomic swap its comment claimed. Stage in the destination directory and gate the `mv` on the staging copy having succeeded.
+
 ## X bookmarks as idea fuel
 
 `bin/x-bookmarks.sh` fetches recent bookmarks into `findings/<date>/x-bookmarks.md`; `PROMPT.md`'s "Ideas from bookmarks" section crosses them against the day's findings. The section's whole value is the intersection, so the prompt is explicit that a bookmark with no connection to this run gets left out and "none connected" is a correct answer — otherwise the model manufactures links and the section becomes a reading list the user already read.

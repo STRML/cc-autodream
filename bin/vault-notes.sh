@@ -59,13 +59,20 @@ AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 # is worse than no status command. Double-sourcing is harmless: run.sh has already
 # exported these by the time it calls us, and the snapshot replay makes the environment
 # win either way.
+# `set +u` around the source for the same reason run.sh does it: this script runs under
+# nounset, and a single typo'd variable reference in the user-edited config would
+# otherwise abort it outright — turning a harmless config typo into a night with no
+# operator notes. run.sh already warns about the typo; staying quiet here avoids printing
+# the same complaint twice per run.
 AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$AUTODREAM_DIR/config}"
 if [ -f "$AUTODREAM_CONFIG" ]; then
   _env_snapshot=$(export -p)
+  set +u
   set -a
   # shellcheck disable=SC1090
   . "$AUTODREAM_CONFIG" 2>/dev/null || true
   set +a
+  set -u
   eval "$_env_snapshot"
   unset _env_snapshot
 fi
@@ -141,6 +148,17 @@ collect() {
 
   ensure_vault
 
+  # Expiry is judged against the date being REPORTED ON, not against now. Rebuilding an
+  # old date (or a launchd catch-up re-running a missed night days later) would otherwise
+  # drop and archive every note whose expiry fell between that date and today, even
+  # though those notes were active for the window in question. The findings dir is named
+  # for the date; anything else (tests, an ad-hoc dir) falls back to today.
+  local report_date; report_date="$(basename "$findings")"
+  case "$report_date" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) : ;;
+    *) report_date="$TODAY" ;;
+  esac
+
   local active=0 expired=0 unreadable=0
   local body; body="$(mktemp)"
   trap 'rm -f "$body"' RETURN
@@ -150,7 +168,14 @@ collect() {
   # and expiry filtering for those stays in the prompt where it has always lived.
   if [ -s "$NOTES_FILE" ]; then
     local lines
-    lines=$(grep -c '^- \[' "$NOTES_FILE" 2>/dev/null || echo 0)
+    # NOT `$(grep -c ... || echo 0)`. With zero matches grep -c prints 0 AND exits 1, so
+    # the `||` fires too and the substitution captures the two-line string "0\n0"; the
+    # arithmetic below then dies and `set -e` takes the whole collect down, writing no
+    # operator-notes.md at all. That input is not hypothetical — it is exactly what
+    # notes.md looks like once the user deletes the notes a report told them were
+    # addressed, leaving only the header autodream-note.sh writes.
+    lines=$(grep -c '^- \[' "$NOTES_FILE" 2>/dev/null) || true
+    [ -n "$lines" ] || lines=0
     {
       printf '## From %s\n\n' "$NOTES_FILE"
       cat "$NOTES_FILE"
@@ -177,7 +202,7 @@ collect() {
       fi
 
       local exp; exp="$(note_expiry "$f")"
-      if [ -n "$exp" ] && [ "$exp" \< "$TODAY" ]; then
+      if [ -n "$exp" ] && [ "$exp" \< "$report_date" ]; then
         expired=$(( expired + 1 ))
         # Still archived: an expired note has done its job and should leave the inbox.
         printf '%s\n' "$f" >> "$manifest"
@@ -194,6 +219,26 @@ collect() {
       printf '%s\n' "$f" >> "$manifest"
       active=$(( active + 1 ))
     done < <(find "$inbox" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort)
+
+    # An iCloud-evicted note is NOT a zero-byte `foo.md`. macOS replaces the file
+    # outright with a dot-prefixed `.foo.md.icloud` placeholder, so the `*.md` walk above
+    # matches nothing at all and the UNREADABLE branch inside it — written for exactly
+    # this case — can never fire. Left unhandled, a note the user wrote from their phone
+    # is reported as `unreadable: 0`, which reads as "nothing was missed". That is the
+    # failure the repo's degraded-measurements-must-say-so rule exists to prevent, so the
+    # placeholders get their own pass. They are deliberately NOT manifested: the note has
+    # not been read, so it must stay in the inbox for the next run to retry.
+    local ph name
+    while IFS= read -r ph; do
+      [ -n "$ph" ] || continue
+      name="$(basename "$ph")"; name="${name#.}"; name="${name%.icloud}"
+      # Skip a placeholder whose real file also materialised — the loop above already
+      # handled it, and counting both would overstate the miss.
+      [ -e "$inbox/$name" ] && continue
+      unreadable=$(( unreadable + 1 ))
+      printf '## note: %s — UNREADABLE\n\nThis note exists in the vault inbox but iCloud had not downloaded its contents within %ss, so it could not be read this run. It has been LEFT IN THE INBOX and will be retried. Mention it by name in the Operator notes section so the user knows a note they wrote was missed, and do not guess at its contents.\n\n' \
+        "$name" "$ICLOUD_WAIT" >> "$body"
+    done < <(find "$inbox" -maxdepth 1 -name '.*.icloud' 2>/dev/null | sort)
   fi
 
   {

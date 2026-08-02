@@ -214,6 +214,65 @@ test_text_is_capped(){
   rm -rf "$root"
 }
 
+# ---- Regressions from the PR #37 review -------------------------------------------
+
+test_duplicate_ids_within_one_fetch(){
+  echo "# regression: the same id twice in one fetch produces one state row, not two"
+  local root; root=$(setup)
+  # X's cursor pagination genuinely returns a post twice when the timeline shifts between
+  # requests. Dedupe used to consult only the pre-existing state file, so neither copy
+  # looked known and both were written.
+  jq -c '.data.bookmark_timeline_v2.timeline.instructions[0].entries =
+          [ .data.bookmark_timeline_v2.timeline.instructions[0].entries[0],
+            .data.bookmark_timeline_v2.timeline.instructions[0].entries[0],
+            .data.bookmark_timeline_v2.timeline.instructions[0].entries[1] ]' \
+    "$root/page.json" > "$root/page-dup.json"
+  MOCK_BODY="$root/page-dup.json" run_bm "$root" collect "$root/findings"
+  assert_eq "$(wc -l < "$root/state/seen.jsonl" | tr -d ' ')" "2" "the duplicate produced one row, not two"
+  assert_eq "$(wc -l < "$root/findings/x-bookmarks-manifest.txt" | tr -d ' ')" "2" "and is listed once in the manifest"
+  rm -rf "$root"
+}
+
+test_auth_failure_reason_is_not_empty(){
+  echo "# regression: the credential-expiry reason survives the subshell that produced it"
+  local root; root=$(setup)
+  # fail() used to set a shell variable from inside nested command substitutions, so the
+  # reason died with the subshell and the report said a fetch failed for no stated reason.
+  MOCK_CODE=401 run_bm "$root" collect "$root/findings"
+  local first; first=$(head -1 "$root/findings/x-bookmarks.md")
+  # Everything after the em dash must be non-empty.
+  case "$first" in
+    *"— "?*) ok "the failure header carries an actual reason" ;;
+    *) no "the failure header has an empty reason (got: $first)" ;;
+  esac
+  assert_grep "$root/findings/x-bookmarks.md" "auth_token" "and the reason names the fix"
+  rm -rf "$root"
+}
+
+test_no_jq_still_writes_the_file(){
+  echo "# regression: a missing jq reports itself instead of silently writing nothing"
+  local root; root=$(setup)
+  # PATH holding only what the script needs, minus jq. A bare exit here used to skip the
+  # dispatch entirely, so no output file was written, run.sh's `|| log` never fired
+  # (status 0), and PROMPT.md read the absent file as "feature not enabled".
+  mkdir -p "$root/nojq"
+  local b
+  for b in date mktemp rm cat mkdir grep sed sort head tail wc stat sleep find basename cut tr awk; do
+    [ -x "/usr/bin/$b" ] && ln -sf "/usr/bin/$b" "$root/nojq/$b"
+    [ -x "/bin/$b" ]     && ln -sf "/bin/$b"     "$root/nojq/$b"
+  done
+  cp "$root/bin/curl" "$root/nojq/curl"
+  env -i HOME="$HOME" PATH="$root/nojq" \
+      AUTODREAM_DIR="$root" AUTODREAM_CONFIG="$root/no-such-config" \
+      X_CREDS_FILE="$root/creds" X_STATE_DIR="$root/state" \
+      /bin/bash "$BIN" collect "$root/findings" >/dev/null 2>&1
+  assert_eq "$?" "0" "exits 0 with jq missing"
+  assert_file "$root/findings/x-bookmarks.md" "the output file is still written"
+  assert_grep "$root/findings/x-bookmarks.md" "^# x-bookmarks: fetch failed" "it reports a failure"
+  assert_grep "$root/findings/x-bookmarks.md" "jq" "and names jq as the cause"
+  rm -rf "$root"
+}
+
 echo "x-bookmarks.sh tests"
 test_not_configured
 test_auth_failure
@@ -226,6 +285,9 @@ test_mark_read_no_manifest
 test_unread_survive_a_failed_fetch
 test_state_not_duplicated
 test_text_is_capped
+test_duplicate_ids_within_one_fetch
+test_auth_failure_reason_is_not_empty
+test_no_jq_still_writes_the_file
 
 echo
 echo "----------------------------------------"
