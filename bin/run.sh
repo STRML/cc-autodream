@@ -588,6 +588,8 @@ run() {
 No Claude Code sessions were modified on this date.
 
 (Generated $(date -u +%Y-%m-%dT%H:%M:%SZ))
+
+<!-- autodream:open-questions=0 -->
 EOF
     return 0
   fi
@@ -961,6 +963,27 @@ PY
 
   L2_ELAPSED=$(( $(date +%s) - L2_START ))
   log "L2 done in ${L2_ELAPSED}s (exit $L2_RC, $attempt attempt(s))"
+
+  # ---- A truncated report must not become the permanent one ----
+  # Every attempt can leave a marker-less file behind (killed mid-write, each time), and
+  # nothing below removes it. The idempotency guard at the top of run() tests `-s` alone,
+  # so the very next launchd catch-up trigger would see a non-empty report, log "nothing
+  # to do", and return — the multi-trigger retry design silently disarmed by the file it
+  # exists to replace, with a half-written report standing as the day's output forever.
+  # That is the same "non-empty is not complete" error as the other three consumers, at a
+  # fourth site, and it is the one that makes the mistake permanent rather than one-night.
+  #
+  # Move it aside rather than delete it: it may hold most of a report, and a partial
+  # report is worth reading even though it must not block a retry. The stub written when
+  # COUNT=0 returns long before this line, so it is never affected.
+  if [ -f "$REPORT_PATH" ] && ! report_complete; then
+    PARTIAL_REPORT="$REPORT_PATH.partial-$(date +%s)"
+    if mv "$REPORT_PATH" "$PARTIAL_REPORT"; then
+      log "WARNING: every L2 attempt left an incomplete report; moved it to $PARTIAL_REPORT so a later trigger retries this date"
+    else
+      log "WARNING: an incomplete report is at $REPORT_PATH and could not be moved aside; later triggers will treat this date as done"
+    fi
+  fi
 
   if [ -f "$REPORT_PATH" ]; then
     log "report bytes: $(wc -c < "$REPORT_PATH" | tr -d ' ')"
