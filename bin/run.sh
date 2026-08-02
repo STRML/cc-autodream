@@ -527,6 +527,35 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
   ' _ {}
 }
 
+# Dates in the trailing window whose findings were produced but never assembled into a
+# complete report (#36). Echoes a comma-separated list, empty when there are none.
+#
+# The completeness test is the open-questions marker, not `-s`, for the same reason every
+# other consumer uses it: a report killed mid-write is not a report. TARGET_DATE is skipped
+# because this run is about to assemble it, and a stub findings dir left by an earlier
+# attempt at the same date would otherwise report itself as a failure.
+unassembled_dates() {
+  local window="${AUTODREAM_UNASSEMBLED_WINDOW:-7}" root="$AUTODREAM_DIR/findings"
+  local d date_label report found out=""
+  [ -d "$root" ] || return 0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    date_label=$(basename "$d")
+    [ "$date_label" = "$TARGET_DATE" ] && continue
+    # Findings JSONs only. A dir holding nothing but *.stats.json sidecars was never
+    # triaged, so it has nothing to assemble and is not a failure.
+    found=$(find "$d" -maxdepth 1 -type f -name '*.json' ! -name '*.stats.json' 2>/dev/null | head -1)
+    [ -n "$found" ] || continue
+    report="$DREAMS_DIR/$date_label.md"
+    if [ -s "$report" ] && grep -q 'autodream:open-questions=' "$report" 2>/dev/null; then
+      continue
+    fi
+    out="${out:+$out, }$date_label"
+  done < <(find "$root" -maxdepth 1 -type d -name '2[0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]' 2>/dev/null \
+    | sort | tail -n "$window")
+  printf '%s' "$out"
+}
+
 run() {
   log "===== autodream start: $(date) ====="
   log "runner: $RUNNER_COMMIT$([ "$RUNNER_DIRTY" = "yes" ] && echo " (dirty)")"
@@ -537,6 +566,23 @@ run() {
   log "claude:      $CLAUDE_BIN"
 
   [ -x "$CLAUDE_BIN" ] || { log "FATAL: claude not at $CLAUDE_BIN"; exit 1; }
+
+  # ---- Dates that were triaged but never assembled (#36) ----
+  # A run killed during L2 leaves a full findings dir and no report, and nothing notices:
+  # notify.sh never runs, so there is not even a quiet banner. 2026-07-26 sat that way for
+  # two days and was found during an unrelated investigation; 2026-08-01 did it again.
+  # The catch-up triggers cannot cover it — launchd will not start a second instance of a
+  # label that is already running, so a run slow enough to span its own catch-up window
+  # turns those triggers into nothing at all.
+  #
+  # Recovery is cheap whenever the findings survive (`autodream-now.sh <date>` skips
+  # straight to L2), so the gap was never the data. It was that nobody was told. This says
+  # so in the log and in run-stats.txt, which puts it in the next morning's report.
+  UNASSEMBLED=$(unassembled_dates)
+  if [ -n "$UNASSEMBLED" ]; then
+    log "WARNING: these dates have findings but no complete report: $UNASSEMBLED"
+    log "         rebuild one cheaply with: $AUTODREAM_DIR/autodream-now.sh <date>"
+  fi
 
   # ---- Idempotency guard: a finished report means we're done ----
   # A report is only written after a successful L2, so its presence means the date is
@@ -837,6 +883,10 @@ PY
     printf 'overlap_measured: %s\n' "$([ "$OVERLAP_MEASURED" = "1" ] && echo yes || echo no)"
     printf 'overlap_events: %s\n' "$OVERLAP_EVENTS"
     printf 'sessions_with_overlap: %s\n' "$SESSIONS_WITH_OVERLAP"
+    # Other dates that were triaged and never assembled (#36). Empty means none in the
+    # window, which is the reading that matters — this is the key that gets a killed run
+    # noticed the next morning instead of during an unrelated investigation two days on.
+    printf 'unassembled_dates: %s\n' "${UNASSEMBLED:-}"
   } > "$FINDINGS_DIR/run-stats.txt"
 
   # ---- Upstream changelog window (writes changelog-window.md for L2 to read) ----
@@ -862,6 +912,21 @@ PY
   else
     log "x-bookmarks.sh not found at $XBOOKMARKS; skipping bookmark collection"
   fi
+
+  # ---- Was the queryId scraping walk actually exercised tonight? (#38) ----
+  # The walk against X's JS bundle is the one part of the fetcher with no test, and the
+  # part most likely to break, since it turns on X's bundle layout rather than on anything
+  # here. A cached id produces a working fetch without proving the walk still works, so
+  # `cache` and `fresh` have to be told apart or a walk that stopped working stays hidden
+  # until the cache expires. Appended rather than written above because the collector that
+  # knows the answer runs after run-stats.txt is closed; the key is always emitted so a
+  # consumer never has to handle it being absent.
+  XQID_SOURCE=not_attempted
+  if [ -s "$FINDINGS_DIR/x-bookmarks-queryid.txt" ]; then
+    XQID_SOURCE=$(tr -d '[:space:]' < "$FINDINGS_DIR/x-bookmarks-queryid.txt")
+    [ -n "$XQID_SOURCE" ] || XQID_SOURCE=not_attempted
+  fi
+  printf 'x_queryid_source: %s\n' "$XQID_SOURCE" >> "$FINDINGS_DIR/run-stats.txt"
 
   # ---- Layer 2: opus aggregate, retried until a report lands ----
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
@@ -985,21 +1050,39 @@ PY
     fi
   fi
 
+  # ---- Retire the copies this date no longer needs, and name the ones it keeps ----
+  # This has to sit outside the `-f "$REPORT_PATH"` test below. A successful partial move
+  # leaves that path gone, so the stale copy went unmentioned in the one outcome where the
+  # user most needs to be told where their last good report went.
+  #
+  # The moved-aside copy was insurance against this rebuild producing nothing. A complete
+  # report means the insurance has expired, and dropping it is what stops every --force
+  # rebuild from leaving another .stale-<epoch> file in the dreams dir forever. Only a
+  # COMPLETE report supersedes the old one; a truncated file is not a rebuild.
+  if [ -n "${STALE_REPORT:-}" ] && [ -s "$STALE_REPORT" ]; then
+    if report_complete; then
+      rm -f "$STALE_REPORT" && log "rebuild succeeded; discarded the superseded report copy"
+    else
+      log "this run produced no complete report; the previous one for $TARGET_DATE is still at $STALE_REPORT"
+    fi
+  fi
+
+  # Partials are prefixes of a report that now exists in full, so a complete report
+  # supersedes every one of them for this date — including partials from earlier nights,
+  # which is the case the .stale-* rule above can never reach because it only knows about
+  # the copy this run made. Without this they pile up in the dreams dir with nothing to
+  # ever remove them.
+  if report_complete; then
+    for partial in "$REPORT_PATH".partial-*; do
+      [ -e "$partial" ] || continue
+      if rm -f "$partial"; then log "discarded superseded partial report $partial"; fi
+    done
+  elif [ -n "${PARTIAL_REPORT:-}" ] && [ -s "$PARTIAL_REPORT" ]; then
+    log "the incomplete report for $TARGET_DATE is readable at $PARTIAL_REPORT"
+  fi
+
   if [ -f "$REPORT_PATH" ]; then
     log "report bytes: $(wc -c < "$REPORT_PATH" | tr -d ' ')"
-
-    # The moved-aside copy was insurance against this rebuild producing nothing. A report
-    # exists, so the insurance has expired. Dropping it here is what stops every --force
-    # rebuild from leaving another .stale-<epoch> file in the dreams dir forever; the
-    # failure branch below keeps it instead and says where it is.
-    # Only a COMPLETE report supersedes the old one. A truncated file is not a rebuild.
-    if [ -n "${STALE_REPORT:-}" ] && [ -s "$STALE_REPORT" ]; then
-      if report_complete; then
-        rm -f "$STALE_REPORT" && log "rebuild succeeded; discarded the superseded report copy"
-      else
-        log "this run's report is incomplete; keeping the previous one at $STALE_REPORT"
-      fi
-    fi
 
     # ---- Drop open-questions file into Sublime (no-op if zero questions) ----
     if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
@@ -1085,16 +1168,32 @@ PY
       fi
     fi
   else
+    # Where the recoverable copies are was already logged above, in the one block that
+    # runs whether or not this path still holds a file.
     log "WARNING: no report at $REPORT_PATH"
-    # This is the case the move-aside existed for. Keep the copy and say where it is.
-    if [ -n "${STALE_REPORT:-}" ] && [ -s "$STALE_REPORT" ]; then
-      log "previous report for $TARGET_DATE is untouched and recoverable at $STALE_REPORT"
-    fi
   fi
 
   log "===== autodream end: $(date) ====="
   return $L2_RC
 }
 
-run 2>&1 | tee -a "$RUN_LOG"
-exit ${PIPESTATUS[0]}
+# ---- The logger must not be able to take the run down with it ----
+# `run 2>&1 | tee -a "$RUN_LOG"` turns every log line into a write to a pipe, so whatever
+# kills tee kills the run on its very next log call — by SIGPIPE, with no error line,
+# before the L2 retry loop, the move-aside blocks, or the consume gate are ever reached.
+# Three runs on 2026-08-02 died exactly there and left 2026-08-01 with no report at all:
+# `Terminated: 15` on tee, `Broken pipe: 13` on run, and a log ending mid-sentence at
+# "L2 aggregation attempt 1/3...". Every recovery path in this script assumes it gets to
+# run, and a logger that can revoke that assumption defeats all of them at once.
+#
+# A file has no reader to lose, so that is where an unattended run writes. Ignoring
+# SIGPIPE covers the interactive path too, where tee is still worth having and a closed
+# terminal should cost the run its output rather than its life.
+trap '' PIPE
+if [ -t 1 ]; then
+  run 2>&1 | tee -a "$RUN_LOG"
+  exit "${PIPESTATUS[0]}"
+fi
+echo "autodream: logging to $RUN_LOG"
+run >> "$RUN_LOG" 2>&1
+exit $?

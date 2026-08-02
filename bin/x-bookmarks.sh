@@ -117,6 +117,15 @@ REAUTH_HINT="Open x.com logged in, DevTools > Application > Cookies > https://x.
 fail() { printf '%s' "$1" > "$FAIL_FILE"; return 1; }
 fail_reason() { cat "$FAIL_FILE" 2>/dev/null; }
 
+# Whether the queryId came from the cache or a fresh scrape of X's bundle (#38). Same file
+# trick and the same reason: get_query_id runs inside a command substitution. Without this
+# a night that reused a cached id is indistinguishable from one that proved the scraping
+# walk still works, and the walk is the part most likely to break, because it depends on
+# X's bundle layout rather than on anything here.
+QID_SOURCE_FILE="$TMP/queryid-source"
+printf 'not_attempted' > "$QID_SOURCE_FILE"   # no credentials, so the walk never ran
+qid_source() { cat "$QID_SOURCE_FILE" 2>/dev/null; }
+
 # ---- credentials ----
 
 load_creds() {
@@ -246,9 +255,14 @@ detect_query_id() {
 get_query_id() {
   if [ -s "$QID_CACHE" ]; then
     local age; age=$(( $(date +%s) - $(stat -f '%m' "$QID_CACHE" 2>/dev/null || echo 0) ))
-    if [ "$age" -lt "$QUERYID_TTL" ]; then cat "$QID_CACHE"; return 0; fi
+    if [ "$age" -lt "$QUERYID_TTL" ]; then
+      printf 'cache' > "$QID_SOURCE_FILE"
+      cat "$QID_CACHE"; return 0
+    fi
   fi
-  local qid; qid=$(detect_query_id) || return 1
+  local qid
+  if ! qid=$(detect_query_id); then printf 'failed' > "$QID_SOURCE_FILE"; return 1; fi
+  printf 'fresh' > "$QID_SOURCE_FILE"
   mkdir -p "$STATE_DIR" && printf '%s' "$qid" > "$QID_CACHE"
   printf '%s' "$qid"
 }
@@ -393,6 +407,17 @@ collect() {
   local findings="$1"
   [ -n "$findings" ] || { echo "usage: x-bookmarks.sh collect <findings-dir>" >&2; exit 2; }
   mkdir -p "$findings"
+  collect_bookmarks "$findings"
+  local rc=$?
+  # Stamped on every path, including the ones that returned early, because "the walk did
+  # not run tonight" is exactly the state this exists to make visible (#38). run.sh reads
+  # it back into run-stats.txt.
+  printf '%s\n' "$(qid_source)" > "$findings/x-bookmarks-queryid.txt"
+  return $rc
+}
+
+collect_bookmarks() {
+  local findings="$1"
   local out="$findings/x-bookmarks.md" manifest="$findings/x-bookmarks-manifest.txt"
   : > "$manifest"
 

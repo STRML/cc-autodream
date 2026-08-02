@@ -77,6 +77,14 @@ run.sh handles it with:
 
 `net_up` checks reachability of `api.anthropic.com` (any HTTP code beats `000`). Disable the wait with `AUTODREAM_NETCHECK=0` (tests set this).
 
+### The logger could kill the run, and did (2026-08-02)
+
+Every recovery path above assumes it gets to run. `run 2>&1 | tee -a "$RUN_LOG"` quietly revoked that assumption for all of them at once: it made each log line a write to a pipe, so whatever killed `tee` killed the run by SIGPIPE on the next `log` call. Three runs died there on 2026-08-02 — two scheduled, one detached, so launchd was not the cause — and 2026-08-01 ended with no report at all. The signature is a run log that stops mid-sentence at `L2 aggregation attempt 1/3...` and a `Terminated: 15` on tee beside a `Broken pipe: 13` on run in the launchd stderr. Nothing else says anything, because the thing that would have said it is what died.
+
+The fix is that an unattended run writes to the file directly (a file has no reader to lose) and `trap '' PIPE` covers the interactive path, where `tee` is still worth having. A closed terminal now costs the run its output rather than its life. `test_dead_stdout_does_not_kill_the_run` pins it by piping a real run into a reader that closes immediately.
+
+What still has no root cause is who SIGTERMs `tee`. It was not `claude --print` signalling its process group (tested directly: a sibling `sleep` survives a worker call), it was not sleep (`pmset -g log` shows the Mac awake), and it was not launchd (the detached run died the same way). The run no longer cares, which is the point, but the signal source is worth naming if it ever shows up somewhere that does.
+
 ## Upstream changelog window
 
 `changelog_window()` clones/pulls `anthropics/claude-code` into `cache/claude-code` and runs `git log -p` on `CHANGELOG.md` over `[TARGET_DATE, NEXT_DATE)` (real commit dates; the raw CHANGELOG has no dates, the git history does). The inserted lines go to `changelog-window.md`, which L2 reads for the "Upstream Claude Code changes" report section. Any git failure writes a note and never aborts the run. There is no remote `git blame`; that is why we keep a persistent local clone.
@@ -110,6 +118,8 @@ It didn't until this feature; only `review.sh` did, which was fine while every k
 - **Publishing is not consuming.** Copying the report into the vault stays outside the date gate; only `archive` and `mark-read` destroy the user's only copy.
 - **A failed move-aside must disarm consuming, not warn.** The first version logged a warning and carried on when the `mv` failed, which puts you back in exactly the state the move exists to prevent: a stale report at `$REPORT_PATH` that a failed L2 lets both the retry loop and the consume gate mistake for fresh output. `CONSUME_SAFE=0` turns the whole consume phase off for that run. A guard whose failure path continues is not a guard.
 
+The copies those moves leave behind are retired by one block that sits *outside* the `-f "$REPORT_PATH"` test, and it has to (#40). A successful `.partial-*` move deletes that path, so anything nested under that test was skipped in exactly the outcome where the user most needs to be told where their last good report went. A complete report supersedes every `.partial-*` for its date, including ones from earlier nights, since a partial is a prefix of a report that now exists in full.
+
 Credentials never go in `argv`. `-H "cookie: auth_token=…"` puts a full account-takeover token in the process list for the life of the request, readable by anything running as the same user, and the nightly run makes several of these unattended. `x-bookmarks.sh` writes them to a 0600 `curl --config` file inside the per-run `$TMP` that the EXIT trap removes.
 
 `materialize()` calls **both** `brctl download` and `fileproviderctl materialize`. `brctl` predates the FileProvider migration and on current macOS often succeeds while doing nothing, which would silently reduce the iCloud wait to a passive timeout dressed up as a fetch.
@@ -132,6 +142,10 @@ The official API is not an option: `GET /2/users/:id/bookmarks` has never been o
 
 Two invariants keep this from ever costing a night's report: the script always exits 0, and it always writes its output file — including a "not configured" stub and a `# x-bookmarks: fetch failed — <reason>` header. `mark-read` runs only after a non-empty report, same reasoning as the note archive above: a bookmark stamped read by a run that produced nothing is a bookmark the user never gets an idea from.
 
+The queryId walk against X's JS bundle stays untested, and #38 closed on that rather than on a fixture. A fixture would assert that our regex matches a string we wrote, and would keep passing on the only day it mattered — the day X changes its chunk naming. A live canary was rejected too: it buys a few hours of notice over the nightly report, at the cost of an unattended job hitting a third party on a schedule. What shipped instead is `x_queryid_source` in `run-stats.txt` (`fresh` / `cache` / `failed` / `not_attempted`), because the one state nothing could see was `cache` — the fetch works, so the walk looks fine, while it may have rotted at any point since the last `fresh`. `x-bookmarks.sh` stamps it on every path via a file rather than a variable, for the reason the whole script does: `get_query_id` runs inside a command substitution.
+
+`bin/cookie-cadence.sh` (#39) answers how long a pasted cookie pair lasts, which is what decides whether automating the capture is worth its moving parts. Same shape as `oversized-gate.sh`: it recomputes from the `x-bookmarks.md` headers already on disk, makes no model calls, reads no credentials, and is safe to re-run. Two things in it are load-bearing rather than decorative. It counts only the 401/403 rejection and the login-page redirect as expiries — a dead network or a missing jq says nothing about the cookies, and folding those in would make a yearly chore read as a weekly one with no visible sign of the error. And a stretch of working nights with no expiry at the end of it is right-censored, so it is reported as a lower bound and never as a lifetime.
+
 ## Self-audit
 
 run.sh writes `run-stats.txt` (raw/excluded/triaged counts, L1 rounds/done/missing/err, elapsed). PROMPT.md's "Autodream self-audit" section reads it and is told to flag self-pollution regressions (excluded count climbing), pipeline-capacity problems (oversized transcripts that blow the token budget), retry/sleep health, and to propose concrete cc-autodream source fixes since the user authors the tool. It proposes; it does not edit cc-autodream source.
@@ -143,6 +157,12 @@ Two counters exist only to keep a broken measurement from looking like a real re
 The sidecar counter is deliberately one number rather than a flag per stat: a broken sidecar degrades several counters at once (the noise gate and the oversized gate both read the same file), so the failure is counted once and PROMPT.md caveats the affected keys. The oversized loop walks `sessions.txt` rather than the `*.stats.json` glob — a sidecar that was never written is absent from the glob, and the session it belonged to used to vanish from `oversized_total` silently. Sizes for those sessions fall back to `wc -c` on the transcript itself, which is exactly what `transcript_bytes` holds anyway, so the #12 gate keeps a truthful number instead of a clamped 0.
 
 The noise gate's own sidecar read still biases to triage on an unparseable sidecar and that stays — the cost is one wasted model call. What was missing there was never the behavior, only the signal.
+
+### Nobody was told (`unassembled_dates`)
+
+A run killed during L2 leaves a complete findings dir and no report, and every surface that would have said so is downstream of the death: `notify.sh` never runs, so there is not even a quiet banner. The catch-up triggers cannot cover it either, because launchd will not start a second instance of a label that is already running — a run slow enough to span its own catch-up window converts those triggers into nothing at all. 2026-07-26 sat unassembled for two days and was found during an unrelated investigation; 2026-08-01 repeated it.
+
+`unassembled_dates()` sweeps the trailing week at the top of `run()` — deliberately *above* the idempotency guard, so a catch-up trigger that no-ops for today still reports older abandoned dates. It lists dates holding findings JSONs (sidecar-only dirs were never triaged and are not failures) whose report is missing or marker-less, and the result goes to the log and to `run-stats.txt`, which puts it in the next morning's report. The data was never the problem: `autodream-now.sh <date>` rebuilds one in minutes because the findings survive and it skips straight to L2.
 
 ### Which code actually ran (`runner_commit`)
 
@@ -182,6 +202,8 @@ When you (the agent) need to kick off a run, prefer this over a background Bash 
 The suite pins `AUTODREAM_CONFIG` into its sandbox now that `run.sh` sources the config. Without that pin, a developer whose real config points `AUTODREAM_VAULT_DIR` at a live Obsidian vault would have the test suite writing notes and reports into it. `MOCK_MODE=l2_fail` makes the aggregator write nothing and exit 1, which is how the "don't archive an unread note" guard is tested; pair it with `AUTODREAM_L2_ATTEMPTS=1` so the test doesn't sit through the retry loop.
 
 `tests/x-bookmarks.sh` covers the bookmark fetcher with `curl` shimmed and the queryId cache pre-seeded, so nothing touches X. The bundle-scraping walk is untested on purpose — it runs against a live third party and a fake proves nothing about it. Everything downstream of the HTTP call is pinned hard, because that is where both development bugs lived: the emit came out oldest-first (it trusted file order, which is only chronological within one run), and `mark-read` silently no-opped on every row (`$ids | index(.id)` rebinds `.` to the array before `.id` is read, so it indexed an array with a string). Neither showed up in a smoke test and both would have quietly wasted the feature.
+
+`tests/cookie-cadence.sh` pins `bin/cookie-cadence.sh`'s classification against every header shape the fetcher writes. Fixtures rather than a smoke test, because a misclassification produces a number that looks exactly as authoritative as a correct one.
 
 `tests/review-skip.sh` covers `bin/review.sh`'s skip/launch decision against fixture reports, with an inline mock claude that just touches a marker file — if the marker exists, review.sh reached `exec claude`. It pins `AUTODREAM_CONFIG` to a nonexistent path so the host's own config (`AUTODREAM_TRIAGE_SURFACE=cmux`) can't leak in and spawn a real workspace mid-test. Run it after any review.sh change, and after changing PROMPT.md's Open-questions marker contract.
 
