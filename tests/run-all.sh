@@ -335,6 +335,36 @@ test_unmovable_stale_report_disarms_consuming(){
   rm -rf "$root"
 }
 
+test_partial_report_does_not_consume(){
+  echo "# regression: a truncated report must not satisfy the retry break or the consume gate"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" survives-truncation "a half-written report must not consume this"
+  # l2_partial writes a non-empty report with no open-questions marker — what a mid-write
+  # kill leaves. `-s` alone cannot tell it from a good report.
+  export MOCK_MODE=l2_partial AUTODREAM_L2_ATTEMPTS=2
+  vault_run "$root"
+  unset MOCK_MODE AUTODREAM_L2_ATTEMPTS
+  assert_file "$root/vault/inbox/survives-truncation.md" "the note stayed in the inbox"
+  assert_no_file "$root/vault/processed/$DATE/survives-truncation.md" "the note was not archived"
+  assert_grep "$root/run.out" "no open-questions marker" "the run names the reason"
+  # It must also have RETRIED rather than accepting the partial file on attempt 1.
+  assert_grep "$root/run.out" "L2 aggregation attempt 2" "a truncated report triggers a retry"
+  rm -rf "$root"
+}
+
+test_partial_report_keeps_previous(){
+  echo "# regression: a truncated rebuild must not discard the previous good report"
+  local root; root=$(setup_env); mk_session "$root" s1
+  vault_run "$root"                                   # a good report lands
+  export MOCK_MODE=l2_partial AUTODREAM_FORCE=1 AUTODREAM_L2_ATTEMPTS=1
+  vault_run "$root"
+  unset MOCK_MODE AUTODREAM_FORCE AUTODREAM_L2_ATTEMPTS
+  ls "$root/dreams/$DATE.md.stale-"* >/dev/null 2>&1 \
+    && ok "the previous good report was kept" \
+    || no "the previous good report was discarded for a truncated one"
+  rm -rf "$root"
+}
+
 test_old_date_reprocess_does_not_consume(){
   echo "# regression: reprocessing an old date must not consume today's pending input"
   local root; root=$(setup_env); mk_session "$root" s1
@@ -1455,6 +1485,8 @@ test_notes_placeholder_and_real_file_counted_once
 test_notes_expiry_uses_report_date
 test_force_rebuild_failed_l2_does_not_consume
 test_unmovable_stale_report_disarms_consuming
+test_partial_report_does_not_consume
+test_partial_report_keeps_previous
 test_old_date_reprocess_does_not_consume
 test_config_unbound_var_does_not_kill_run
 echo

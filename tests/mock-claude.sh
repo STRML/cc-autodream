@@ -58,7 +58,17 @@ else
     echo "mock: aggregator failed" >&2
     exit 1
   fi
-  printf '# Autodream — mock\n\nmock aggregate report\n' > "$rep"
+  # l2_partial: a NON-EMPTY report with no open-questions marker — what a mid-write kill
+  # leaves behind. `-s` cannot tell this from a good report, which is why run.sh checks
+  # for the marker instead.
+  if [ "$mode" = "l2_partial" ]; then
+    printf '# Autodream — mock\n\n## Top patterns\n\n1. truncated mid-w' > "$rep"
+    echo "mock: partial write"
+    exit 0
+  fi
+  # The open-questions marker is part of the real contract (PROMPT.md mandates it) and
+  # run.sh now treats its absence as a truncated write, so the mock must emit it too.
+  printf '# Autodream — mock\n\nmock aggregate report\n\n<!-- autodream:open-questions=0 -->\n' > "$rep"
   echo "report: $rep"
   echo "mock: 1 session reviewed, 0 findings, 0 edits"
 fi

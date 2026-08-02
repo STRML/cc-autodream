@@ -311,7 +311,13 @@ publish() {
 # ---- status ----
 
 status() {
-  printf 'notes file:  %s%s\n' "$NOTES_FILE" "$([ -s "$NOTES_FILE" ] && printf ' (%s line notes)' "$(grep -c '^- \[' "$NOTES_FILE" 2>/dev/null || echo 0)" || printf ' (absent/empty)')"
+  # Same `grep -c` trap collect() hit: zero matches print 0 AND exit 1, so a `|| echo 0`
+  # fallback fires as well and the count becomes "0\n0". Harmless here (status only
+  # prints it) but it printed nonsense on exactly the header-only notes.md that broke
+  # collect, which is the confusing case to be looking at status for.
+  local n; n=$(grep -c '^- \[' "$NOTES_FILE" 2>/dev/null) || true
+  [ -n "${n:-}" ] || n=0
+  printf 'notes file:  %s%s\n' "$NOTES_FILE" "$([ -s "$NOTES_FILE" ] && printf ' (%s line notes)' "$n" || printf ' (absent/empty)')"
   if [ -z "$VAULT_DIR" ]; then
     printf 'vault:       not configured (set AUTODREAM_VAULT_DIR in %s/config)\n' "$AUTODREAM_DIR"
     return 0
