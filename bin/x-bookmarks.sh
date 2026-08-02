@@ -60,13 +60,19 @@ AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 # Source the config here too, not only in run.sh — `status` is meant to be run by hand
 # and has to see the same settings the nightly run does. Harmless when run.sh already
 # sourced it: those values arrive exported, and the snapshot replay keeps them winning.
+# `set +u` around the source for the same reason run.sh does it: this script runs under
+# nounset, and a single typo'd variable reference in the user-edited config would
+# otherwise abort it outright before it could write its output file. run.sh already
+# warns about the typo, so stay quiet here rather than complaining twice per run.
 AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$AUTODREAM_DIR/config}"
 if [ -f "$AUTODREAM_CONFIG" ]; then
   _env_snapshot=$(export -p)
+  set +u
   set -a
   # shellcheck disable=SC1090
   . "$AUTODREAM_CONFIG" 2>/dev/null || true
   set +a
+  set -u
   eval "$_env_snapshot"
   unset _env_snapshot
 fi
@@ -96,10 +102,20 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/xbm.XXXXXX")"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
-FAIL_REASON=""     # non-empty once anything has gone wrong; drives the output header
+# The failure reason goes to a FILE, not a variable, and that is load-bearing. The
+# queryId stage is reached through nested command substitutions (`qid=$(get_query_id)`,
+# which itself runs `qid=$(detect_query_id)`), and each of those forks a subshell whose
+# variable writes are thrown away. A plain `FAIL_REASON=...` inside detect_query_id
+# therefore never reaches the caller — so the single most important message this script
+# produces, "your cookies expired, here is how to re-paste them", arrived as an empty
+# string and the report told the user a fetch had failed for no stated reason. A file
+# crosses the subshell boundary; a variable does not.
+FAIL_FILE="$TMP/fail-reason"
+: > "$FAIL_FILE"
 REAUTH_HINT="Open x.com logged in, DevTools > Application > Cookies > https://x.com, copy auth_token and ct0, and rewrite $CREDS_FILE."
 
-fail() { FAIL_REASON="$1"; return 1; }
+fail() { printf '%s' "$1" > "$FAIL_FILE"; return 1; }
+fail_reason() { cat "$FAIL_FILE" 2>/dev/null; }
 
 # ---- credentials ----
 
@@ -292,23 +308,41 @@ fetch_new() {
   return 0
 }
 
-# Append genuinely-new records to the state file. Atomic: a crash mid-write must not
-# leave a truncated seen.jsonl, which would re-surface every bookmark as unread.
+# Append genuinely-new records to the state file.
+#
+# The temp file lives in STATE_DIR, not in $TMP. $TMP is a mktemp -d under TMPDIR, which
+# on macOS is a different filesystem, so `mv` from there is a copy-then-unlink rather than
+# a rename — precisely NOT the atomic swap the old comment claimed. Same directory means a
+# real rename, and the mv is gated on the copy having actually succeeded: a truncated
+# seen.jsonl silently re-surfaces every lost bookmark as unread, so the next report
+# re-serves posts the user has already been shown.
 merge_state() {
   mkdir -p "$STATE_DIR"
   [ -f "$SEEN" ] || : > "$SEEN"
-  local tmp="$TMP/seen.new"
-  cat "$SEEN" > "$tmp"
+  local tmp="$STATE_DIR/.seen.jsonl.new.$$"
+  if ! cat "$SEEN" > "$tmp"; then
+    rm -f "$tmp"
+    echo "x-bookmarks: could not stage a state update; leaving seen.jsonl untouched" >&2
+    return 1
+  fi
+  # Ids accepted during THIS run. Dedupe used to consult only $SEEN, which is the state
+  # as it was before the run — so when X's cursor pagination returned the same post on
+  # two pages (it does; the timeline shifts between requests, which is why paging is
+  # paced at all) neither copy was in $SEEN and both got written. One bookmark, two rows,
+  # shown twice in the report and eating two of the MAX_UNREAD slots.
+  local accepted="$TMP/accepted-ids"; : > "$accepted"
   if [ -s "$TMP/new.jsonl" ]; then
     local line id
     while IFS= read -r line; do
       id=$(printf '%s' "$line" | jq -r '.id' 2>/dev/null)
       [ -n "$id" ] || continue
+      grep -qxF "$id" "$accepted" 2>/dev/null && continue
+      printf '%s\n' "$id" >> "$accepted"
       jq -e --arg id "$id" 'select(.id == $id)' "$SEEN" >/dev/null 2>&1 && continue
       printf '%s\n' "$line" >> "$tmp"
     done < "$TMP/new.jsonl"
   fi
-  mv "$tmp" "$SEEN"
+  mv "$tmp" "$SEEN" || { rm -f "$tmp"; echo "x-bookmarks: state update failed; seen.jsonl unchanged" >&2; return 1; }
 }
 
 # ---- collect ----
@@ -325,8 +359,8 @@ collect() {
     2) printf '# x-bookmarks: not configured (no credentials at %s)\n' "$CREDS_FILE" > "$out"
        echo "x-bookmarks: not configured; skipping"
        return 0 ;;
-    1) printf '# x-bookmarks: fetch failed — %s\n' "$FAIL_REASON" > "$out"
-       echo "x-bookmarks: $FAIL_REASON"
+    1) printf '# x-bookmarks: fetch failed — %s\n' "$(fail_reason)" > "$out"
+       echo "x-bookmarks: $(fail_reason)"
        return 0 ;;
   esac
   warn_perms
@@ -336,10 +370,10 @@ collect() {
     # they are already on disk and the model can still use them. Only say "failed" when
     # there is also nothing to show.
     merge_state
-    if ! emit_unread "$out" "$manifest" "$FAIL_REASON"; then
-      printf '# x-bookmarks: fetch failed — %s\n' "$FAIL_REASON" > "$out"
+    if ! emit_unread "$out" "$manifest" "$(fail_reason)"; then
+      printf '# x-bookmarks: fetch failed — %s\n' "$(fail_reason)" > "$out"
     fi
-    echo "x-bookmarks: $FAIL_REASON"
+    echo "x-bookmarks: $(fail_reason)"
     return 0
   fi
 
@@ -392,7 +426,9 @@ mark_read() {
   [ -s "$manifest" ] || { echo "x-bookmarks: nothing to mark read"; return 0; }
   [ -s "$SEEN" ] || return 0
 
-  local tmp="$TMP/seen.read" ids
+  # Staged inside STATE_DIR so the mv below is a same-filesystem rename, not a copy —
+  # same reasoning as merge_state.
+  local tmp="$STATE_DIR/.seen.jsonl.read.$$" ids
   ids=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$manifest" 2>/dev/null) || ids='[]'
   # `.id` is bound to $i BEFORE the pipe into $ids. Inside `$ids | index(.id)` the `.`
   # has already been rebound to the array, so `.id` indexes the array with a string and
@@ -402,9 +438,10 @@ mark_read() {
         | if (.read_on == null) and (($ids | index($i)) != null)
           then .read_on = $today else . end
       ' "$SEEN" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-    mv "$tmp" "$SEEN"
+    mv "$tmp" "$SEEN" || { rm -f "$tmp"; echo "x-bookmarks: read-state update failed; they stay unread" >&2; return 0; }
     echo "x-bookmarks: marked $(wc -l < "$manifest" | tr -d ' ') bookmark(s) read"
   else
+    rm -f "$tmp"
     echo "x-bookmarks: could not update read state (leaving them unread)" >&2
   fi
   return 0
@@ -422,7 +459,7 @@ status() {
   if load_creds; then
     printf 'keys:        X_AUTH_TOKEN and X_CT0 both set\n'
   else
-    printf 'keys:        INCOMPLETE — %s\n' "$FAIL_REASON"
+    printf 'keys:        INCOMPLETE — %s\n' "$(fail_reason)"
     return 0
   fi
   if [ -s "$SEEN" ]; then
@@ -440,11 +477,37 @@ status() {
   fi
 }
 
-command -v jq >/dev/null 2>&1 || { echo "x-bookmarks.sh needs jq" >&2; exit 0; }
+# A missing jq must NOT short-circuit the dispatch below. It used to `exit 0` right here,
+# which broke the one invariant everything downstream leans on: collect always writes its
+# output file. run.sh's `|| log` never fired (the exit status was 0) and PROMPT.md treats
+# an absent file as "feature not enabled, do not mention it" — so a user with working
+# credentials and bookmarks piling up saw the section silently vanish from every report,
+# with nothing anywhere distinguishing "off" from "broken". run.sh builds the launchd
+# agent's PATH itself, so jq going missing there is a real configuration, not a theory.
+# Report it the same way every other failure is reported: as the content of the file.
+HAVE_JQ=1
+command -v jq >/dev/null 2>&1 || HAVE_JQ=0
 
 case "${1:-}" in
-  collect)   shift; collect "${1:-}" ;;
-  mark-read) shift; mark_read "${1:-}" ;;
-  status)    status ;;
+  collect)
+    shift
+    if [ "$HAVE_JQ" = "0" ]; then
+      findings="${1:-}"
+      [ -n "$findings" ] || { echo "usage: x-bookmarks.sh collect <findings-dir>" >&2; exit 2; }
+      mkdir -p "$findings"
+      : > "$findings/x-bookmarks-manifest.txt"
+      printf '# x-bookmarks: fetch failed — jq is not installed or not on PATH, so bookmarks cannot be parsed\n' \
+        > "$findings/x-bookmarks.md"
+      echo "x-bookmarks: jq not found; wrote a failure stub" >&2
+      exit 0
+    fi
+    collect "${1:-}" ;;
+  mark-read)
+    shift
+    [ "$HAVE_JQ" = "1" ] || { echo "x-bookmarks: jq not found; cannot update read state (they stay unread)" >&2; exit 0; }
+    mark_read "${1:-}" ;;
+  status)
+    [ "$HAVE_JQ" = "1" ] || printf 'jq:          NOT FOUND — the feature cannot run without it\n'
+    status ;;
   *) echo "usage: x-bookmarks.sh {collect <findings-dir>|mark-read <findings-dir>|status}" >&2; exit 2 ;;
 esac

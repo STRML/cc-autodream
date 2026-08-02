@@ -90,6 +90,7 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # Individual tests override this by exporting AUTODREAM_CONFIG before calling.
   AUTODREAM_GC=0 AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" CLAUDE_BIN="$MOCK" \
   AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
+  AUTODREAM_CONSUME_DATE="${AUTODREAM_CONSUME_DATE:-$DATE}" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
   PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
@@ -233,6 +234,113 @@ test_config_env_wins_over_config(){
   local f; f="$(fdir "$root")/operator-notes.md"
   assert_grep   "$f" "the env-chosen vault"    "the environment's vault was read"
   assert_nogrep "$f" "the config-chosen vault" "the config's vault was overridden"
+  rm -rf "$root"
+}
+
+# ---- Regressions from the PR #37 review -------------------------------------------
+# Every one of these had a reproducer in the review and no test. They are grouped here
+# rather than merged into the tests above because each pins a specific way the feature
+# lost the user's input silently.
+
+test_notes_header_only_file_does_not_abort(){
+  echo "# regression: a notes.md with no '- [' lines must not abort collect"
+  local root; root=$(setup_env); mk_session "$root" s1
+  # Exactly what autodream-note.sh leaves once the user deletes the notes a report told
+  # them were addressed. `grep -c` prints 0 AND exits 1, so a `|| echo 0` fallback made
+  # the count "0\n0" and the arithmetic killed the whole collect under set -e.
+  printf '# Operator notes for autodream\n\nFree-text notes.\n\n' > "$root/autodream/notes.md"
+  mk_vault_note "$root" survives "this note must still reach the model"
+  vault_run "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_file "$f" "operator-notes.md was still written"
+  assert_grep "$f" "active: 1" "the vault note was still counted"
+  assert_grep "$f" "this note must still reach the model" "the vault note still reached the model"
+  rm -rf "$root"
+}
+
+test_notes_icloud_placeholder_is_counted(){
+  echo "# regression: an iCloud placeholder is a missed note, not a clean zero"
+  local root; root=$(setup_env); mk_session "$root" s1
+  # An evicted note is NOT a zero-byte .md — the real file is gone and only the
+  # dot-prefixed placeholder remains, so the '*.md' walk matched nothing at all.
+  mkdir -p "$root/vault/inbox"; : > "$root/vault/inbox/.from-phone.md.icloud"
+  AUTODREAM_ICLOUD_WAIT=0 vault_run "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_grep "$f" "unreadable: 1" "the evicted note is counted, not reported as zero"
+  assert_grep "$f" "from-phone.md — UNREADABLE" "it is named so the user knows what was missed"
+  assert_file "$root/vault/inbox/.from-phone.md.icloud" "the placeholder stays for the next run"
+  rm -rf "$root"
+}
+
+test_notes_placeholder_and_real_file_counted_once(){
+  echo "# regression: a materialised note with a leftover placeholder is not double-counted"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" both "the real content"
+  : > "$root/vault/inbox/.both.md.icloud"
+  AUTODREAM_ICLOUD_WAIT=0 vault_run "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_grep "$f" "active: 1" "counted as one active note"
+  assert_grep "$f" "unreadable: 0" "not also counted as unreadable"
+  rm -rf "$root"
+}
+
+test_notes_expiry_uses_report_date(){
+  echo "# regression: expiry is judged against the reported date, not today"
+  local root; root=$(setup_env); mk_session "$root" s1
+  # Expires long after the date being reported on ($DATE) but long before today, so a
+  # wall-clock comparison drops and archives a note that was active for this window.
+  mk_vault_note "$root" still-active "active during the reported window" 2020-06-01
+  vault_run "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_grep "$f" "active during the reported window" "the note is still shown to the model"
+  assert_grep "$f" "expired-and-dropped: 0" "it is not counted as expired"
+  rm -rf "$root"
+}
+
+test_force_rebuild_failed_l2_does_not_consume(){
+  echo "# regression: a stale report must not satisfy the consume gate under --force"
+  local root; root=$(setup_env); mk_session "$root" s1
+  vault_run "$root"                                    # first run succeeds, leaves a report
+  mk_vault_note "$root" written-later "must survive the failed rebuild"
+  # Rebuild with an L2 that writes nothing. The old report is still on disk, and it used
+  # to satisfy both the retry loop's break and the consume gate, so this note was
+  # archived having been read by nothing.
+  export MOCK_MODE=l2_fail AUTODREAM_FORCE=1 AUTODREAM_L2_ATTEMPTS=1
+  vault_run "$root"
+  unset MOCK_MODE AUTODREAM_FORCE AUTODREAM_L2_ATTEMPTS
+  assert_file "$root/vault/inbox/written-later.md" "the note stayed in the inbox"
+  assert_no_file "$root/vault/processed/$DATE/written-later.md" "the note was not archived"
+  ls "$root/dreams/$DATE.md.stale-"* >/dev/null 2>&1 \
+    && ok "the previous report was preserved, not destroyed" \
+    || no "the previous report was not preserved"
+  rm -rf "$root"
+}
+
+test_old_date_reprocess_does_not_consume(){
+  echo "# regression: reprocessing an old date must not consume today's pending input"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" todays-note "written this morning"
+  # TARGET_DATE is not the date a normal nightly run would process.
+  AUTODREAM_CONSUME_DATE=2099-01-01 vault_run "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_grep "$f" "written this morning" "the note is still collected as context for L2"
+  assert_file "$root/vault/inbox/todays-note.md" "but it is NOT archived out of the inbox"
+  assert_nonempty "$root/vault/reports/$DATE.md" "publishing still happens (it consumes nothing)"
+  rm -rf "$root"
+}
+
+test_config_unbound_var_does_not_kill_run(){
+  echo "# regression: a typo'd variable in the config must warn, not kill the run"
+  local root; root=$(setup_env); mk_session "$root" s1
+  # AUTODREAM_HOME does not exist; under `set -u` this used to abort bash outright,
+  # before the log file or log() existed, so the night produced nothing and said nothing.
+  printf 'X_CREDS_FILE=$AUTODREAM_HOME/x-credentials\nAUTODREAM_VAULT_DIR=%s/vault\n' "$root" > "$root/autodream/config"
+  mk_vault_note "$root" survives-typo "the run must still happen"
+  run_dream "$root"
+  assert_nonempty "$root/dreams/$DATE.md" "the run still produced a report"
+  assert_grep "$root/run.out" "unbound variable" "the bad config key is named in a warning"
+  assert_grep "$(fdir "$root")/operator-notes.md" "the run must still happen" \
+    "keys after the bad line still took effect"
   rm -rf "$root"
 }
 
@@ -1322,6 +1430,13 @@ test_notes_vault_report_published
 test_notes_vault_unreadable_note_stays
 test_config_file_sourced
 test_config_env_wins_over_config
+test_notes_header_only_file_does_not_abort
+test_notes_icloud_placeholder_is_counted
+test_notes_placeholder_and_real_file_counted_once
+test_notes_expiry_uses_report_date
+test_force_rebuild_failed_l2_does_not_consume
+test_old_date_reprocess_does_not_consume
+test_config_unbound_var_does_not_kill_run
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

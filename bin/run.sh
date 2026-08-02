@@ -62,15 +62,40 @@ AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 #
 # `set -a` around the source is the other half: the helper scripts below are separate
 # processes, so a config key that stays an unexported shell variable reaches nothing.
+#
+# This whole script runs under `set -u` (top of file), and sourcing a user-edited file
+# under nounset means ANY unbound reference in it (e.g. a typo'd
+# X_CREDS_FILE=$AUTODREAM_HOME/x-credentials, meaning AUTODREAM_DIR) aborts the shell
+# outright — before LOG_DIR or the log() function exist, so nothing reaches the run log
+# and no report is produced. The `|| echo WARNING ...` below can't catch that: nounset
+# kills the shell rather than making `.` return non-zero. run.sh never sourced this file
+# before the vault-notes feature, so a typo that used to be harmless now silently costs
+# a night. Two passes fix it without losing the config-key-name diagnostic:
+#   1. A throwaway subshell probe sources the config under the SAME `set -u` this
+#      script runs under, purely so bash's own error message (which names the exact
+#      unbound variable) can be surfaced as a WARNING. A subshell dying from `set -u`
+#      does not kill this shell, and nothing it does touches real state.
+#   2. The real source runs with nounset OFF, so a bad reference can't abort us — it
+#      degrades to an empty expansion for that one reference, and every other key
+#      (before or after the bad line) still gets set and exported normally.
 AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$AUTODREAM_DIR/config}"
 if [ -f "$AUTODREAM_CONFIG" ]; then
   _env_snapshot=$(export -p)
+
+  # shellcheck disable=SC1090
+  _config_probe_err=$(set -a; set -u; . "$AUTODREAM_CONFIG" 2>&1 1>/dev/null)
+  if [ -n "$_config_probe_err" ]; then
+    echo "WARNING: $AUTODREAM_CONFIG has an unbound variable reference (continuing without it): $_config_probe_err" >&2
+  fi
+
+  set +u
   set -a
   # shellcheck disable=SC1090
   . "$AUTODREAM_CONFIG" || echo "WARNING: failed to source $AUTODREAM_CONFIG (continuing)" >&2
   set +a
+  set -u
   eval "$_env_snapshot"
-  unset _env_snapshot
+  unset _env_snapshot _config_probe_err
 fi
 DREAMS_DIR="${DREAMS_DIR:-$HOME/.claude/dreams}"
 LOG_DIR="$AUTODREAM_DIR/logs"
@@ -841,6 +866,31 @@ PY
   fi
   log "L2 model: $AUTODREAM_L2_MODEL"
 
+  # ---- Move a stale report aside before attempting L2 ----
+  # The only way to reach this line with $REPORT_PATH already non-empty is
+  # AUTODREAM_FORCE=1 (the idempotency guard above returns early otherwise): a previous
+  # run of this same TARGET_DATE left a report on disk and we're rebuilding. Nothing
+  # below distinguishes "this run wrote it" from "it was already there" — the retry
+  # loop's `[ -s "$REPORT_PATH" ] && break` and the consume gate further down both just
+  # stat the path. Left in place, an old report satisfies BOTH: the retry loop stops
+  # after attempt 1 even though this run's L2 never wrote anything, and the consume
+  # gate then archives the vault note / marks bookmarks read as if something had
+  # actually read them. That's the exact overnight failure mode this script is built
+  # around (Mac sleeps mid-run, every L2 attempt fails) turning into silent,
+  # unrecoverable data loss for the user's notes and bookmarks. Move the old file aside
+  # first so `-s "$REPORT_PATH"` again means "this run produced it" for both checks.
+  # Moved aside, not deleted: if every L2 attempt below still fails, the user's last
+  # good report for this date must stay recoverable, not vanish.
+  if [ -s "$REPORT_PATH" ]; then
+    STALE_REPORT="$REPORT_PATH.stale-$(date +%s)"
+    if mv "$REPORT_PATH" "$STALE_REPORT"; then
+      log "existing report for $TARGET_DATE moved aside to $STALE_REPORT before rebuilding (AUTODREAM_FORCE=1)"
+    else
+      log "WARNING: could not move existing report aside; leaving it in place (AUTODREAM_FORCE=1 rebuild may be misreported as already done)"
+      STALE_REPORT=""
+    fi
+  fi
+
   L2_ATTEMPTS="${AUTODREAM_L2_ATTEMPTS:-3}"
   L2_START=$(date +%s)
   L2_RC=1
@@ -887,6 +937,14 @@ PY
   if [ -f "$REPORT_PATH" ]; then
     log "report bytes: $(wc -c < "$REPORT_PATH" | tr -d ' ')"
 
+    # The moved-aside copy was insurance against this rebuild producing nothing. A report
+    # exists, so the insurance has expired. Dropping it here is what stops every --force
+    # rebuild from leaving another .stale-<epoch> file in the dreams dir forever; the
+    # failure branch below keeps it instead and says where it is.
+    if [ -n "${STALE_REPORT:-}" ] && [ -s "$STALE_REPORT" ]; then
+      rm -f "$STALE_REPORT" && log "rebuild succeeded; discarded the superseded report copy"
+    fi
+
     # ---- Drop open-questions file into Sublime (no-op if zero questions) ----
     if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
       log "writing open-questions inbox file..."
@@ -898,13 +956,43 @@ PY
     # note or stamping a bookmark read after a run that produced nothing would throw away
     # the only copy of input the user cared about — the failure mode is silent and
     # unrecoverable, so the guard is stricter than the enclosing -f check.
+    #
+    # Also gated on TARGET_DATE being the date a normal nightly run would process
+    # (yesterday, right now — same computation the default at the top of this script
+    # uses). collect() above is date-agnostic: it reads whatever is CURRENTLY in the
+    # vault inbox and CURRENTLY unread, regardless of which date's findings dir it's
+    # writing into. That's exactly right when TARGET_DATE is tonight's date — but
+    # CLAUDE.md documents reprocessing an old one (AUTODREAM_FORCE=1 run.sh
+    # 2026-05-29), and archive/mark-read have no idea the date is old: a successful
+    # rebuild of 2026-05-29 would archive a note the user wrote THIS morning into
+    # processed/2026-05-29/ and stamp today's unread bookmarks read, and tonight's real
+    # run would then find an empty inbox and nothing unread — the note never reaches
+    # any report. Collection still runs unconditionally above, so L2 still SEES
+    # today's notes/bookmarks as context; only the consuming side is skipped for an
+    # old-date reprocess.
+    # AUTODREAM_CONSUME_DATE overrides which date counts as "the normal nightly one",
+    # authoritatively and with no fallback, for the same reason AUTODREAM_STATS_BIN and
+    # AUTODREAM_OVERLAP_BIN do: the suite pins a fixed historical TARGET_DATE, so without
+    # an override every consume path would take the skip branch and the tests that cover
+    # archiving would pass while asserting nothing.
+    NORMAL_TARGET_DATE="${AUTODREAM_CONSUME_DATE:-$(date -v-1d +%Y-%m-%d)}"
     if [ -s "$REPORT_PATH" ]; then
+      # Publishing is NOT a consuming step — it copies the report into the vault so it
+      # can be read on a phone, and a reprocessed date is exactly as worth reading as a
+      # fresh one. It stays outside the date gate; only archive and mark-read, which
+      # destroy the user's only copy of their input, are gated.
       if [ -x "$VAULT_NOTES" ]; then
-        "$VAULT_NOTES" archive "$FINDINGS_DIR" || log "vault note archive failed (notes stay in the inbox)"
         "$VAULT_NOTES" publish "$REPORT_PATH" || log "vault report publish failed (continuing)"
       fi
-      if [ -x "$XBOOKMARKS" ]; then
-        "$XBOOKMARKS" mark-read "$FINDINGS_DIR" || log "x-bookmark mark-read failed (they stay unread)"
+      if [ "$TARGET_DATE" = "$NORMAL_TARGET_DATE" ]; then
+        if [ -x "$VAULT_NOTES" ]; then
+          "$VAULT_NOTES" archive "$FINDINGS_DIR" || log "vault note archive failed (notes stay in the inbox)"
+        fi
+        if [ -x "$XBOOKMARKS" ]; then
+          "$XBOOKMARKS" mark-read "$FINDINGS_DIR" || log "x-bookmark mark-read failed (they stay unread)"
+        fi
+      else
+        log "target date $TARGET_DATE is not $NORMAL_TARGET_DATE (today's normal nightly date); skipping vault-notes archive and x-bookmark mark-read so today's inbox/unread bookmarks aren't consumed by this reprocess (still collected as L2 context)"
       fi
     fi
 
@@ -938,6 +1026,10 @@ PY
     fi
   else
     log "WARNING: no report at $REPORT_PATH"
+    # This is the case the move-aside existed for. Keep the copy and say where it is.
+    if [ -n "${STALE_REPORT:-}" ] && [ -s "$STALE_REPORT" ]; then
+      log "previous report for $TARGET_DATE is untouched and recoverable at $STALE_REPORT"
+    fi
   fi
 
   log "===== autodream end: $(date) ====="
