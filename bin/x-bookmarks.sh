@@ -1,0 +1,450 @@
+#!/usr/bin/env bash
+# x-bookmarks.sh — pull recent X bookmarks so the aggregator can turn them into ideas.
+#
+# WHY NOT THE OFFICIAL API
+#
+# `GET /2/users/:id/bookmarks` has never been on X's free tier and needs Basic at
+# $200/mo (checked 2026-08-02). So this speaks to the same internal web GraphQL
+# endpoint the bookmarks page itself calls, authenticated with cookies the user pastes
+# in once. That is the only mechanism that works, which is also why every browser
+# extension in this space does the same thing.
+#
+# GROUNDING
+#
+# The request contract below — endpoint shape, bearer token, headers, `features` and
+# `fieldToggles` payloads, the queryId discovery walk, and the response path — was taken
+# on 2026-08-02 from displace-agency/x-bookmarks-exporter (src/api.ts), a working
+# implementation, not from guesswork. Two things there are worth knowing when it breaks:
+#
+#   * The queryId in the URL path rotates whenever X deploys, so it is scraped from the
+#     live JS bundle rather than hardcoded, and cached for a day.
+#   * A wrong/stale `features` object comes back as HTTP 400 with a body that NAMES the
+#     missing feature flags. That error text is self-documenting: read it and add the
+#     named keys to FEATURES below. Do not go hunting.
+#
+# WHY IT CANNOT FAIL LOUDLY
+#
+# This runs inside the nightly pipeline. X changing a bundle path at 3am must not cost a
+# night's report, so every path here exits 0 and always writes the output file — the
+# failure IS the content, reported to the model as a `# x-bookmarks: fetch failed` header
+# that PROMPT.md knows how to render. Nothing about a bookmark is worth an exit code.
+#
+# READ STATE
+#
+# `collect` merges the fetch into seen.jsonl and then emits every entry still carrying a
+# null `read_on` — not just the ones this fetch returned. That matters after a failed
+# run: the bookmarks were already recorded as seen (so incremental paging stops at them)
+# but were never actually shown to anyone, and emitting only fresh finds would drop them
+# forever. `mark-read` is what closes the loop, and run.sh calls it only after a
+# non-empty report exists.
+#
+# Usage:
+#   x-bookmarks.sh collect <findings-dir>    # write x-bookmarks.md + manifest
+#   x-bookmarks.sh mark-read <findings-dir>  # stamp the manifest's ids as read
+#   x-bookmarks.sh status                    # check the setup by hand
+#
+# Config (env; run.sh sources ~/.claude/autodream/config with `set -a` first):
+#   AUTODREAM_DIR   default $HOME/.claude/autodream
+#   X_CREDS_FILE    default $AUTODREAM_DIR/x-credentials — sourced as bash, keys:
+#                     X_AUTH_TOKEN=...     (the auth_token cookie)
+#                     X_CT0=...            (the ct0 cookie)
+#   X_STATE_DIR     default $AUTODREAM_DIR/x-bookmarks
+#   X_MAX_PAGES     pagination cap, ~20 bookmarks per page      default 3
+#   X_MAX_UNREAD    most unread bookmarks to show one report     default 40
+#   X_MAX_TEXT      per-post character cap in the report input   default 800
+#   X_QUERYID_TTL   seconds to reuse a scraped queryId           default 86400
+set -uo pipefail
+
+AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+
+# Source the config here too, not only in run.sh — `status` is meant to be run by hand
+# and has to see the same settings the nightly run does. Harmless when run.sh already
+# sourced it: those values arrive exported, and the snapshot replay keeps them winning.
+AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$AUTODREAM_DIR/config}"
+if [ -f "$AUTODREAM_CONFIG" ]; then
+  _env_snapshot=$(export -p)
+  set -a
+  # shellcheck disable=SC1090
+  . "$AUTODREAM_CONFIG" 2>/dev/null || true
+  set +a
+  eval "$_env_snapshot"
+  unset _env_snapshot
+fi
+
+CREDS_FILE="${X_CREDS_FILE:-$AUTODREAM_DIR/x-credentials}"
+STATE_DIR="${X_STATE_DIR:-$AUTODREAM_DIR/x-bookmarks}"
+MAX_PAGES="${X_MAX_PAGES:-3}"
+MAX_UNREAD="${X_MAX_UNREAD:-40}"
+MAX_TEXT="${X_MAX_TEXT:-800}"
+QUERYID_TTL="${X_QUERYID_TTL:-86400}"
+
+SEEN="$STATE_DIR/seen.jsonl"
+QID_CACHE="$STATE_DIR/query-id"
+TODAY="$(date +%F)"
+
+# Public bearer embedded in X's web app — identical for every user, not a secret.
+BEARER="${X_BEARER:-AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA}"
+UA="${X_USER_AGENT:-Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36}"
+GRAPHQL_BASE="https://x.com/i/api/graphql"
+
+# Verbatim from the reference implementation. X rejects the request with a 400 naming
+# any flag it expects and does not find here, so this list is maintained reactively.
+FEATURES='{"graphql_timeline_v2_bookmark_timeline":true,"rweb_tipjar_consumption_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"creator_subscriptions_quote_tweet_preview_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"rweb_video_timestamps_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_enhance_cards_enabled":false}'
+FIELD_TOGGLES='{"withArticlePlainText":false,"withArticleRichContentState":false,"withGrokAnalyze":false,"withDisallowedReplyControls":false}'
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/xbm.XXXXXX")"
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+FAIL_REASON=""     # non-empty once anything has gone wrong; drives the output header
+REAUTH_HINT="Open x.com logged in, DevTools > Application > Cookies > https://x.com, copy auth_token and ct0, and rewrite $CREDS_FILE."
+
+fail() { FAIL_REASON="$1"; return 1; }
+
+# ---- credentials ----
+
+load_creds() {
+  [ -f "$CREDS_FILE" ] || return 2   # 2 = not configured, which is not a failure
+  # shellcheck disable=SC1090
+  . "$CREDS_FILE" 2>/dev/null || { fail "credentials file at $CREDS_FILE could not be parsed as shell"; return 1; }
+  [ -n "${X_AUTH_TOKEN:-}" ] && [ -n "${X_CT0:-}" ] || { fail "credentials file is missing X_AUTH_TOKEN or X_CT0. $REAUTH_HINT"; return 1; }
+  return 0
+}
+
+# The cookies are a full account session — anyone who can read the file can post as the
+# user. Warn rather than refuse: a nightly job silently doing nothing is worse than a
+# nightly job that works and complains.
+warn_perms() {
+  local mode; mode=$(stat -f '%OLp' "$CREDS_FILE" 2>/dev/null) || return 0
+  case "$mode" in
+    600|400) : ;;
+    *) echo "  WARNING: $CREDS_FILE is mode $mode; these cookies are a full account session. chmod 600 it." >&2 ;;
+  esac
+}
+
+curl_x() { curl -sS --max-time 30 -A "$UA" "$@"; }
+
+# ---- queryId discovery ----
+# Walks the same path the reference does: bookmarks page -> webpack runtime -> the
+# Bookmarks chunk -> the queryId literal beside operationName:"Bookmarks".
+
+extract_qid() { grep -oE 'queryId:"[^"]+",operationName:"Bookmarks"' "$1" 2>/dev/null | head -1 | sed 's/queryId:"//; s/",operationName.*//'; }
+
+detect_query_id() {
+  local html="$TMP/bookmarks.html"
+  curl_x -H "cookie: auth_token=$X_AUTH_TOKEN; ct0=$X_CT0" \
+         -o "$html" -w '%{http_code}' "https://x.com/i/bookmarks" > "$TMP/code" 2>/dev/null
+  local code; code=$(cat "$TMP/code" 2>/dev/null)
+  [ -s "$html" ] || { fail "could not load x.com/i/bookmarks (HTTP ${code:-none})"; return 1; }
+  # X serves the login flow instead of redirecting when the session cookie is dead.
+  if grep -q -e 'LoginForm' -e '/i/flow/login' "$html" 2>/dev/null; then
+    fail "X returned its login page — the auth_token/ct0 cookies are expired or invalid. $REAUTH_HINT"
+    return 1
+  fi
+
+  # Candidate bundles, cheapest first: any client-web JS URL printed in the HTML, then
+  # the Bookmarks chunk reconstructed from the webpack runtime's id->name and id->hash
+  # maps (the chunk's own filename is never in the HTML; only the runtime knows it).
+  local cands="$TMP/cands"; : > "$cands"
+  grep -oE 'https://abs\.twimg\.com/responsive-web/client-web/[A-Za-z0-9._~-]+\.js' "$html" 2>/dev/null \
+    | grep -E 'main\.|bundle\.Bookmarks' >> "$cands"
+
+  local chunk_id name hash
+  chunk_id=$(grep -oE '[0-9]+:"(shared~bundle\.BookmarkFolders~bundle\.Bookmarks|bundle\.Bookmarks)"' "$html" 2>/dev/null | head -1 | cut -d: -f1)
+  if [ -n "$chunk_id" ]; then
+    name=$(grep -oE "${chunk_id}:\"[^\"]+\"" "$html" 2>/dev/null | head -1 | sed 's/^[0-9]*:"//; s/"$//')
+    # The id appears in both the name map and the hash map; the hash map's value is the
+    # short hex, and it is the later occurrence.
+    hash=$(grep -oE "${chunk_id}:\"[a-f0-9]{7,8}\"" "$html" 2>/dev/null | tail -1 | sed 's/^[0-9]*:"//; s/"$//')
+    if [ -n "$name" ] && [ -n "$hash" ]; then
+      # X writes 8-char hashes into filenames but sometimes stores 7 in the map.
+      local sfx
+      for sfx in "$hash" "${hash}a" "${hash}b"; do
+        printf 'https://abs.twimg.com/responsive-web/client-web/%s.%s.js\n' "$name" "$sfx" >> "$cands"
+      done
+    fi
+  fi
+
+  local url qid n=0
+  while IFS= read -r url; do
+    [ -n "$url" ] || continue
+    n=$(( n + 1 )); [ "$n" -gt 8 ] && break
+    curl_x -H 'referer: https://x.com/' -o "$TMP/chunk.js" "$url" >/dev/null 2>&1 || continue
+    qid=$(extract_qid "$TMP/chunk.js")
+    if [ -n "$qid" ]; then printf '%s' "$qid"; return 0; fi
+  done < <(sort -u "$cands")
+
+  fail "could not find the Bookmarks queryId in any X JS bundle (X changed its bundle layout; see the grounding note in this script)"
+  return 1
+}
+
+get_query_id() {
+  if [ -s "$QID_CACHE" ]; then
+    local age; age=$(( $(date +%s) - $(stat -f '%m' "$QID_CACHE" 2>/dev/null || echo 0) ))
+    if [ "$age" -lt "$QUERYID_TTL" ]; then cat "$QID_CACHE"; return 0; fi
+  fi
+  local qid; qid=$(detect_query_id) || return 1
+  mkdir -p "$STATE_DIR" && printf '%s' "$qid" > "$QID_CACHE"
+  printf '%s' "$qid"
+}
+
+# ---- fetch ----
+
+# $1=queryId $2=cursor(optional) -> writes $TMP/page.json, echoes nothing
+fetch_page() {
+  local qid="$1" cursor="${2:-}" vars
+  if [ -n "$cursor" ]; then
+    vars=$(jq -nc --arg c "$cursor" '{count:20,includePromotedContent:false,cursor:$c}')
+  else
+    vars='{"count":20,"includePromotedContent":false}'
+  fi
+  local code
+  code=$(curl_x --get "$GRAPHQL_BASE/$qid/Bookmarks" \
+    --data-urlencode "variables=$vars" \
+    --data-urlencode "features=$FEATURES" \
+    --data-urlencode "fieldToggles=$FIELD_TOGGLES" \
+    -H "authorization: Bearer $BEARER" \
+    -H "cookie: auth_token=$X_AUTH_TOKEN; ct0=$X_CT0" \
+    -H "x-csrf-token: $X_CT0" \
+    -H 'x-twitter-active-user: yes' \
+    -H 'x-twitter-auth-type: OAuth2Session' \
+    -H 'x-twitter-client-language: en' \
+    -H 'content-type: application/json' \
+    -H 'referer: https://x.com/i/bookmarks' \
+    -o "$TMP/page.json" -w '%{http_code}' 2>/dev/null)
+
+  case "$code" in
+    200) : ;;
+    401|403) fail "X rejected the credentials (HTTP $code) — the cookies are expired. $REAUTH_HINT"; return 1 ;;
+    429)     fail "X rate-limited the request (HTTP 429); it will be retried tomorrow"; return 1 ;;
+    400)     # Almost always a rotated queryId or a new required feature flag. Both are
+             # recoverable, and the body names which — quote it rather than paraphrase.
+             rm -f "$QID_CACHE"
+             fail "X returned HTTP 400: $(head -c 300 "$TMP/page.json" 2>/dev/null | tr '\n' ' ')"; return 1 ;;
+    *)       fail "X returned HTTP ${code:-none}"; return 1 ;;
+  esac
+  jq -e . "$TMP/page.json" >/dev/null 2>&1 || { fail "X returned a response that is not JSON"; return 1; }
+  return 0
+}
+
+# Parse one page's JSON into JSONL bookmark records on stdout. Mirrors the reference's
+# parseTweet: the visibility wrapper puts the real tweet under .tweet, and the author
+# handle moved from user legacy to user core, so both are tried.
+parse_page() {
+  jq -c --arg today "$TODAY" '
+    [ (.data.bookmark_timeline_v2.timeline.instructions // [])[] | (.entries // [])[] ]
+    | map(select(.content.itemContent.tweet_results.result != null))
+    | map(.content.itemContent.tweet_results.result)
+    | map(if .tweet then .tweet else . end)
+    | map(select(.legacy != null))
+    | map({
+        id: (.rest_id // ""),
+        author: ((.core.user_results.result.core.screen_name
+                  // .core.user_results.result.legacy.screen_name) // "unknown"),
+        text: (.legacy.full_text // ""),
+        links: [ (.legacy.entities.urls // [])[] | .expanded_url ],
+        created_at: (.legacy.created_at // ""),
+        first_seen: $today,
+        read_on: null
+      })
+    | map(select(.id != ""))
+    | map(. + {url: ("https://x.com/" + .author + "/status/" + .id)})
+    | .[]
+  ' "$TMP/page.json" 2>/dev/null
+}
+
+next_cursor() {
+  jq -r '
+    [ (.data.bookmark_timeline_v2.timeline.instructions // [])[] | (.entries // [])[]
+      | select((.content.cursorType == "Bottom") or ((.entryId // "") | startswith("cursor-bottom")))
+      | .content.value ] | (.[0] // "")
+  ' "$TMP/page.json" 2>/dev/null
+}
+
+known_ids() { [ -s "$SEEN" ] && jq -r '.id' "$SEEN" 2>/dev/null || true; }
+
+# Walk pages newest-first, stopping at the first already-seen bookmark (the timeline is
+# reverse-chronological, so everything past it is old) or at the page cap.
+fetch_new() {
+  local qid; qid=$(get_query_id) || return 1
+  local known="$TMP/known"; known_ids | sort > "$known"
+  local out="$TMP/new.jsonl"; : > "$out"
+  local cursor="" page=1
+
+  while [ "$page" -le "$MAX_PAGES" ]; do
+    fetch_page "$qid" "$cursor" || return 1
+    parse_page > "$TMP/page.jsonl"
+    [ -s "$TMP/page.jsonl" ] || break
+
+    local line id hit=0
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | jq -r '.id' 2>/dev/null)
+      if grep -qxF "$id" "$known" 2>/dev/null; then hit=1; break; fi
+      printf '%s\n' "$line" >> "$out"
+    done < "$TMP/page.jsonl"
+    [ "$hit" -eq 1 ] && break
+
+    cursor=$(next_cursor)
+    [ -n "$cursor" ] || break
+    page=$(( page + 1 ))
+    sleep 2   # the reference paces pages; do not look like a scraper
+  done
+  return 0
+}
+
+# Append genuinely-new records to the state file. Atomic: a crash mid-write must not
+# leave a truncated seen.jsonl, which would re-surface every bookmark as unread.
+merge_state() {
+  mkdir -p "$STATE_DIR"
+  [ -f "$SEEN" ] || : > "$SEEN"
+  local tmp="$TMP/seen.new"
+  cat "$SEEN" > "$tmp"
+  if [ -s "$TMP/new.jsonl" ]; then
+    local line id
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | jq -r '.id' 2>/dev/null)
+      [ -n "$id" ] || continue
+      jq -e --arg id "$id" 'select(.id == $id)' "$SEEN" >/dev/null 2>&1 && continue
+      printf '%s\n' "$line" >> "$tmp"
+    done < "$TMP/new.jsonl"
+  fi
+  mv "$tmp" "$SEEN"
+}
+
+# ---- collect ----
+
+collect() {
+  local findings="$1"
+  [ -n "$findings" ] || { echo "usage: x-bookmarks.sh collect <findings-dir>" >&2; exit 2; }
+  mkdir -p "$findings"
+  local out="$findings/x-bookmarks.md" manifest="$findings/x-bookmarks-manifest.txt"
+  : > "$manifest"
+
+  load_creds
+  case $? in
+    2) printf '# x-bookmarks: not configured (no credentials at %s)\n' "$CREDS_FILE" > "$out"
+       echo "x-bookmarks: not configured; skipping"
+       return 0 ;;
+    1) printf '# x-bookmarks: fetch failed — %s\n' "$FAIL_REASON" > "$out"
+       echo "x-bookmarks: $FAIL_REASON"
+       return 0 ;;
+  esac
+  warn_perms
+
+  if ! fetch_new; then
+    # A failed fetch still lets previously-recorded unread bookmarks through below —
+    # they are already on disk and the model can still use them. Only say "failed" when
+    # there is also nothing to show.
+    merge_state
+    if ! emit_unread "$out" "$manifest" "$FAIL_REASON"; then
+      printf '# x-bookmarks: fetch failed — %s\n' "$FAIL_REASON" > "$out"
+    fi
+    echo "x-bookmarks: $FAIL_REASON"
+    return 0
+  fi
+
+  merge_state
+  emit_unread "$out" "$manifest" "" || printf '# x-bookmarks: no unread bookmarks\n' > "$out"
+  echo "x-bookmarks: $(wc -l < "$manifest" | tr -d ' ') unread -> $out"
+  return 0
+}
+
+# Write every unread bookmark as a markdown block. Returns 1 when there are none, so the
+# caller can choose a different header. $3, when set, is a warning banner to prepend.
+emit_unread() {
+  local out="$1" manifest="$2" warn="${3:-}"
+  [ -s "$SEEN" ] || return 1
+  local unread="$TMP/unread.jsonl"
+  # Sort by tweet id descending — NOT by position in the file. The fetch appends each
+  # page newest-first, so file order is only chronological within a single run and
+  # interleaves across runs; taking the head or the tail of it silently served the
+  # oldest 40 bookmarks. Snowflake ids increase with time, but they exceed 2^53, so
+  # `tonumber` would round them: sort by (length, string) instead, which orders numeric
+  # strings correctly whether or not X shortens ids again.
+  jq -sc 'map(select(.read_on == null)) | sort_by([(.id | length), .id]) | reverse | .[]' \
+    "$SEEN" 2>/dev/null | head -n "$MAX_UNREAD" > "$unread"
+  [ -s "$unread" ] || return 1
+
+  local total; total=$(jq -c 'select(.read_on == null)' "$SEEN" 2>/dev/null | wc -l | tr -d ' ')
+  {
+    printf '# Unread X bookmarks\n'
+    [ -n "$warn" ] && printf '\n> Note: this run could not reach X (%s). The bookmarks below were captured earlier and are still unread.\n' "$warn"
+    printf '\n%s unread bookmark(s)' "$total"
+    [ "$total" -gt "$MAX_UNREAD" ] && printf '; showing the %s most recent' "$MAX_UNREAD"
+    printf '.\n\n'
+    jq -r --argjson cap "$MAX_TEXT" '
+      "## @" + .author + "\n" +
+      .url + "\n\n" +
+      (if (.text | length) > $cap then (.text[0:$cap] + " […]") else .text end) + "\n" +
+      (if (.links | length) > 0 then "\nLinks: " + (.links | join(", ")) + "\n" else "" end)
+    ' "$unread"
+  } > "$out"
+  jq -r '.id' "$unread" > "$manifest"
+  return 0
+}
+
+# ---- mark-read ----
+
+mark_read() {
+  local findings="$1"
+  [ -n "$findings" ] || { echo "usage: x-bookmarks.sh mark-read <findings-dir>" >&2; exit 2; }
+  local manifest="$findings/x-bookmarks-manifest.txt"
+  [ -s "$manifest" ] || { echo "x-bookmarks: nothing to mark read"; return 0; }
+  [ -s "$SEEN" ] || return 0
+
+  local tmp="$TMP/seen.read" ids
+  ids=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$manifest" 2>/dev/null) || ids='[]'
+  # `.id` is bound to $i BEFORE the pipe into $ids. Inside `$ids | index(.id)` the `.`
+  # has already been rebound to the array, so `.id` indexes the array with a string and
+  # jq errors out on every line — a silent no-op that leaves everything unread forever.
+  if jq -c --argjson ids "$ids" --arg today "$TODAY" '
+        .id as $i
+        | if (.read_on == null) and (($ids | index($i)) != null)
+          then .read_on = $today else . end
+      ' "$SEEN" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mv "$tmp" "$SEEN"
+    echo "x-bookmarks: marked $(wc -l < "$manifest" | tr -d ' ') bookmark(s) read"
+  else
+    echo "x-bookmarks: could not update read state (leaving them unread)" >&2
+  fi
+  return 0
+}
+
+# ---- status ----
+
+status() {
+  if [ ! -f "$CREDS_FILE" ]; then
+    printf 'credentials: absent (%s) — feature is off\n' "$CREDS_FILE"
+    return 0
+  fi
+  printf 'credentials: %s (mode %s)\n' "$CREDS_FILE" "$(stat -f '%OLp' "$CREDS_FILE" 2>/dev/null || echo '?')"
+  warn_perms
+  if load_creds; then
+    printf 'keys:        X_AUTH_TOKEN and X_CT0 both set\n'
+  else
+    printf 'keys:        INCOMPLETE — %s\n' "$FAIL_REASON"
+    return 0
+  fi
+  if [ -s "$SEEN" ]; then
+    printf 'state:       %s known, %s unread (%s)\n' \
+      "$(wc -l < "$SEEN" | tr -d ' ')" \
+      "$(jq -c 'select(.read_on == null)' "$SEEN" 2>/dev/null | wc -l | tr -d ' ')" "$SEEN"
+  else
+    printf 'state:       empty (%s)\n' "$SEEN"
+  fi
+  if [ -s "$QID_CACHE" ]; then
+    printf 'queryId:     cached, %ss old (ttl %ss)\n' \
+      "$(( $(date +%s) - $(stat -f '%m' "$QID_CACHE" 2>/dev/null || echo 0) ))" "$QUERYID_TTL"
+  else
+    printf 'queryId:     not yet scraped\n'
+  fi
+}
+
+command -v jq >/dev/null 2>&1 || { echo "x-bookmarks.sh needs jq" >&2; exit 0; }
+
+case "${1:-}" in
+  collect)   shift; collect "${1:-}" ;;
+  mark-read) shift; mark_read "${1:-}" ;;
+  status)    status ;;
+  *) echo "usage: x-bookmarks.sh {collect <findings-dir>|mark-read <findings-dir>|status}" >&2; exit 2 ;;
+esac

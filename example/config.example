@@ -27,3 +27,25 @@ AUTODREAM_TRIAGE_SURFACE=cmux
 # Path to the cmux CLI. Only consulted when the surface above is `cmux`.
 # Defaults to the app-bundle path; uncomment to override.
 # CMUX_BIN=/Applications/cmux.app/Contents/Resources/bin/cmux
+
+# ---- Operator notes from a synced vault --------------------------------------------
+# An autodream folder inside an Obsidian (or any synced) vault. Set it and the run
+# creates the layout on its own:
+#   <vault>/inbox/*.md         drop a note here from anywhere, including your phone
+#   <vault>/processed/<date>/  where a note goes once a report has read it
+#   <vault>/reports/<date>.md  the nightly report, copied in so you can read it in bed
+# Notes written with `autodream-note.sh` keep working; both surfaces are merged into
+# one file for the aggregator. Leave unset to keep notes.md as the only surface.
+# Quote it — the iCloud path has spaces.
+# AUTODREAM_VAULT_DIR="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/vault/autodream"
+
+# How long to wait for iCloud to download a note whose contents were evicted, before
+# giving up and reporting it as unreadable (it stays in the inbox and is retried).
+# AUTODREAM_ICLOUD_WAIT=30
+
+# ---- X bookmarks -------------------------------------------------------------------
+# Unread X bookmarks become idea fuel: the aggregator cross-references what you saved
+# against what you actually worked on. Off unless the credentials file exists. See the
+# README for how to fill it in — the official API is not usable for this ($200/mo tier).
+# X_CREDS_FILE=$HOME/.claude/autodream/x-credentials
+# X_MAX_PAGES=3
