@@ -83,7 +83,13 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # Changelog check defaults OFF so the suite never touches the network; the dedicated
   # changelog test exports AUTODREAM_CHANGELOG=1 with a local CHANGELOG_REMOTE.
   # Retry/network knobs forced fast+offline so the suite never sleeps or hits the net.
+  # AUTODREAM_CONFIG is pinned into the sandbox so the HOST's own
+  # ~/.claude/autodream/config can never leak in. run.sh started sourcing that file so
+  # AUTODREAM_VAULT_DIR could reach the nightly run; without this pin a developer whose
+  # config points at a real Obsidian vault would have the suite writing into it.
+  # Individual tests override this by exporting AUTODREAM_CONFIG before calling.
   AUTODREAM_GC=0 AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
   PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
@@ -91,6 +97,144 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
 fdir(){ printf '%s' "$1/autodream/findings/$DATE"; }   # findings dir for a root
 
 # ---------------------------------------------------------------------------
+
+# ---- Operator notes: notes.md + vault inbox merged into operator-notes.md ----------
+# The seam under test is that PROMPT.md reads exactly ONE file. Every assertion here is
+# about that file's contents and about what leaves the inbox, because the two ways this
+# feature fails silently are (a) a surface not reaching the model and (b) a note being
+# archived before it was read.
+
+mk_vault_note(){ # $1=root $2=name $3=body [$4=expires]
+  local d="$1/vault/inbox"; mkdir -p "$d"
+  {
+    if [ -n "${4:-}" ]; then printf -- '---\nexpires: %s\n---\n' "$4"; fi
+    printf '%s\n' "$3"
+  } > "$d/$2.md"
+}
+vault_run(){ # $1=root — a run with the vault surface enabled
+  AUTODREAM_VAULT_DIR="$1/vault" run_dream "$1"
+}
+
+test_notes_no_surfaces(){
+  echo "# operator notes: no notes.md and no vault -> the file still exists, saying so"
+  local root; root=$(setup_env); mk_session "$root" s1
+  run_dream "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_file "$f" "operator-notes.md is written even with nothing to report"
+  assert_grep "$f" "active: 0" "header reports zero active notes"
+  assert_grep "$f" "No active operator notes" "body says there are no notes"
+  rm -rf "$root"
+}
+
+test_notes_from_notes_file(){
+  echo "# operator notes: notes.md lines reach the merged file verbatim"
+  local root; root=$(setup_env); mk_session "$root" s1
+  printf -- '- [2020-01-01] check whether /graphify is used\n' > "$root/autodream/notes.md"
+  run_dream "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_grep "$f" "check whether /graphify is used" "the note text is present"
+  assert_grep "$f" "active: 1" "the line note is counted active"
+  rm -rf "$root"
+}
+
+test_notes_from_vault_inbox(){
+  echo "# operator notes: a vault inbox file becomes a note block"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" idea-from-phone "look at how often the retry budget fires"
+  vault_run "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_grep "$f" "note: idea-from-phone" "the inbox file is titled by its filename"
+  assert_grep "$f" "how often the retry budget fires" "the inbox note body is present"
+  assert_grep "$f" "active: 1" "the inbox note is counted active"
+  assert_nogrep "$f" "^expires:" "frontmatter is stripped from the body"
+  rm -rf "$root"
+}
+
+test_notes_vault_expired_dropped(){
+  echo "# operator notes: an expired vault note is dropped from the merged file but still archived"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" stale "this stopped mattering" 2020-01-01
+  vault_run "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_nogrep "$f" "this stopped mattering" "expired note body is not shown to the model"
+  assert_grep "$f" "expired-and-dropped: 1" "the expired note is counted in the header"
+  assert_no_file "$root/vault/inbox/stale.md" "an expired note still leaves the inbox"
+  rm -rf "$root"
+}
+
+test_notes_vault_archived_after_report(){
+  echo "# operator notes: a consumed vault note moves to processed/<date>/"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" done-with-this "some note"
+  vault_run "$root"
+  assert_no_file "$root/vault/inbox/done-with-this.md" "the note left the inbox"
+  assert_file "$root/vault/processed/$DATE/done-with-this.md" "the note landed in processed/<date>/"
+  rm -rf "$root"
+}
+
+test_notes_vault_not_archived_without_report(){
+  echo "# operator notes: a failed L2 (no report) leaves the note in the inbox"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" keep-me "must survive a failed run"
+  # l2_fail makes the aggregator write nothing; the archive step is gated on a
+  # non-empty report precisely so an unread note is never thrown away.
+  export MOCK_MODE=l2_fail AUTODREAM_L2_ATTEMPTS=1
+  vault_run "$root"
+  unset MOCK_MODE AUTODREAM_L2_ATTEMPTS
+  assert_file "$root/vault/inbox/keep-me.md" "the note stayed in the inbox after a failed run"
+  assert_no_file "$root/vault/processed/$DATE/keep-me.md" "the note was not archived"
+  rm -rf "$root"
+}
+
+test_notes_vault_report_published(){
+  echo "# operator notes: the report is copied into the vault for phone reading"
+  local root; root=$(setup_env); mk_session "$root" s1
+  vault_run "$root"
+  assert_nonempty "$root/vault/reports/$DATE.md" "the report was published into the vault"
+  rm -rf "$root"
+}
+
+test_notes_vault_unreadable_note_stays(){
+  echo "# operator notes: an empty (unsynced) note is reported, not silently skipped"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mkdir -p "$root/vault/inbox"; : > "$root/vault/inbox/not-synced.md"
+  AUTODREAM_ICLOUD_WAIT=0 vault_run "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_grep "$f" "unreadable: 1" "the unreadable note is counted"
+  assert_grep "$f" "not-synced.md — UNREADABLE" "the unreadable note is named for the model"
+  assert_file "$root/vault/inbox/not-synced.md" "an unread note is left in the inbox to retry"
+  rm -rf "$root"
+}
+
+# ---- Config file: run.sh sources it, but the environment still wins ----------------
+# run.sh ignored ~/.claude/autodream/config until AUTODREAM_VAULT_DIR needed to reach the
+# nightly run. The env-wins half is the part worth pinning: the config uses plain
+# KEY=value, so a naive `.` would let the file override a caller who deliberately
+# exported something.
+
+test_config_file_sourced(){
+  echo "# config: AUTODREAM_VAULT_DIR set only in the config file reaches the run"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" from-config "config-sourced vault"
+  printf 'AUTODREAM_VAULT_DIR=%s/vault\n' "$root" > "$root/autodream/config"
+  run_dream "$root"
+  assert_grep "$(fdir "$root")/operator-notes.md" "config-sourced vault" "the config-only vault path was used"
+  rm -rf "$root"
+}
+
+test_config_env_wins_over_config(){
+  echo "# config: an exported AUTODREAM_VAULT_DIR beats the config file's value"
+  local root; root=$(setup_env); mk_session "$root" s1
+  mk_vault_note "$root" real "the env-chosen vault"
+  mkdir -p "$root/decoy/inbox"
+  printf 'the config-chosen vault\n' > "$root/decoy/inbox/decoy.md"
+  printf 'AUTODREAM_VAULT_DIR=%s/decoy\n' "$root" > "$root/autodream/config"
+  vault_run "$root"
+  local f; f="$(fdir "$root")/operator-notes.md"
+  assert_grep   "$f" "the env-chosen vault"    "the environment's vault was read"
+  assert_nogrep "$f" "the config-chosen vault" "the config's vault was overridden"
+  rm -rf "$root"
+}
 
 test_session_stats(){
   echo "# deterministic session stats pre-pass acceptance fixtures"
@@ -1168,6 +1312,16 @@ test_overlap_none
 test_overlap_not_measured_missing_bin
 test_overlap_not_measured_empty_output
 test_overlap_not_measured_malformed_output
+test_notes_no_surfaces
+test_notes_from_notes_file
+test_notes_from_vault_inbox
+test_notes_vault_expired_dropped
+test_notes_vault_archived_after_report
+test_notes_vault_not_archived_without_report
+test_notes_vault_report_published
+test_notes_vault_unreadable_note_stays
+test_config_file_sourced
+test_config_env_wins_over_config
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

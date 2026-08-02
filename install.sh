@@ -32,6 +32,14 @@ mkdir -p "$TARGET" "$TARGET_PARENT/dreams" "$TARGET/findings" "$TARGET/inbox" "$
 
 link() {
   local src="$1" dst="$2"
+  # Never create a dangling symlink. A link pointing at a file the checked-out tree
+  # does not have looks installed and silently does nothing at 03:15 — that is the
+  # overlap-stats.sh failure from 2026-07-24, and it cost a night of data before
+  # anyone noticed. Say so loudly and leave the old link alone instead.
+  if [ ! -e "$src" ]; then
+    echo "  WARNING: skipping $dst — source missing: $src" >&2
+    return 0
+  fi
   if [ -L "$dst" ] || [ -f "$dst" ]; then
     rm -f "$dst"
   fi
@@ -51,6 +59,8 @@ link "$REPO_DIR/bin/slim-transcript.sh"     "$TARGET/slim-transcript.sh"
 link "$REPO_DIR/bin/session-stats.sh"        "$TARGET/session-stats.sh"
 link "$REPO_DIR/bin/overlap-stats.sh"        "$TARGET/overlap-stats.sh"
 link "$REPO_DIR/bin/oversized-gate.sh"       "$TARGET/oversized-gate.sh"
+link "$REPO_DIR/bin/vault-notes.sh"          "$TARGET/vault-notes.sh"
+link "$REPO_DIR/bin/x-bookmarks.sh"          "$TARGET/x-bookmarks.sh"
 link "$REPO_DIR/prompts/PROMPT.md"      "$TARGET/PROMPT.md"
 link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 

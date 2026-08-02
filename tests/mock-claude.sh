@@ -10,6 +10,10 @@
 #   MOCK_MODE=good           write findings (L1) / report (L2). [default]
 #   MOCK_MODE=l1_incomplete  L1 writes nothing (simulates a worker that exits
 #                            without producing JSON); L2 still writes its report.
+#   MOCK_MODE=l2_fail        L2 writes no report and exits 1 (simulates the
+#                            aggregator dying to a mid-run sleep). L1 is unaffected.
+#                            Pair with AUTODREAM_L2_ATTEMPTS=1 so the test doesn't
+#                            sit through the retry loop.
 #   MOCK_CAPTURE_DIR=<dir>   dump each layer's stdin + argv to <dir>/l{1,2}-*.txt
 #                            so tests can assert on the exact prompt framing.
 #   MOCK_CALL_LOG=<file>     append the L1 output path for every invocation of
@@ -50,6 +54,10 @@ else
     printf '%s\n' "$@" > "$MOCK_CAPTURE_DIR/l2-args.txt"
   fi
   rep=$(printf '%s' "$line2" | sed 's/^Write the report to this literal absolute path: //')
+  if [ "$mode" = "l2_fail" ]; then
+    echo "mock: aggregator failed" >&2
+    exit 1
+  fi
   printf '# Autodream — mock\n\nmock aggregate report\n' > "$rep"
   echo "report: $rep"
   echo "mock: 1 session reviewed, 0 findings, 0 edits"

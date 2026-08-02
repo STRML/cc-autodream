@@ -122,6 +122,69 @@ cmux workspace instead, drop a config file at `~/.claude/autodream/config`
 AUTODREAM_TRIAGE_SURFACE=cmux    # inline (default) | cmux
 ```
 
+## Leaving notes for the next run
+
+Notes you leave get answered in the report's **Operator notes** section, with evidence
+from that night's sessions — "how often did I actually use /graphify, and did it work?"
+comes back as a count and a verdict, not a guess.
+
+From a terminal:
+
+```bash
+~/.claude/autodream/autodream-note.sh "evaluate how often /graphify is used"
+~/.claude/autodream/autodream-note.sh --expires 2026-10-01 "check the codemaps hook overhead"
+```
+
+From anywhere else, including your phone, point autodream at a folder in a synced
+vault and drop a markdown file in its inbox:
+
+```bash
+# in ~/.claude/autodream/config — quote it, the iCloud path has spaces
+AUTODREAM_VAULT_DIR="$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/vault/autodream"
+```
+
+The run creates the rest on its own:
+
+| path | what it holds |
+| --- | --- |
+| `<vault>/inbox/*.md` | drop a note here; one file per note, any filename |
+| `<vault>/processed/<date>/` | where a note moves once a report has read it |
+| `<vault>/reports/<date>.md` | the nightly report, copied in so you can read it in bed |
+
+Add `expires: YYYY-MM-DD` as YAML frontmatter to a note that should retire itself. A
+note is only archived after a report actually read it, so a failed run leaves your
+inbox alone, and so does a note you write while a run is in flight.
+
+## Ideas from your X bookmarks
+
+Point autodream at your X bookmarks and the report gains an **Ideas from bookmarks**
+section: what you saved, crossed against what you actually worked on that day. A
+bookmark that connects to nothing gets left out — the section is the intersection, not
+a reading list.
+
+X's official API can't do this (the bookmarks endpoint needs the $200/mo Basic tier),
+so this reads the same web endpoint your browser does, with your session cookies:
+
+1. Open x.com in a browser, logged in. DevTools → Application → Cookies → `https://x.com`.
+2. Copy the values of `auth_token` and `ct0`.
+3. Put them in `~/.claude/autodream/x-credentials`:
+
+```bash
+X_AUTH_TOKEN=paste_auth_token_here
+X_CT0=paste_ct0_here
+```
+
+```bash
+chmod 600 ~/.claude/autodream/x-credentials
+~/.claude/autodream/x-bookmarks.sh status   # check it took
+```
+
+Bookmarks are marked read once a report has covered them, so each one gives you an
+idea once. Without that file the feature is simply off. When the cookies expire the
+report says so and tells you to re-paste; the run itself never fails over it.
+
+## Running long jobs
+
 A full run usually takes more than 10 minutes. If you're kicking it off from
 something that kills long jobs (a Claude Code background task, a flaky ssh session),
 use `autodream-now.sh` — it hands the run to launchd, which has no time cap and keeps

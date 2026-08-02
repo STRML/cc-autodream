@@ -36,12 +36,42 @@
 #   AUTODREAM_OVERLAP_BIN     override the resolved overlap-stats.sh path, authoritative
 #                             (no existability fallback — lets tests force the "not
 #                             measured" paths)                        default: unset
+#   AUTODREAM_CONFIG     path to the sourced config file             default: $AUTODREAM_DIR/config
+#   AUTODREAM_VAULT_DIR  autodream folder inside an Obsidian/synced vault; enables the
+#                        inbox note surface + report publishing       default: unset (off)
+#   AUTODREAM_VAULT_BIN  override the resolved vault-notes.sh path, authoritative
+#   AUTODREAM_XBOOKMARKS_BIN override the resolved x-bookmarks.sh path, authoritative
 
 set -u
 
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.claude/projects}"
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
+
+# ---- Config file ----
+# run.sh historically ignored ~/.claude/autodream/config; only review.sh sourced it. That
+# was fine while every key it held was review-only, and stopped being fine the moment a
+# key had to reach the nightly run (AUTODREAM_VAULT_DIR). Sourced here, after AUTODREAM_DIR
+# is resolved — so AUTODREAM_DIR itself must come from the environment, not the config.
+#
+# The env-wins dance matters: the config uses plain `KEY=value`, so a bare `.` would let
+# the file clobber a variable the caller deliberately exported (tests set env, and a run
+# invoked as `AUTODREAM_VAULT_DIR= run.sh` to disable the vault must actually disable it).
+# Snapshot the exported environment, source, then replay the snapshot: names the caller
+# set win, names only the config sets survive.
+#
+# `set -a` around the source is the other half: the helper scripts below are separate
+# processes, so a config key that stays an unexported shell variable reaches nothing.
+AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$AUTODREAM_DIR/config}"
+if [ -f "$AUTODREAM_CONFIG" ]; then
+  _env_snapshot=$(export -p)
+  set -a
+  # shellcheck disable=SC1090
+  . "$AUTODREAM_CONFIG" || echo "WARNING: failed to source $AUTODREAM_CONFIG (continuing)" >&2
+  set +a
+  eval "$_env_snapshot"
+  unset _env_snapshot
+fi
 DREAMS_DIR="${DREAMS_DIR:-$HOME/.claude/dreams}"
 LOG_DIR="$AUTODREAM_DIR/logs"
 FANOUT="${FANOUT:-8}"
@@ -94,6 +124,23 @@ if [ -n "${AUTODREAM_OVERLAP_BIN:-}" ]; then
 else
   OVERLAP="$SCRIPT_DIR/overlap-stats.sh"
   [ -x "$OVERLAP" ] || OVERLAP="$AUTODREAM_DIR/overlap-stats.sh"
+fi
+# Operator-note collector and X-bookmark fetcher. Both are context-gatherers for L2 and
+# both are opt-in: vault-notes.sh degrades to the plain notes.md when no vault is set,
+# x-bookmarks.sh to a "not configured" stub when no credentials exist. Overrides are
+# authoritative (no existability fallback) for the same reason as STATS/OVERLAP above —
+# tests need to force the missing-helper path.
+if [ -n "${AUTODREAM_VAULT_BIN:-}" ]; then
+  VAULT_NOTES="$AUTODREAM_VAULT_BIN"
+else
+  VAULT_NOTES="$SCRIPT_DIR/vault-notes.sh"
+  [ -x "$VAULT_NOTES" ] || VAULT_NOTES="$AUTODREAM_DIR/vault-notes.sh"
+fi
+if [ -n "${AUTODREAM_XBOOKMARKS_BIN:-}" ]; then
+  XBOOKMARKS="$AUTODREAM_XBOOKMARKS_BIN"
+else
+  XBOOKMARKS="$SCRIPT_DIR/x-bookmarks.sh"
+  [ -x "$XBOOKMARKS" ] || XBOOKMARKS="$AUTODREAM_DIR/x-bookmarks.sh"
 fi
 
 # Provenance of the code actually executing (#29), stamped into run-stats.txt below.
@@ -753,6 +800,27 @@ PY
   # ---- Upstream changelog window (writes changelog-window.md for L2 to read) ----
   changelog_window
 
+  # ---- Operator notes (writes operator-notes.md for L2 to read) ----
+  # Merges every capture surface — the terminal-written notes.md and the vault inbox —
+  # into one file so PROMPT.md reads a single path. Adding a surface is a change to
+  # vault-notes.sh, never to the prompt. Best-effort: a broken vault must not cost the
+  # report, so failure here logs and continues.
+  if [ -x "$VAULT_NOTES" ]; then
+    "$VAULT_NOTES" collect "$FINDINGS_DIR" || log "operator-note collection failed (continuing)"
+  else
+    log "vault-notes.sh not found at $VAULT_NOTES; skipping operator-note collection"
+  fi
+
+  # ---- X bookmarks (writes x-bookmarks.md for L2 to read) ----
+  # Unread bookmarks become idea fuel: L2 cross-references what the user saved against
+  # what they actually worked on. The script always exits 0 and always writes the file,
+  # including a "not configured" stub, so this seam has exactly one shape for L2.
+  if [ -x "$XBOOKMARKS" ]; then
+    "$XBOOKMARKS" collect "$FINDINGS_DIR" || log "x-bookmark collection failed (continuing)"
+  else
+    log "x-bookmarks.sh not found at $XBOOKMARKS; skipping bookmark collection"
+  fi
+
   # ---- Layer 2: opus aggregate, retried until a report lands ----
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
   # "no report" overnight). Retry until $REPORT_PATH is non-empty, waiting for the
@@ -823,6 +891,21 @@ PY
     if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
       log "writing open-questions inbox file..."
       "$AUTODREAM_DIR/notify.sh" "$REPORT_PATH" || log "notify step returned non-zero (continuing)"
+    fi
+
+    # ---- Consume what L2 just read ----
+    # Deliberately gated on a NON-EMPTY report, not merely an existing one. Archiving a
+    # note or stamping a bookmark read after a run that produced nothing would throw away
+    # the only copy of input the user cared about — the failure mode is silent and
+    # unrecoverable, so the guard is stricter than the enclosing -f check.
+    if [ -s "$REPORT_PATH" ]; then
+      if [ -x "$VAULT_NOTES" ]; then
+        "$VAULT_NOTES" archive "$FINDINGS_DIR" || log "vault note archive failed (notes stay in the inbox)"
+        "$VAULT_NOTES" publish "$REPORT_PATH" || log "vault report publish failed (continuing)"
+      fi
+      if [ -x "$XBOOKMARKS" ]; then
+        "$XBOOKMARKS" mark-read "$FINDINGS_DIR" || log "x-bookmark mark-read failed (they stay unread)"
+      fi
     fi
 
     # ---- Symbiotic GC: trigger cc-simple-memory to consolidate
