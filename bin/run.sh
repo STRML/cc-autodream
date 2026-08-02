@@ -296,6 +296,21 @@ changelog_window() {
 # the still-missing sessions across wake/sleep cycles until they all land, and retry
 # L2 until a report exists. Tunable; network-wait/sleep are disabled in tests.
 
+# A report is COMPLETE when it carries the end-of-document marker PROMPT.md mandates, not
+# merely when its path is non-empty. `-s` cannot tell a finished report from one the
+# aggregator was killed halfway through writing, and a truncated report satisfies `-s`
+# exactly as well as a good one. That mattered three separate ways: the L2 retry loop
+# would break after attempt 1 on a partial file, the superseded good copy would be
+# deleted, and the consume gate would archive the user's notes and stamp bookmarks read
+# against a half-written report. Mid-write death is precisely the sleep-kill scenario all
+# of this exists for, so "non-empty" was never the right test. The marker is the last
+# thing PROMPT.md emits, which is what makes its presence mean the write reached the end.
+#
+# Deliberately not `L2_RC -eq 0`: the CLI can exit non-zero after a perfectly good write.
+report_complete() {
+  [ -s "$REPORT_PATH" ] && grep -q 'autodream:open-questions=' "$REPORT_PATH" 2>/dev/null
+}
+
 net_up() { # exit 0 if the API host is reachable (any HTTP code beats "000" = no route)
   local code
   code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>/dev/null)
@@ -931,8 +946,12 @@ PY
     )
 
     L2_RC=$?
-    [ -s "$REPORT_PATH" ] && break
-    log "L2 attempt $attempt wrote no report (exit $L2_RC)"
+    report_complete && break
+    if [ -s "$REPORT_PATH" ]; then
+      log "L2 attempt $attempt left a report with no open-questions marker — treating it as truncated and retrying (exit $L2_RC)"
+    else
+      log "L2 attempt $attempt wrote no report (exit $L2_RC)"
+    fi
     if [ "$attempt" -lt "$L2_ATTEMPTS" ]; then
       wait_for_network
       sleep "${AUTODREAM_RETRY_WAIT:-60}"
@@ -950,8 +969,13 @@ PY
     # exists, so the insurance has expired. Dropping it here is what stops every --force
     # rebuild from leaving another .stale-<epoch> file in the dreams dir forever; the
     # failure branch below keeps it instead and says where it is.
+    # Only a COMPLETE report supersedes the old one. A truncated file is not a rebuild.
     if [ -n "${STALE_REPORT:-}" ] && [ -s "$STALE_REPORT" ]; then
-      rm -f "$STALE_REPORT" && log "rebuild succeeded; discarded the superseded report copy"
+      if report_complete; then
+        rm -f "$STALE_REPORT" && log "rebuild succeeded; discarded the superseded report copy"
+      else
+        log "this run's report is incomplete; keeping the previous one at $STALE_REPORT"
+      fi
     fi
 
     # ---- Drop open-questions file into Sublime (no-op if zero questions) ----
@@ -985,7 +1009,9 @@ PY
     # an override every consume path would take the skip branch and the tests that cover
     # archiving would pass while asserting nothing.
     NORMAL_TARGET_DATE="${AUTODREAM_CONSUME_DATE:-$(date -v-1d +%Y-%m-%d)}"
-    if [ -s "$REPORT_PATH" ]; then
+    if ! report_complete; then
+      log "report is present but carries no open-questions marker; skipping vault-notes archive and x-bookmark mark-read rather than consuming input against a truncated report"
+    else
       # Publishing is NOT a consuming step — it copies the report into the vault so it
       # can be read on a phone, and a reprocessed date is exactly as worth reading as a
       # fresh one. It stays outside the date gate; only archive and mark-read, which

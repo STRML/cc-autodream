@@ -121,8 +121,16 @@ fail_reason() { cat "$FAIL_FILE" 2>/dev/null; }
 
 load_creds() {
   [ -f "$CREDS_FILE" ] || return 2   # 2 = not configured, which is not a failure
+  # `set +u` for the same reason the config source has it. This file is hand-pasted, so a
+  # stray unbound reference in it is a live possibility, and under nounset that kills the
+  # script outright — before collect can write its output stub. L2 would then see an
+  # absent x-bookmarks.md and read the feature as OFF rather than BROKEN, which is exactly
+  # the distinction the jq-missing path was restructured to preserve. The `||` below
+  # cannot catch it: nounset kills the shell rather than failing the source.
+  set +u
   # shellcheck disable=SC1090
-  . "$CREDS_FILE" 2>/dev/null || { fail "credentials file at $CREDS_FILE could not be parsed as shell"; return 1; }
+  . "$CREDS_FILE" 2>/dev/null || { set -u; fail "credentials file at $CREDS_FILE could not be parsed as shell"; return 1; }
+  set -u
   [ -n "${X_AUTH_TOKEN:-}" ] && [ -n "${X_CT0:-}" ] || { fail "credentials file is missing X_AUTH_TOKEN or X_CT0. $REAUTH_HINT"; return 1; }
   return 0
 }
@@ -146,19 +154,32 @@ curl_x() { curl -sS --max-time 30 -A "$UA" "$@"; }
 # nightly run makes several of these while the machine is unattended. `--config` keeps
 # them in a 0600 file inside the per-run $TMP, which the EXIT trap removes.
 #
-# Two call sites need different header sets: the bundle scrape sends cookies only, the
-# GraphQL call sends cookies plus the CSRF token and bearer. Both are written here so
-# there is one place where credentials touch the disk.
+# Two authenticated call sites need different header sets: the x.com bookmarks-page fetch
+# sends cookies only, the GraphQL call sends cookies plus the CSRF token and bearer. Both
+# are written here so there is one place where credentials touch the disk. The JS chunk
+# fetch that follows the page load is deliberately unauthenticated — it hits
+# abs.twimg.com, a public CDN, and sending a session cookie to it would widen where the
+# credential goes for no benefit.
 COOKIE_CFG="$TMP/curl-cookie.cfg"
 API_CFG="$TMP/curl-api.cfg"
 
+# curl's config parser treats a double-quoted value as escapable, so a `"` or `\` in a
+# token would end the string early and break every authenticated fetch. X cookie values
+# are hex/base64url in practice, so this is belt-and-braces — but the failure would be a
+# curl parse error on a line the user pasted by hand, which is a miserable thing to debug.
+cfg_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
 write_curl_configs() {
+  local tok csrf bearer
+  tok="$(cfg_escape "$X_AUTH_TOKEN")"
+  csrf="$(cfg_escape "$X_CT0")"
+  bearer="$(cfg_escape "$BEARER")"
   ( umask 077
-    printf 'header = "cookie: auth_token=%s; ct0=%s"\n' "$X_AUTH_TOKEN" "$X_CT0" > "$COOKIE_CFG"
+    printf 'header = "cookie: auth_token=%s; ct0=%s"\n' "$tok" "$csrf" > "$COOKIE_CFG"
     {
-      printf 'header = "cookie: auth_token=%s; ct0=%s"\n' "$X_AUTH_TOKEN" "$X_CT0"
-      printf 'header = "x-csrf-token: %s"\n' "$X_CT0"
-      printf 'header = "authorization: Bearer %s"\n' "$BEARER"
+      printf 'header = "cookie: auth_token=%s; ct0=%s"\n' "$tok" "$csrf"
+      printf 'header = "x-csrf-token: %s"\n' "$csrf"
+      printf 'header = "authorization: Bearer %s"\n' "$bearer"
       printf 'header = "x-twitter-active-user: yes"\n'
       printf 'header = "x-twitter-auth-type: OAuth2Session"\n'
       printf 'header = "x-twitter-client-language: en"\n'
