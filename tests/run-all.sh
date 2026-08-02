@@ -316,6 +316,25 @@ test_force_rebuild_failed_l2_does_not_consume(){
   rm -rf "$root"
 }
 
+test_unmovable_stale_report_disarms_consuming(){
+  echo "# regression: if the stale report cannot be moved aside, nothing may be consumed"
+  local root; root=$(setup_env); mk_session "$root" s1
+  vault_run "$root"                                    # first run leaves a report
+  mk_vault_note "$root" must-survive "the mv failed, so this must not be archived"
+  # Make the move fail the way it would in practice: the destination directory is not
+  # writable, so the old report stays at $REPORT_PATH. Without the disarm this is the
+  # original hole reopened — the retry loop and the consume gate both see the old file.
+  chmod 555 "$root/dreams"
+  export MOCK_MODE=l2_fail AUTODREAM_FORCE=1 AUTODREAM_L2_ATTEMPTS=1
+  vault_run "$root"
+  unset MOCK_MODE AUTODREAM_FORCE AUTODREAM_L2_ATTEMPTS
+  chmod 755 "$root/dreams"
+  assert_file "$root/vault/inbox/must-survive.md" "the note stayed in the inbox"
+  assert_no_file "$root/vault/processed/$DATE/must-survive.md" "the note was not archived"
+  assert_grep "$root/run.out" "will NOT archive notes" "the run says why consuming was disarmed"
+  rm -rf "$root"
+}
+
 test_old_date_reprocess_does_not_consume(){
   echo "# regression: reprocessing an old date must not consume today's pending input"
   local root; root=$(setup_env); mk_session "$root" s1
@@ -1435,6 +1454,7 @@ test_notes_icloud_placeholder_is_counted
 test_notes_placeholder_and_real_file_counted_once
 test_notes_expiry_uses_report_date
 test_force_rebuild_failed_l2_does_not_consume
+test_unmovable_stale_report_disarms_consuming
 test_old_date_reprocess_does_not_consume
 test_config_unbound_var_does_not_kill_run
 echo

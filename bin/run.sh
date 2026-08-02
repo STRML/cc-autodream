@@ -881,13 +881,22 @@ PY
   # first so `-s "$REPORT_PATH"` again means "this run produced it" for both checks.
   # Moved aside, not deleted: if every L2 attempt below still fails, the user's last
   # good report for this date must stay recoverable, not vanish.
+  # CONSUME_SAFE is the whole point of this block, not a side effect of it. If the move
+  # fails we are back in precisely the state the move exists to prevent: an old report
+  # sitting at $REPORT_PATH that a failed L2 will let the retry loop and the consume gate
+  # both mistake for this run's output. Continuing anyway would archive unread notes and
+  # stamp bookmarks read against a report nothing produced — the silent, unrecoverable
+  # loss this is all guarding. So a failed move disarms consuming for the run rather than
+  # logging a warning and carrying on.
+  CONSUME_SAFE=1
   if [ -s "$REPORT_PATH" ]; then
     STALE_REPORT="$REPORT_PATH.stale-$(date +%s)"
     if mv "$REPORT_PATH" "$STALE_REPORT"; then
       log "existing report for $TARGET_DATE moved aside to $STALE_REPORT before rebuilding (AUTODREAM_FORCE=1)"
     else
-      log "WARNING: could not move existing report aside; leaving it in place (AUTODREAM_FORCE=1 rebuild may be misreported as already done)"
+      log "WARNING: could not move the existing report aside; this run will NOT archive notes or mark bookmarks read, because a stale report can no longer be told apart from a fresh one"
       STALE_REPORT=""
+      CONSUME_SAFE=0
     fi
   fi
 
@@ -984,7 +993,9 @@ PY
       if [ -x "$VAULT_NOTES" ]; then
         "$VAULT_NOTES" publish "$REPORT_PATH" || log "vault report publish failed (continuing)"
       fi
-      if [ "$TARGET_DATE" = "$NORMAL_TARGET_DATE" ]; then
+      if [ "${CONSUME_SAFE:-1}" != "1" ]; then
+        log "skipping vault-notes archive and x-bookmark mark-read: a stale report could not be moved aside, so this report cannot be attributed to this run"
+      elif [ "$TARGET_DATE" = "$NORMAL_TARGET_DATE" ]; then
         if [ -x "$VAULT_NOTES" ]; then
           "$VAULT_NOTES" archive "$FINDINGS_DIR" || log "vault note archive failed (notes stay in the inbox)"
         fi

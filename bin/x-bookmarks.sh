@@ -140,6 +140,34 @@ warn_perms() {
 
 curl_x() { curl -sS --max-time 30 -A "$UA" "$@"; }
 
+# Secrets go in a curl config file, never in argv. `-H "cookie: auth_token=..."` puts a
+# full account-takeover credential into the process list, where any process running as
+# this user can read it out of `ps` for as long as the request is in flight — and the
+# nightly run makes several of these while the machine is unattended. `--config` keeps
+# them in a 0600 file inside the per-run $TMP, which the EXIT trap removes.
+#
+# Two call sites need different header sets: the bundle scrape sends cookies only, the
+# GraphQL call sends cookies plus the CSRF token and bearer. Both are written here so
+# there is one place where credentials touch the disk.
+COOKIE_CFG="$TMP/curl-cookie.cfg"
+API_CFG="$TMP/curl-api.cfg"
+
+write_curl_configs() {
+  ( umask 077
+    printf 'header = "cookie: auth_token=%s; ct0=%s"\n' "$X_AUTH_TOKEN" "$X_CT0" > "$COOKIE_CFG"
+    {
+      printf 'header = "cookie: auth_token=%s; ct0=%s"\n' "$X_AUTH_TOKEN" "$X_CT0"
+      printf 'header = "x-csrf-token: %s"\n' "$X_CT0"
+      printf 'header = "authorization: Bearer %s"\n' "$BEARER"
+      printf 'header = "x-twitter-active-user: yes"\n'
+      printf 'header = "x-twitter-auth-type: OAuth2Session"\n'
+      printf 'header = "x-twitter-client-language: en"\n'
+      printf 'header = "content-type: application/json"\n'
+      printf 'header = "referer: https://x.com/i/bookmarks"\n'
+    } > "$API_CFG"
+  )
+}
+
 # ---- queryId discovery ----
 # Walks the same path the reference does: bookmarks page -> webpack runtime -> the
 # Bookmarks chunk -> the queryId literal beside operationName:"Bookmarks".
@@ -148,7 +176,7 @@ extract_qid() { grep -oE 'queryId:"[^"]+",operationName:"Bookmarks"' "$1" 2>/dev
 
 detect_query_id() {
   local html="$TMP/bookmarks.html"
-  curl_x -H "cookie: auth_token=$X_AUTH_TOKEN; ct0=$X_CT0" \
+  curl_x --config "$COOKIE_CFG" \
          -o "$html" -w '%{http_code}' "https://x.com/i/bookmarks" > "$TMP/code" 2>/dev/null
   local code; code=$(cat "$TMP/code" 2>/dev/null)
   [ -s "$html" ] || { fail "could not load x.com/i/bookmarks (HTTP ${code:-none})"; return 1; }
@@ -219,14 +247,7 @@ fetch_page() {
     --data-urlencode "variables=$vars" \
     --data-urlencode "features=$FEATURES" \
     --data-urlencode "fieldToggles=$FIELD_TOGGLES" \
-    -H "authorization: Bearer $BEARER" \
-    -H "cookie: auth_token=$X_AUTH_TOKEN; ct0=$X_CT0" \
-    -H "x-csrf-token: $X_CT0" \
-    -H 'x-twitter-active-user: yes' \
-    -H 'x-twitter-auth-type: OAuth2Session' \
-    -H 'x-twitter-client-language: en' \
-    -H 'content-type: application/json' \
-    -H 'referer: https://x.com/i/bookmarks' \
+    --config "$API_CFG" \
     -o "$TMP/page.json" -w '%{http_code}' 2>/dev/null)
 
   case "$code" in
@@ -364,6 +385,7 @@ collect() {
        return 0 ;;
   esac
   warn_perms
+  write_curl_configs
 
   if ! fetch_new; then
     # A failed fetch still lets previously-recorded unread bookmarks through below —

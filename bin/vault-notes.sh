@@ -107,7 +107,14 @@ ensure_vault() {
 materialize() {
   local dir="$1" waited=0
   [ -d "$dir" ] || return 0
+  # Both are asked, because neither is reliable alone. `brctl download` predates the
+  # FileProvider migration (Monterey) and on a current system it frequently succeeds
+  # while doing nothing at all, which would leave the wait loop below as the only
+  # mechanism — a passive timeout dressed up as a fetch. `fileproviderctl materialize`
+  # is the FileProvider-era equivalent and is what actually pulls the file down on
+  # modern macOS. Keep brctl for older systems; neither failing is an error.
   command -v brctl >/dev/null 2>&1 && brctl download "$dir" >/dev/null 2>&1 || true
+  command -v fileproviderctl >/dev/null 2>&1 && fileproviderctl materialize "$dir" >/dev/null 2>&1 || true
   while [ "$waited" -lt "$ICLOUD_WAIT" ]; do
     # Placeholders are dot-prefixed siblings ending in .icloud; no placeholder means
     # every file in the directory has its contents locally.
