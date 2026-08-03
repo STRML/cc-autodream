@@ -1,5 +1,9 @@
 name: tests
 
+# push is filtered to main on purpose: with `pull_request:` also enabled, an
+# unfiltered push trigger runs every PR commit twice. Branch work is covered by
+# the PR trigger; both routes into main - a merge and a direct push - fire the
+# push trigger. A feature branch with no PR runs nothing, which is the trade.
 on:
   push:
     branches: [main]
@@ -26,7 +30,7 @@ jobs:
         run: |
           jq --version
           python3 --version
-          brew install coreutils
+          command -v gtimeout >/dev/null 2>&1 || brew install coreutils
           gtimeout --version | head -1
 
       - name: run-all
