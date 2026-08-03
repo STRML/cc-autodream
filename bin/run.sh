@@ -190,7 +190,7 @@ fi
 mkdir -p "$FINDINGS_DIR" "$DREAMS_DIR" "$LOG_DIR" "$WORK_DIR"
 
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-cd "$HOME"
+cd "$HOME" || exit 1
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 

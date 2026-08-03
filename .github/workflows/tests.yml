@@ -1,0 +1,54 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # macOS, not Linux: the suites use BSD `date` and `touch` semantics and will
+    # fail on GNU coreutils. Every suite runs against tests/mock-claude.sh, so
+    # nothing here needs network or a real model.
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check deps
+        run: |
+          jq --version
+          python3 --version
+
+      - name: run-all
+        run: bash tests/run-all.sh
+
+      - name: cookie-cadence
+        run: bash tests/cookie-cadence.sh
+
+      - name: review-skip
+        run: bash tests/review-skip.sh
+
+      - name: x-bookmarks
+        run: bash tests/x-bookmarks.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # The shipped scripts are held at `warning`. A cron job nobody watches
+      # cannot afford a swallowed exit code, and that is the class shellcheck
+      # actually catches (SC2164, SC2155).
+      - name: shellcheck bin + install
+        run: shellcheck --severity=warning bin/*.sh install.sh
+
+      # Test code is held at `error` only. tests/run-all.sh has ~24 SC2155
+      # hits from `local x=$(cmd)` in assertion helpers, where masking a return
+      # value has no consequence. Tighten this if that stops being true.
+      - name: shellcheck tests
+        run: shellcheck --severity=error tests/*.sh
