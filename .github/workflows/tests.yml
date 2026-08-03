@@ -18,10 +18,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # coreutils is for `gtimeout` only: four oversized-gate assertions need GNU
+      # timeout and stock macOS ships neither name. Deliberately NOT adding
+      # coreutils' gnubin to PATH - the suite depends on BSD `date` and `touch`,
+      # and GNU versions of those would break far more than they fix.
       - name: check deps
         run: |
           jq --version
           python3 --version
+          brew install coreutils
+          gtimeout --version | head -1
 
       - name: run-all
         run: bash tests/run-all.sh
