@@ -108,7 +108,8 @@ install_schedule() {
   local path_val="${path_dirs:+$path_dirs:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
   local target_plist="$la_dir/$label.plist"
-  local domain="gui/$(id -u)"
+  local domain
+  domain="gui/$(id -u)"
 
   cat > "$target_plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

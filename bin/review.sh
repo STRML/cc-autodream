@@ -232,7 +232,7 @@ echo "─── autodream review: $DATE ($REPORT_BYTES bytes) ───"
 echo "Starting triage. /quit to exit."
 echo
 
-cd "$HOME"
+cd "$HOME" || exit 1
 exec "$CLAUDE_BIN" \
   --permission-mode bypassPermissions \
   --append-system-prompt "$SYSTEM" \

@@ -1166,14 +1166,22 @@ test_oversized_gate_script_args(){
   [ -x "$GATE" ] || { no "oversized-gate.sh executable"; return 0; }
   # `--days` with no value left $# at 1 while `shift 2` refused to shift, looping forever.
   # A hang in a nightly-adjacent script is worse than a wrong number, so it gets a test.
+  # These are the only assertions in the suite that need GNU `timeout`. Stock macOS has
+  # neither name; homebrew coreutils installs `gtimeout`, and `timeout` too if its gnubin
+  # is on PATH. Resolve whichever exists and say so plainly when neither does — without
+  # this, all four assertions come back as exit 127 and read like real regressions.
+  local TO=""
+  command -v timeout  >/dev/null 2>&1 && TO=timeout
+  [ -n "$TO" ] || { command -v gtimeout >/dev/null 2>&1 && TO=gtimeout; }
+  [ -n "$TO" ] || { no "oversized-gate arg tests need GNU timeout (brew install coreutils)"; return 0; }
   local out rc
-  out=$( { timeout 10 bash "$GATE" --days; } 2>&1 ); rc=$?
+  out=$( { "$TO" 10 bash "$GATE" --days; } 2>&1 ); rc=$?
   assert_eq "$rc" "2" "--days with no value exits 2 instead of hanging (124 would be the hang)"
-  out=$( { timeout 10 bash "$GATE" --days abc; } 2>&1 ); rc=$?
+  out=$( { "$TO" 10 bash "$GATE" --days abc; } 2>&1 ); rc=$?
   assert_eq "$rc" "2" "--days with a non-integer exits 2"
-  out=$( { timeout 10 bash "$GATE" --days 0; } 2>&1 ); rc=$?
+  out=$( { "$TO" 10 bash "$GATE" --days 0; } 2>&1 ); rc=$?
   assert_eq "$rc" "2" "--days 0 exits 2"
-  out=$( { timeout 10 bash "$GATE" --bogus; } 2>&1 ); rc=$?
+  out=$( { "$TO" 10 bash "$GATE" --bogus; } 2>&1 ); rc=$?
   assert_eq "$rc" "2" "an unknown option exits 2 rather than being read as a findings dir"
 }
 

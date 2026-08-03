@@ -195,6 +195,24 @@ How it works: it writes a transient one-shot LaunchAgent (`<base-label>.ondemand
 
 When you (the agent) need to kick off a run, prefer this over a background Bash task — fire it, then poll `dreams/<date>.md` instead of holding a long task open.
 
+## Reviewing changes here
+
+Almost everything in this repo is shell, and a shell bug here fails silently on a
+nightly cron nobody is watching. `/code-review` is a fine first pass but it is not the
+gate. Before merging any change to `run.sh`, `bin/*.sh`, `install.sh`, the launchd
+plists, or the prompts, also run `/debate:run tight` — that preset is Codex + Gemini +
+DeepSeek, so at least one seat does not share Claude's blind spots.
+
+This is not a hypothetical. PR #37 (merged 2026-08-02) was reviewed by a fanout of 30+
+Claude verifier subagents. They found 18 real defects, which is the case for the fanout.
+But ten of those verifiers issued verdicts quoting `file:line` they had never read, and
+three of them accused a sibling of fabricating citations while fabricating their own.
+Adding more Claude seats does not catch that, because every seat fails the same way.
+A different vendor does.
+
+DeepSeek direct retains prompts and trains on them. That is fine for this repo, which is
+public. For private code, swap the seat rather than skipping the pass.
+
 ## Tests
 
 `tests/run-all.sh` drives the real `run.sh` against `tests/mock-claude.sh` (no network, no model). Mock modes: `good` (default), `l1_incomplete` (worker writes nothing), `l1_flaky` (fails first dispatch per session, succeeds on retry). The suite forces `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0` and a low `AUTODREAM_L1_ROUNDS` so it never sleeps or hits the network. macOS only (BSD `date`/`touch`). Run it after any run.sh/prompt change.
