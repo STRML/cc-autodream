@@ -1112,6 +1112,81 @@ test_runner_provenance_no_git(){
   rm -rf "$root"
 }
 
+test_runner_provenance_through_symlink(){
+  echo "# runner provenance (#29): the installed symlink layout still stamps the repo's sha"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # Reproduce what install.sh actually leaves on disk, which is what the earlier tests
+  # missed: ~/.claude/autodream is a REAL directory holding one symlink per script, not a
+  # symlink to the checkout. `cd "$(dirname "$0")"` therefore lands in a directory with no
+  # .git, and provenance has to follow the file's own link to find the working tree.
+  # Six production runs through 2026-08-03 stamped "unknown" against a clean checkout.
+  local f; for f in "$REPO"/bin/*.sh; do ln -sf "$f" "$root/autodream/$(basename "$f")"; done
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
+  PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+  bash "$root/autodream/run.sh" "$DATE" > "$root/run.out" 2>&1
+  local head; head=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" "runner_commit: $head" "a symlinked runner reports the checkout it points at"
+  assert_file "$root/dreams/$DATE.md"          "the run still produced a report"
+  rm -rf "$root"
+}
+
+test_runner_provenance_relative_symlink(){
+  echo "# runner provenance (#29): a symlink with a relative target still finds the checkout"
+  command -v python3 >/dev/null 2>&1 || { echo "  skip - python3 not available"; return 0; }
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # install.sh writes absolute targets, so nothing in production exercises the walk's
+  # relative-target branch. A hand-rolled install (ln -s ../../git/oss/cc-autodream/bin/…)
+  # produces one, and a target resolved against $PWD instead of the link's own directory
+  # silently lands nowhere.
+  # Both sides must be physical paths before relpath: on macOS $TMPDIR sits under /var,
+  # which is itself a link to /private/var, so a relative path computed from the logical
+  # name walks up through a directory that does not exist and the link is born broken.
+  local phys_ad phys_bin rel
+  phys_ad=$(cd "$root/autodream" && pwd -P)
+  phys_bin=$(cd "$REPO/bin" && pwd -P)
+  rel=$(python3 -c 'import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))' "$phys_bin" "$phys_ad")
+  local f; for f in "$REPO"/bin/*.sh; do ln -sf "$rel/$(basename "$f")" "$root/autodream/$(basename "$f")"; done
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
+  PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+  bash "$root/autodream/run.sh" "$DATE" > "$root/run.out" 2>&1
+  local head; head=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
+  assert_grep "$(fdir "$root")/run-stats.txt" "runner_commit: $head" "a relative link target resolves against the link's own dir"
+  assert_file "$root/dreams/$DATE.md" "the run still produced a report"
+  rm -rf "$root"
+}
+
+test_runner_provenance_unresolvable_chain(){
+  echo "# runner provenance (#29): a chain past the hop cap says unknown, never a wrong sha"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local f; for f in "$REPO"/bin/*.sh; do ln -sf "$f" "$root/autodream/$(basename "$f")"; done
+  # A chain longer than the cap leaves the walk holding a path that is still a symlink.
+  # Resolving it anyway would stamp the sha of whatever checkout that truncated path sits
+  # in — here, this very repo, which is exactly the plausible-but-wrong answer #29 exists
+  # to rule out. 12 hops clears the cap of 8 while staying under macOS's ELOOP limit of 16,
+  # so bash still executes the script and only the provenance field degrades.
+  local prev="$REPO/bin/run.sh" i
+  for i in $(seq 1 12); do
+    ln -sf "$prev" "$root/autodream/hop-$i.sh"
+    prev="$root/autodream/hop-$i.sh"
+  done
+  ln -sf "$prev" "$root/autodream/run.sh"
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
+  PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+  bash "$root/autodream/run.sh" "$DATE" > "$root/run.out" 2>&1
+  local stats="$(fdir "$root")/run-stats.txt"
+  assert_grep "$stats" 'runner_commit: unknown' "an unresolved chain degrades instead of guessing"
+  assert_grep "$stats" 'runner_dirty: no'       "dirty is not claimed when the commit is unknown"
+  assert_file "$root/dreams/$DATE.md"           "the run still produced a report"
+  rm -rf "$root"
+}
+
 test_oversized_gate_script(){
   echo "# oversized-gate.sh (#29): recomputes the #12 window from artifacts, including dates whose run-stats.txt lacks the keys"
   local GATE="$REPO/bin/oversized-gate.sh"
@@ -1574,6 +1649,9 @@ test_stats_sidecar_malformed_counted
 test_stats_sidecar_non_numeric_counted
 test_runner_provenance
 test_runner_provenance_no_git
+test_runner_provenance_through_symlink
+test_runner_provenance_relative_symlink
+test_runner_provenance_unresolvable_chain
 test_oversized_gate_script
 test_oversized_gate_script_open
 test_oversized_gate_script_empty
