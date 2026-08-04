@@ -169,19 +169,57 @@ else
 fi
 
 # Provenance of the code actually executing (#29), stamped into run-stats.txt below.
-# Resolved against SCRIPT_DIR (which follows the ~/.claude/autodream symlink back into
-# the working tree) rather than $PWD, since launchd starts the job from an unrelated cwd.
+# Resolved by walking this script's own symlink chain rather than by reusing SCRIPT_DIR,
+# which is a working directory and not a checkout. install.sh symlinks each script
+# individually into ~/.claude/autodream, so that directory is real and has no .git, and
+# `cd "$(dirname "$0")"` resolves symlinked *directories* but not a symlinked *file* —
+# it lands in the install dir every time. Six of the eight runs through 2026-08-03 wrote
+# `runner_commit: unknown` for that reason alone, which is the exact blind spot #29
+# existed to close. The two that did stamp a sha were launched from the repo by hand.
+# SCRIPT_DIR stays as it is: helper lookup genuinely wants the install dir.
 # Everything degrades to "unknown"/"no": a tarball install with no git, or no git binary
 # at all, is a supported way to run this and must not fail the run.
 # --untracked-files=no on the dirty check: "dirty" is meant to warn that the run used code
 # that exists in nobody's history, which only tracked modifications can cause. Counting
 # untracked files made the first production run report runner_dirty: yes over a stray
 # scratch directory, which is exactly the kind of false alarm that gets a signal ignored.
-RUNNER_COMMIT=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null) || RUNNER_COMMIT=""
+RUNNER_SRC="${BASH_SOURCE[0]}"
+runner_hops=0
+# A symlink can point at another symlink, and a target can be relative to the link's own
+# directory rather than to $PWD. The hop cap keeps a cycle from hanging the run.
+# 8 rather than a bigger round number so the cap is reachable in a test: macOS refuses to
+# execute anything behind 16+ links (ELOOP), so a cap at or above that could never fire on
+# a script that got far enough to run this code, and an untestable guard is a guess. Linux
+# allows 40, where it can genuinely fire. A real install is one hop.
+while [ -L "$RUNNER_SRC" ] && [ "$runner_hops" -lt 8 ]; do
+  runner_link_dir=$(cd "$(dirname "$RUNNER_SRC")" && pwd) || break
+  RUNNER_SRC=$(readlink "$RUNNER_SRC") || break
+  case $RUNNER_SRC in /*) ;; *) RUNNER_SRC="$runner_link_dir/$RUNNER_SRC" ;; esac
+  runner_hops=$((runner_hops + 1))
+done
+# Still a symlink means the walk gave up (a cycle, or a chain past the cap) rather than
+# arriving anywhere. Resolving the truncated path would stamp whatever checkout it happens
+# to sit in, and a confidently wrong sha is worse than no sha at all — the whole point of
+# #29 is that this field can be trusted when someone is chasing a bad night.
+if [ -L "$RUNNER_SRC" ]; then
+  RUNNER_REPO_DIR=""
+else
+  RUNNER_REPO_DIR=$(cd "$(dirname "$RUNNER_SRC")" && pwd) || RUNNER_REPO_DIR=""
+fi
+# The empty case has to short-circuit before git rather than lean on git to reject it:
+# `git -C "" rev-parse HEAD` does NOT fail, it silently stays in $PWD and answers for
+# whatever repo the caller happened to launch from. launchd starts this job from an
+# unrelated cwd, so leaving that to git would stamp a stranger's sha and call it
+# provenance.
+if [ -z "$RUNNER_REPO_DIR" ]; then
+  RUNNER_COMMIT=""
+else
+  RUNNER_COMMIT=$(git -C "$RUNNER_REPO_DIR" rev-parse --short HEAD 2>/dev/null) || RUNNER_COMMIT=""
+fi
 : "${RUNNER_COMMIT:=unknown}"
 if [ "$RUNNER_COMMIT" = "unknown" ]; then
   RUNNER_DIRTY=no
-elif [ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+elif [ -n "$(git -C "$RUNNER_REPO_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
   RUNNER_DIRTY=yes
 else
   RUNNER_DIRTY=no
