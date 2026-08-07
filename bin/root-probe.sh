@@ -46,6 +46,7 @@ AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 CHOICES="$AUTODREAM_DIR/root-choices.conf"
 
 PRIMARY="$HOME/.claude/projects"
+# shellcheck disable=SC2125  # the glob must stay literal so it expands in the `for` loop below
 PROBE_GLOB="$HOME"/.claude*/projects
 
 MODE=""
