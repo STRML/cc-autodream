@@ -1692,6 +1692,164 @@ test_unassembled_ignores_a_finished_date
 test_no_sessions_stub_carries_marker
 test_old_date_reprocess_does_not_consume
 test_config_unbound_var_does_not_kill_run
+# ---- Multi-root session scanning (SESSION_ROOTS) + root-probe ----
+
+# A run that scans more than one projects dir: primary + one alt, both holding sessions
+# touched into the target day. Works by NOT exporting PROJECTS_DIR (so autodetect runs)
+# and overriding HOME into the sandbox so root-probe discovers the sandbox's claude dirs
+# rather than the host's.
+run_dream_autodetect(){ # $1=root — like run_dream but with HOME inside the sandbox, no PROJECTS_DIR
+  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CONFIG="$1/autodream/config" \
+  AUTODREAM_CONSUME_DATE="$DATE" \
+  AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
+  HOME="$1/home" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
+  bash "$RUN" "$DATE" > "$1/run.out" 2>&1
+  cat "$1/autodream/logs/run-$DATE.log" >> "$1/run.out" 2>/dev/null || true
+}
+setup_env_altroot(){ # like setup_env, but with HOME inside the sandbox (no $1/projects); echoes the root
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$root/home/.claude/projects/proj-a" \
+           "$root/home/.claude-ds4/projects/proj-a" \
+           "$root/autodream" "$root/dreams" "$root/cap"
+  cp "$REPO/prompts/SESSION_TRIAGE.md" "$root/autodream/SESSION_TRIAGE.md"
+  cp "$REPO/prompts/PROMPT.md"         "$root/autodream/PROMPT.md"
+  printf '%s' "$root"
+}
+mk_session_in(){ # $1=dir $2=name
+  local f="$1/$2.jsonl"
+  printf '%s\n' \
+    '{"type":"user","cwd":"/tmp/proj-a","message":{"content":"start the task"}}' \
+    '{"type":"user","message":{"content":"keep going"}}' \
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}' \
+    > "$f"
+  touch -t "$STAMP" "$f"
+}
+
+# Mark an alt root as decided-index so probe_roots scans it.
+decide_index(){ # $1=root-dir — writes $AUTODREAM_DIR/root-choices.conf
+  mkdir -p "$1/autodream"
+  printf '%s=index\n' "$2" >> "$1/autodream/root-choices.conf"
+}
+
+test_multiroot_triages_alt_root(){
+  echo "# multi-root: sessions in a second (decided) claude dir get triaged too"
+  local root; root=$(setup_env_altroot)
+  decide_index "$root" "$root/home/.claude-ds4/projects"
+  mk_session_in "$root/home/.claude/projects/proj-a" s1
+  mk_session_in "$root/home/.claude-ds4/projects/proj-a" s2
+  run_dream_autodetect "$root"
+  local fdir="$root/autodream/findings/$DATE"
+  assert_grep "$root/run.out" "session roots:" "probe_roots logged the resolved roots"
+  assert_file "$fdir/$(printf '%s' "$root/home/.claude/projects/proj-a/s1.jsonl" | shasum | cut -c1-12).json" "primary-root session has a findings JSON"
+  assert_file "$fdir/$(printf '%s' "$root/home/.claude-ds4/projects/proj-a/s2.jsonl" | shasum | cut -c1-12).json" "decided alt-root session has a findings JSON"
+  assert_grep "$root/autodream/findings/$DATE/sessions.txt.raw" "$root/home/.claude/projects/proj-a/s1.jsonl" "primary session enumerated"
+  assert_grep "$root/autodream/findings/$DATE/sessions.txt.raw" "$root/home/.claude-ds4/projects/proj-a/s2.jsonl" "decided alt session enumerated"
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" "session_roots: 2" "run-stats reports 2 roots scanned"
+  # A decided-index root is not flagged.
+  assert_nogrep "$root/autodream/findings/$DATE/unindexed-roots.txt" "$root/home/.claude-ds4/projects" "a decided-index root is not flagged"
+  rm -rf "$root"
+}
+
+test_multiroot_heldout_and_dedup(){
+  echo "# multi-root: undecided dirs are held out (flagged, not triaged); a file reachable via symlink from two roots is triaged once"
+  local root; root=$(setup_env_altroot)
+  decide_index "$root" "$root/home/.claude-ds4/projects"
+  # An undecided third dir (present, no choice recorded).
+  mkdir -p "$root/home/.claude-sigint/projects/proj-a"
+  mk_session_in "$root/home/.claude-sigint/projects/proj-a" s9
+  mk_session_in "$root/home/.claude/projects/proj-a" s1
+  # The same transcript reachable from both decided roots: a symlink in the alt root
+  # pointing at the primary's file. `find -type f` follows the link and reports the
+  # target path, so the two roots yield the SAME path and sort -u must collapse it.
+  mk_session_in "$root/home/.claude/projects/proj-a" s2
+  ln -s "$root/home/.claude/projects/proj-a/s2.jsonl" "$root/home/.claude-ds4/projects/proj-a/s2.jsonl"
+  run_dream_autodetect "$root"
+  local fdir="$root/autodream/findings/$DATE"
+  # Held-out: sigint is flagged and its session is NOT triaged.
+  assert_grep "$fdir/unindexed-roots.txt" "$root/home/.claude-sigint/projects" "the undecided sigint dir is flagged"
+  assert_nogrep "$fdir/sessions.txt.raw" "$root/home/.claude-sigint/projects/proj-a/s9.jsonl" "the undecided sigint session is NOT triaged"
+  # Dedup: the symlinked path appears exactly once in sessions.txt.raw.
+  local n; n=$(grep -c "$root/home/.claude/projects/proj-a/s2.jsonl" "$fdir/sessions.txt.raw")
+  assert_eq "$n" "1" "the symlinked path appears once in sessions.txt.raw"
+  local p; p=$(printf '%s' "$root/home/.claude/projects/proj-a/s2.jsonl" | shasum | cut -c1-12)
+  assert_file "$fdir/$p.json" "the one overlapping session has a findings JSON"
+  rm -rf "$root"
+}
+
+test_multiroot_flags_unindexed(){
+  echo "# multi-root: claude dirs that exist but are not indexed are flagged for the report"
+  local root; root=$(setup_env_altroot)
+  # Third dir, present, not indexed, not in root-choices.conf.
+  mkdir -p "$root/home/.claude-sigint/projects/proj-a"
+  : > "$root/home/.claude-sigint/projects/proj-a/s9.jsonl"; touch -t "$STAMP" "$root/home/.claude-sigint/projects/proj-a/s9.jsonl"
+  mk_session_in "$root/home/.claude/projects/proj-a" s1
+  # The ds4 dir (from setup) is also present and undecided.
+  mk_session_in "$root/home/.claude-ds4/projects/proj-a" s2
+  run_dream_autodetect "$root"
+  local flag="$root/autodream/findings/$DATE/unindexed-roots.txt"
+  assert_file "$flag" "unindexed-roots.txt written"
+  assert_grep "$flag" "$root/home/.claude-sigint/projects" "the sigint dir is named"
+  assert_grep "$flag" "$root/home/.claude-ds4/projects" "the ds4 dir is named too"
+  assert_nogrep "$flag" "$root/home/.claude/projects" "the primary dir is never flagged"
+  # Neither undecided dir is triaged — they're held out until decided.
+  assert_nogrep "$root/autodream/findings/$DATE/sessions.txt.raw" "$root/home/.claude-sigint/projects/proj-a/s9.jsonl" "sigint session is not triaged"
+  assert_nogrep "$root/autodream/findings/$DATE/sessions.txt.raw" "$root/home/.claude-ds4/projects/proj-a/s2.jsonl" "ds4 session is not triaged"
+  rm -rf "$root"
+}
+
+# ---- root-probe.sh unit tests (no run.sh) ----
+rp(){ AUTODREAM_DIR="$T/ad" HOME="$T/home" "$REPO/bin/root-probe.sh" "$@"; }
+
+test_rootprobe_remembers_choice(){
+  echo "# root-probe: --default-index records the choice once and stops re-asking"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home/.claude/projects" "$T/home/.claude-ds4/projects" "$T/ad"
+  rp --default-index >/dev/null 2>&1
+  assert_grep "$T/ad/root-choices.conf" "$T/home/.claude-ds4/projects=index" "unasked alt root recorded as index"
+  # Second invocation with a NEW unasked dir: only the new one gets a line.
+  mkdir -p "$T/home/.claude-sigint/projects"
+  rp --default-index >/dev/null 2>&1
+  local n; n=$(grep -c '^.*=index' "$T/ad/root-choices.conf")
+  assert_eq "$n" "2" "second run records only the newly-unasked root"
+  assert_nogrep "$T/ad/root-choices.conf" "$T/home/.claude-sigint/projects=ignore" "new root not ignored"
+  rm -rf "$T"
+}
+
+test_rootprobe_no_write_mode_flags_but_does_not_write(){
+  echo "# root-probe: nightly mode (no --ask/--default-index) flags but never writes choices"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home/.claude/projects" "$T/home/.claude-ds4/projects" "$T/ad"
+  rp --unindexed >/dev/null 2>&1 || true
+  assert_no_file "$T/ad/root-choices.conf" "no choice file written by a nightly-mode run"
+  rm -rf "$T"
+}
+
+test_rootprobe_empty_home(){
+  echo "# root-probe: a machine with no claude dirs at all must not abort (empty roots, set -u)"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home" "$T/ad"
+  # Capture the exit code before any `|| true` swallows it.
+  local out rc
+  out=$(HOME="$T/home" AUTODREAM_DIR="$T/ad" "$REPO/bin/root-probe.sh" --list 2>&1)
+  rc=$?
+  assert_eq "$rc" "0" "root-probe --list exits 0 with no claude dirs (got $rc)"
+  local n; n=$(printf '%s\n' "$out" | grep -c .)
+  assert_eq "$n" "0" "no roots are listed (got $n)"
+  out=$(HOME="$T/home" AUTODREAM_DIR="$T/ad" "$REPO/bin/root-probe.sh" --consolidated 2>&1)
+  rc=$?
+  assert_eq "$rc" "0" "root-probe --consolidated exits 0 with no claude dirs (got $rc)"
+  rm -rf "$T"
+}
+
+# ---- run the new tests ----
+test_multiroot_triages_alt_root
+test_multiroot_heldout_and_dedup
+test_multiroot_flags_unindexed
+test_rootprobe_remembers_choice
+test_rootprobe_no_write_mode_flags_but_does_not_write
+test_rootprobe_empty_home
+
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

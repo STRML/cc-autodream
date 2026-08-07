@@ -14,7 +14,13 @@
 #
 # Environment overrides (all optional):
 #   CLAUDE_BIN     path to claude CLI                   default: $HOME/.local/bin/claude
-#   PROJECTS_DIR   where session JSONLs live           default: $HOME/.claude/projects
+#   PROJECTS_DIR   single root: where session JSONLs live (kept for compat; one root)
+#                  default: $HOME/.claude/projects
+#   SESSION_ROOTS  colon-separated dirs to scan for session JSONLs. Takes precedence
+#                  over PROJECTS_DIR. If neither is set, every $HOME/.claude*/projects
+#                  that exists is scanned (primary always first) — each CLAUDE_CONFIG_DIR
+#                  profile keeps its own projects/ bucket, so one-dir scanning silently
+#                  missed sessions recorded under ~/.claude-nous, ~/.claude-ds4, ...
 #   AUTODREAM_DIR  scripts + prompts + state           default: $HOME/.claude/autodream
 #   DREAMS_DIR     where final reports are written     default: $HOME/.claude/dreams
 #   FANOUT         L1 parallelism                      default: 8
@@ -45,7 +51,17 @@
 set -u
 
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
-PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.claude/projects}"
+# PROJECTS_DIR's default is applied here AND its explicit-ness is recorded, because the
+# resolution order is SESSION_ROOTS > PROJECTS_DIR(explicit) > autodetect. `:-` can't
+# tell "unset" from "set to the default", and treating the always-present default as
+# explicit would make autodetect unreachable.
+PROJECTS_DIR_EXPLICIT=0
+if [ -n "${PROJECTS_DIR+x}" ]; then
+  PROJECTS_DIR_EXPLICIT=1
+  PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.claude/projects}"
+else
+  PROJECTS_DIR="$HOME/.claude/projects"
+fi
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 
 # ---- Config file ----
@@ -124,6 +140,15 @@ SESSIONS_LIST="$FINDINGS_DIR/sessions.txt"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
 [ -x "$PRUNE" ] || PRUNE="$AUTODREAM_DIR/prune-self-sessions.sh"
+# Root prober — decides which $HOME/.claude*/projects dirs to scan (see root-probe.sh).
+# AUTODREAM_ROOTPROBE_BIN overrides the resolved path (no existability fallback), so
+# tests can point it at a stub and exercise the scan fallbacks deterministically.
+if [ -n "${AUTODREAM_ROOTPROBE_BIN:-}" ]; then
+  ROOT_PROBE="$AUTODREAM_ROOTPROBE_BIN"
+else
+  ROOT_PROBE="$SCRIPT_DIR/root-probe.sh"
+  [ -x "$ROOT_PROBE" ] || ROOT_PROBE="$AUTODREAM_DIR/root-probe.sh"
+fi
 # Oversized-transcript slimmer (resolved the same way; exported to the L1 workers).
 SLIM="$SCRIPT_DIR/slim-transcript.sh"
 [ -x "$SLIM" ] || SLIM="$AUTODREAM_DIR/slim-transcript.sh"
@@ -238,6 +263,77 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 # running workers from $WORK_DIR those stubs land in $WORK_BUCKET, which we empty
 # before and after every run so they never accumulate in the user's session history.
 clean_work_bucket() { rm -rf "$WORK_BUCKET" 2>/dev/null || true; }
+
+# ---- Session-root selection ----
+# autodream scans one or more $HOME/.claude*/projects dirs. Resolution order:
+#   1. SESSION_ROOTS (colon-separated, set by env/config) — authoritative.
+#   2. PROJECTS_DIR — but ONLY when the caller explicitly set it (its default is applied
+#      anyway at startup, so an explicit-set flag is what distinguishes a deliberate
+#      single-root choice from an unset variable). Kept for backward compatibility.
+#   3. Neither: autodetect every $HOME/.claude*/projects that exists, primary
+#      ($HOME/.claude/projects) first, via root-probe.sh. If the probe is missing or
+#      fails, fall back to the primary dir alone rather than scanning nothing.
+# WORK_BUCKET stays keyed off the PRIMARY dir: the lean workers run under the default
+# config, so their AI-title stubs land in the default bucket, which the isolation +
+# clean_work_bucket above is built around. Scanning extra roots does not change that.
+probe_roots() {
+  SESSION_ROOTS="${SESSION_ROOTS:-}"
+  if [ -z "$SESSION_ROOTS" ] && [ "$PROJECTS_DIR_EXPLICIT" = "1" ]; then
+    SESSION_ROOTS="$PROJECTS_DIR"
+  fi
+  if [ -n "$SESSION_ROOTS" ]; then
+    log "session roots: ${SESSION_ROOTS//:/, }"
+    return 0
+  fi
+  if [ -x "$ROOT_PROBE" ]; then
+    # Scan the decided roots only: primary + the ones root-choices.conf says index.
+    # An unasked root is held out of the report until the user decides on it — that is
+    # the point of the flag file (write_unindexed_flag) the report reads: "found a
+    # folder we're not indexing." Scanning an undecided folder would make that flag a
+    # lie. Folders the user explicitly ignored are likewise skipped.
+    SESSION_ROOTS=$("$ROOT_PROBE" --consolidated 2>/dev/null) || SESSION_ROOTS=""
+  fi
+  [ -n "$SESSION_ROOTS" ] || SESSION_ROOTS="$HOME/.claude/projects"
+  log "session roots: ${SESSION_ROOTS//:/, }"
+}
+
+# Which roots exist but are NOT indexed — written to a flag file so the morning report
+# can tell the human a Claude folder appeared that setup never asked about. Never a
+# prompt in the unattended run; the report is the surface.
+write_unindexed_flag() {
+  local flag="$FINDINGS_DIR/unindexed-roots.txt"
+  : > "$flag"
+  [ -x "$ROOT_PROBE" ] || { printf 'root-probe.sh not found; cannot detect unindexed claude folders\n' > "$flag"; return 0; }
+  "$ROOT_PROBE" --unindexed 2>/dev/null >> "$flag" || true
+  [ -s "$flag" ] || printf '(none — every $HOME/.claude*/projects dir is indexed)\n' > "$flag"
+}
+
+# Find sessions modified during the target day across every session root.
+scan_roots() {
+  : > "$SESSIONS_LIST.raw"
+  local -a roots
+  IFS=: read -ra roots <<< "$SESSION_ROOTS"
+  local r
+  for r in "${roots[@]}"; do
+    [ -n "$r" ] || continue
+    # SESSION_ROOTS is colon-separated, so a root path containing ':' is unrepresentable:
+    # the split above already fragmented it. Catch the symptom — a fragment that is not
+    # a directory (or that was split out of one) — and say why it's being skipped rather
+    # than silently scanning nothing.
+    if [ ! -d "$r" ]; then
+      log "WARNING: session root is not a directory (possible ':' in path — SESSION_ROOTS is colon-separated): $r"
+      continue
+    fi
+    find "$r" -type f -name '*.jsonl' \
+         -newermt "$TARGET_DATE 00:00:00" \
+         ! -newermt "$NEXT_DATE 00:00:00" \
+         2>/dev/null >> "$SESSIONS_LIST.raw"
+  done
+  # A transcript reachable from two roots (e.g. one dir is a symlink of another) must
+  # be triaged exactly once.
+  sort -u "$SESSIONS_LIST.raw" -o "$SESSIONS_LIST.raw"
+  RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
+}
 
 # ---- Empty-session filter: drop 0-turn shells before fanout ----
 # Most of a quiet night's corpus is auto-opened/aborted sessions that hold no user
@@ -605,6 +701,14 @@ run() {
 
   [ -x "$CLAUDE_BIN" ] || { log "FATAL: claude not at $CLAUDE_BIN"; exit 1; }
 
+  # ---- Session roots (which $HOME/.claude*/projects dirs we scan) ----
+  probe_roots
+
+  # Flag found-but-not-indexed Claude folders for the report (never a prompt here).
+  # Written before the idempotency guard on purpose: a catch-up trigger that no-ops for
+  # today should still report folders that appeared since setup.
+  write_unindexed_flag
+
   # ---- Dates that were triaged but never assembled (#36) ----
   # A run killed during L2 leaves a full findings dir and no report, and nothing notices:
   # notify.sh never runs, so there is not even a quiet banner. 2026-07-26 sat that way for
@@ -633,12 +737,8 @@ run() {
   fi
 
   # ---- Enumerate sessions modified during the target day ----
-  log "scanning $PROJECTS_DIR for sessions modified between $TARGET_DATE and $NEXT_DATE..."
-  find "$PROJECTS_DIR" -type f -name '*.jsonl' \
-       -newermt "$TARGET_DATE 00:00:00" \
-       ! -newermt "$NEXT_DATE 00:00:00" \
-       2>/dev/null > "$SESSIONS_LIST.raw"
-  RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
+  log "scanning for sessions modified between $TARGET_DATE and $NEXT_DATE..."
+  scan_roots
 
   # Exclude autodream's OWN headless worker/aggregator transcripts. New runs leave none
   # (--no-session-persistence), but runs predating that fix littered ~/.claude/projects/
@@ -866,6 +966,9 @@ PY
   [ "$DROPPED_AFTER_FAILURES" -lt 0 ] && DROPPED_AFTER_FAILURES=0
   L1_FRESHLY_PROCESSED=$(( L1_OK - L1_PRECACHED ))
   [ "$L1_FRESHLY_PROCESSED" -lt 0 ] && L1_FRESHLY_PROCESSED=0
+  # How many directories we scanned for sessions (colon-count + 1). Kept as its own
+  # stat so a regression to single-root scanning is visible from the artifact.
+  SESSION_ROOT_COUNT=$(( $(printf '%s' "$SESSION_ROOTS" | tr -cd ':' | wc -c) + 1 ))
   {
     printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
     # Which code produced this file (#29). install.sh symlinks ~/.claude/autodream/*.sh
@@ -879,6 +982,8 @@ PY
     # the commit makes the runner's age legible from the artifact itself.
     printf 'runner_commit: %s\n' "$RUNNER_COMMIT"
     printf 'runner_dirty: %s\n' "$RUNNER_DIRTY"
+    printf 'session_roots: %s\n' "$SESSION_ROOT_COUNT"
+    printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
     printf 'sessions_found_raw: %s\n' "$RAW"
     printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
     printf 'sessions_skipped_empty: %s\n' "$SKIPPED_EMPTY"

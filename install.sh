@@ -62,10 +62,40 @@ link "$REPO_DIR/bin/oversized-gate.sh"       "$TARGET/oversized-gate.sh"
 link "$REPO_DIR/bin/cookie-cadence.sh"       "$TARGET/cookie-cadence.sh"
 link "$REPO_DIR/bin/vault-notes.sh"          "$TARGET/vault-notes.sh"
 link "$REPO_DIR/bin/x-bookmarks.sh"          "$TARGET/x-bookmarks.sh"
+link "$REPO_DIR/bin/root-probe.sh"           "$TARGET/root-probe.sh"
 link "$REPO_DIR/prompts/PROMPT.md"      "$TARGET/PROMPT.md"
 link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 
 chmod +x "$REPO_DIR/bin/"*.sh
+
+# --------------------------------------------------- session roots --
+# autodream scans every $HOME/.claude*/projects dir that has a session store. At
+# install time we detect them, ask about the ones the user hasn't decided on yet, and
+# record the decision in root-choices.conf so the nightly run stays unattended. On a
+# non-TTY install (CI, an automated shell), unasked roots default to indexed so the
+# install silently covers everything; the log line says what was chosen. The
+# SESSION_ROOTS line below is the managed section run.sh sources.
+if [ -x "$TARGET/root-probe.sh" ]; then
+  CONFIG="$TARGET/config"
+  if [ -t 1 ]; then
+    AUTODREAM_DIR="$TARGET" "$TARGET/root-probe.sh" --ask
+  else
+    echo "  non-interactive install: indexing any unasked Claude folders (edit root-choices.conf to change)"
+    AUTODREAM_DIR="$TARGET" "$TARGET/root-probe.sh" --default-index
+  fi
+  # Insert/replace the managed section. A prior line (or lines) under the marker is
+  # removed so re-installs converge instead of stacking SESSION_ROOTS definitions.
+  if [ -f "$CONFIG" ]; then
+    awk '
+      /^# claude-folder-indexing/{skip=1; next}
+      skip && /^SESSION_ROOTS=/{next}
+      skip && /^[^#]/{skip=0}
+      {print}
+    ' "$CONFIG" > "$CONFIG.new" && mv "$CONFIG.new" "$CONFIG"
+  fi
+  { echo; AUTODREAM_DIR="$TARGET" "$TARGET/root-probe.sh" --write-config; } >> "$CONFIG"
+  echo "  session roots written to $CONFIG (see root-choices.conf to adjust)"
+fi
 
 # Build the rebranded "cc-autodream" notifier bundle so open-questions banners show up
 # under that name instead of "terminal-notifier". No-op if terminal-notifier isn't

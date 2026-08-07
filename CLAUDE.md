@@ -10,6 +10,41 @@ A nightly two-layer pipeline that reads yesterday's Claude Code session transcri
 - **Layer 2** (`prompts/PROMPT.md`, opus, single call): reads all findings JSONs, writes `dreams/YYYY-MM-DD.md`, optionally pins to project MEMORY.md.
 - `bin/run.sh` orchestrates both layers and everything around them.
 
+## Session roots: one dir is not the corpus
+
+The user runs several Claude config dirs at once (`~/.claude-nous`, `~/.claude-ds4`,
+`~/.claude-sigint`, ...), each with its own `projects/` bucket. autodream used to scan
+only `$HOME/.claude/projects`, so the nightly report silently stopped seeing the real
+work — triage collapsed 132 → 7 → 8 → 1 sessions/night on 2026-08-03…06 purely because
+the sessions had moved to the other buckets. The fix is multi-root scanning:
+
+- `SESSION_ROOTS` (colon-separated) wins; else `PROJECTS_DIR` (single root, kept for
+  compat); else autodetect every `$HOME/.claude*/projects` via `bin/root-probe.sh`,
+  primary first. `run.sh` logs the resolved list every run.
+- `WORK_BUCKET` stays keyed off the PRIMARY dir: lean workers run under the default
+  config, so their AI-title stubs land in the default bucket — scanning extra roots
+  does not change the isolation/wipe story.
+- `root-choices.conf` remembers the per-folder index decision. install.sh runs
+  root-probe with `--ask` on a TTY, `--default-index` otherwise, and writes the managed
+  `SESSION_ROOTS` section to `config` (the awk in install.sh converges re-installs by
+  dropping the old managed section first). The nightly run passes neither flag, so it
+  never writes choices — unindexed roots are *reported* (`findings/<date>/unindexed-roots.txt`)
+  instead, which is the "found a folder, ask the user" surface.
+- Semantics: a folder is scanned iff it's `index` or the always-on primary. An *unasked*
+  folder is held out of the report until the user decides — that's what the flag
+  "found a folder we're not indexing" means, and scanning it would make the flag a lie.
+  `--default-index` on install flips every unasked folder to `index` so a fresh install
+  covers everything silently.
+- Compatibility (verified 2026-08-07 against real files): claude-code-router wraps
+  sessions in a `{"type":"queue-operation",...}` envelope before the normal records —
+  `session-stats.sh`, `prune-self-sessions.sh`, and L1's prompt all key off
+  `.type == "user"`, so the envelope is invisible to them. cc-ds4's transcripts are
+  standard shapes under `projects/` (its `history.jsonl`/`spend-ledger.jsonl` live
+  outside `projects/`, so the glob never trips on them). ccam keeps an accounts file,
+  no transcript store. The `projects/`-bucket glob IS the compatibility layer.
+- run-stats carries `session_roots` (count) + `session_roots_list` so a regression to
+  single-root scanning is visible from the artifact.
+
 ## Where state lives
 
 All under `$AUTODREAM_DIR` (default `~/.claude/autodream/`) except the reports:
@@ -21,6 +56,8 @@ All under `$AUTODREAM_DIR` (default `~/.claude/autodream/`) except the reports:
 - `findings/YYYY-MM-DD/operator-notes.md` — every capture surface's notes merged into the one file L2 reads. `vault-notes-manifest.txt` alongside it lists the inbox files that went into it.
 - `findings/YYYY-MM-DD/x-bookmarks.md` — unread X bookmarks for the "Ideas from bookmarks" section, plus `x-bookmarks-manifest.txt` of their ids. `x-bookmarks/seen.jsonl` holds the persistent read state.
 - `findings/YYYY-MM-DD/touched-projects.txt` — sidecar listing projects whose MEMORY.md L2 edited (drives the optional `claude-memory gc`).
+- `findings/YYYY-MM-DD/unindexed-roots.txt` — Claude folders (`~/.claude*/projects`) that exist but are not indexed, for the self-audit section. Written before the idempotency guard so a catch-up no-op still reports folders that appeared since setup.
+- `root-choices.conf` — the per-folder index decision (`~/.claude-ds4/projects=index`), written by `bin/root-probe.sh` at install time. The primary `~/.claude/projects` is always indexed.
 - `cache/claude-code/` — persistent clone of `anthropics/claude-code` for the changelog.
 - `logs/run-YYYY-MM-DD.log` — full run log (run.sh tees here). `logs/launchd.{out,err}.log` — launchd's capture.
 - `dreams/YYYY-MM-DD.md` (default `~/.claude/dreams/`) — the final report.

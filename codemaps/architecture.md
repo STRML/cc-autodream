@@ -12,7 +12,9 @@ bin/run.sh  TARGET_DATE
       │
       ├─ idempotency guard: report exists for date? → exit 0 (unless AUTODREAM_FORCE=1)
       │
-      ├─ enumerate: find *.jsonl in [TARGET_DATE, NEXT_DATE)  → sessions.txt.raw
+      ├─ probe_roots: resolve SESSION_ROOTS (env/config | PROJECTS_DIR | root-probe autodetect)
+      │     └─ write findings/<date>/unindexed-roots.txt (folders found but not indexed; before guard)
+      ├─ enumerate: find *.jsonl in [TARGET_DATE, NEXT_DATE) per root → sessions.txt.raw (sort -u)
       │     └─ prune-self-sessions.sh --filter                → sessions.txt   (drops autodream's own)
       │
       ├─ L1 retry loop (AUTODREAM_L1_ROUNDS):
@@ -40,6 +42,7 @@ bin/run.sh  TARGET_DATE
 | `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); picks the scheduled plist that runs `run.sh` for its label namespace |
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/oversized-gate.sh` | recompute the #12 measurement gate over a trailing window from the sidecars/findings on disk (`--days N`, or explicit findings dirs). Recovers dates whose `run-stats.txt` predates the counters; artifacts only, no model calls |
+| `bin/root-probe.sh` | detect the `~/.claude*/projects` buckets and decide which to index. `--consolidated`/`--unindexed`/`--list` (read-only, nightly), `--ask`/`--default-index` (install-time; writes root-choices.conf + the managed `SESSION_ROOTS` config section). Artifacts only, no model calls |
 | `bin/notify.sh` | extract "Open questions" → inbox file, counted from the `open-questions=N` marker, opened via `$AUTODREAM_OPEN` |
 | `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`); `AUTODREAM_TRIAGE_SURFACE=cmux` (config/env) launches it in its own cmux workspace instead of inline. Skips the session entirely (prints a notice) when the report has 0 open questions or is already triaged — reads the `<!-- autodream:open-questions=N -->` marker, falls back to prose, launches on anything ambiguous; `--force` overrides. Skip check runs before the cmux branch so a skip never spawns a workspace |
 | `prompts/SESSION_TRIAGE.md` | L1 prompt: per-session JSON schema |
@@ -64,7 +67,8 @@ All optional; full list (with defaults) is documented in `bin/run.sh`'s header. 
 | Variable | Default | Purpose |
 |---|---|---|
 | `CLAUDE_BIN` | `$HOME/.local/bin/claude` | path to `claude` CLI |
-| `PROJECTS_DIR` | `$HOME/.claude/projects` | where Claude Code stores session JSONLs |
+| `SESSION_ROOTS` | autodetected | colon-separated dirs to scan for session JSONLs (every `$HOME/.claude*/projects`). Wins over `PROJECTS_DIR` |
+| `PROJECTS_DIR` | `$HOME/.claude/projects` | single root, kept for compat (one dir); `WORK_BUCKET` isolation is keyed off this |
 | `AUTODREAM_DIR` | `$HOME/.claude/autodream` | scripts + runtime state |
 | `DREAMS_DIR` | `$HOME/.claude/dreams` | where reports are written |
 | `FANOUT` | `8` | L1 parallelism |

@@ -77,6 +77,13 @@ schedule for you (auto-detecting your username, paths, and `claude`/`git` locati
 no plist editing). Because the scripts are symlinks, editing the repo copy takes
 effect immediately. Requires the `claude` CLI on PATH (override with `CLAUDE_BIN`).
 
+Install also detects every Claude config dir on the machine — `~/.claude-nous`,
+`~/.claude-ds4`, `~/.claude-sigint`, and any other `~/.claude*/projects` bucket — and
+asks whether to index each one (on a non-interactive install it indexes them all and
+says so). The choices land in `~/.claude/autodream/root-choices.conf`, and the enabled
+set is written to `config` as `SESSION_ROOTS`. You can add or remove a folder later by
+editing that file and re-running `./install.sh`.
+
 The schedule fires `run.sh` at 03:15 with morning catch-up triggers (06:15/09:15/12:15)
 in case the Mac was asleep; the idempotency guard makes all but the first a one-second
 no-op. To skip scheduling and only symlink the scripts:
