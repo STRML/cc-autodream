@@ -22,7 +22,7 @@ Then:
 3. **Write the JSON** with the Write tool to the literal output path from line 2 — exactly one JSON object, no prose around it.
 4. Print `done` and exit. No commentary.
 
-When present, a **Precomputed session stats** block follows this document at the end of the prompt. Its `turn_count`, `tool_call_count`, `tools_used`, `models_used`, and `compliance_markers` fields are authoritative: copy them verbatim into the output JSON. Do not derive or recount those fields from the transcript. If the block is absent, derive them from the transcript as before.
+When present, a **Precomputed session stats** block follows this document at the end of the prompt. Its `turn_count`, `tool_call_count`, `tools_used`, and `models_used` fields are authoritative: copy them verbatim into the output JSON. Do not derive or recount those fields from the transcript. If the block is absent, derive them from the transcript as before.
 
 ## What to look for
 
@@ -36,7 +36,7 @@ Quote 1-3 sentences of evidence for every finding. Don't synthesize, don't infer
 | `wrong_skill` | Claude invoked a skill that didn't fit; user corrected ("no use X instead"). |
 | `sandbox_friction` | `Operation not permitted`, `dangerouslyDisableSandbox: true` retries, `/tmp` writes failing, permission prompts denied. |
 | `memory_miss` | User says "I told you", "we established", "remember", "the same as last time"; Claude re-discovers a workaround that was used in a previous session. |
-| `tool_loop` | Same command retried ≥3 times with minor variants (>2 close-but-different curl/grep/find variants in <10 turns). **Marker check:** the retry-budget rules require the agent to emit a literal `RETRY-BUDGET: ...` (or `FETCH-PIVOT: ...`) line in its response text when it stops/pivots. A loop that ends WITH such a marker means the rule worked — severity `low`, and say the marker was present. A loop with NO marker is the real finding — note "no RETRY-BUDGET marker" in `what`. |
+| `tool_loop` | Same command retried ≥3 times with minor variants (>2 close-but-different curl/grep/find variants in <10 turns). Judge severity on the transcript alone: a loop the agent breaks out of on its own is `low`; one that keeps going or ends the session is the real finding. |
 | `permission_prompt` | Commands the user repeatedly allowed or repeatedly denied that should be in `.claude/settings.json` allowlist/denylist. |
 | `fabricated_id` | Claude quoted a SHA, PR number, line number, function name, or version that wasn't from a just-run command. See the HARD RULE above: tools like `StructuredOutput` that succeed but aren't in `skill_listing` are harness-provided — never flag them. |
 | `stop_projection` | "you must be tired", "let's pick this back up", "we should stop", any variant. |
@@ -61,14 +61,10 @@ For a trivial session (a handful of turns, no substantive work), emit the facets
 ## Output schema
 
 Write EXACTLY this shape to `OUTPUT_PATH`. JSON only, no markdown fence, no prose.
-`compliance_markers` holds counts of `RETRY-BUDGET:`, `FETCH-PIVOT:`, `DELEGATED:`,
-and `DIRECT-OK:` marker lines in assistant text (0 when absent — most sessions).
-Counting rule (all four markers, same rule): count only lines that BEGIN with the
-marker string, in the top-level session's assistant text. Do NOT count markers that
-appear inside quoted or fenced blocks, markers quoted from rule files, or markers
-inside subagent transcripts — a main-loop message quoting a returned report does not
-count. (This line-start rule replaced substring counting for RETRY-BUDGET/FETCH-PIVOT
-on 2026-07-20; historical comparisons may shift once.)
+Do NOT emit a `compliance_markers` field: it was retired on 2026-08-08 after an
+archive-wide scan found zero real emissions of `RETRY-BUDGET:` / `FETCH-PIVOT:` /
+`DELEGATED:` / `DIRECT-OK:` in any session ever recorded. Older findings carry the
+field; ignore it there too.
 
 ```json
 {
@@ -81,7 +77,6 @@ on 2026-07-20; historical comparisons may shift once.)
   "skills_invoked": ["schedule", "python-env-management"],
   "models_used": ["claude-opus-4-7"],
   "notable_initiatives": ["one-line summary of the main thing the user worked on"],
-  "compliance_markers": {"RETRY-BUDGET": 0, "FETCH-PIVOT": 0, "DELEGATED": 0, "DIRECT-OK": 0},
   "underlying_goal": "one line of user intent, or null if it duplicates notable_initiatives",
   "outcome": "fully_achieved|mostly_achieved|partially_achieved|not_achieved|unclear_from_transcript",
   "satisfaction_signals": {"happy": 0, "satisfied": 0, "dissatisfied": 0, "frustrated": 0},
