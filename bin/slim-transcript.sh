@@ -29,21 +29,49 @@ cap="${AUTODREAM_SLIM_CAP:-262144}"
 lines=$(wc -l < "$src" | tr -d ' ')
 bytes=$(wc -c < "$src" | tr -d ' ')
 
-# Pre-pass: when jq is available, strip the bulky payloads inside tool_result
-# entries (and base64 image_url data) before the line-based head/tail/truncate
-# pass. Orchestrator/review-fan-out transcripts spend most of their bytes on
-# tool_result blocks (entire diffs, file dumps, gh JSON), so cutting just the
-# *.message.content tool_result fields shrinks the file 5-20x while leaving the
-# turn structure intact for fuzzy pattern-spotting. The line-based pass below
-# still runs as a safety net (caps stragglers like assistant turns that paste
-# huge code blocks). Falls back transparently if jq isn't installed or the
-# stream isn't pure JSONL (e.g. a non-Claude session schema we don't know).
+# Pre-pass: when jq is available, strip the bulky payloads inside tool-result entries
+# (and base64 image data) before the line-based head/tail/truncate pass.
+# Orchestrator/review-fan-out transcripts spend most of their bytes on tool results
+# (entire diffs, file dumps, gh JSON), so cutting just those fields shrinks the file
+# 5-20x while leaving the turn structure intact for fuzzy pattern-spotting. The
+# line-based pass below still runs as a safety net (it caps stragglers like assistant
+# turns that paste huge code blocks). Falls back transparently if jq isn't installed or
+# the stream isn't pure JSONL.
+#
+# Two schemas are handled, discriminated by the entry's own `type`:
+#   Claude Code — `{"type":"user"|"assistant", "message":{"content":[{"type":"tool_result"…
+#   OMP         — `{"type":"message", "message":{"role":"toolResult", "content":[{"type":"text"…
+# For OMP the payload is a plain text block on a `toolResult` message, and the tool's
+# arguments ride in a `toolCall` block, so neither is reachable by the Claude rules.
+# Both are truncated to a head rather than erased: the first line of a tool result
+# ("Operation not permitted") is the sandbox_friction signal, and a toolCall's command
+# text is what makes a tool_loop recognisable as the same command retried.
 pre_src="$src"
 pre_tmp=""
 if command -v jq >/dev/null 2>&1; then
   pre_tmp="$dst.pre.jsonl"
-  if jq -c '
-    if (.message.content | type) == "array" then
+  if jq -c --argjson head "${AUTODREAM_SLIM_PAYLOAD_HEAD:-200}" '
+    def cap($n):
+      if type == "string" and (length > $n)
+      then .[0:$n] + " …[autodream: tool_result payload stripped]"
+      else . end;
+
+    if .type == "message" and ((.message.content | type) == "array") then
+      # OMP entry.
+      .message.content |= map(
+        if .type == "toolCall" then
+          .arguments |= (if type == "object" then map_values(cap($head)) else cap($head) end)
+        elif .type == "image" then
+          .data = "[autodream: image stripped]"
+        else . end
+      )
+      | if (.message.role // "") == "toolResult" then
+          .message.content |= map(if .type == "text" then .text |= cap($head) else . end)
+          # details duplicates the payload as a structured object.
+          | del(.message.details)
+        else . end
+    elif (.message.content | type) == "array" then
+      # Claude Code entry.
       .message.content |= map(
         if .type == "tool_result" then
           # Replace the heavy content array with a one-line marker, preserve

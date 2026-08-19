@@ -56,6 +56,11 @@ link "$REPO_DIR/bin/notify.sh"          "$TARGET/notify.sh"
 link "$REPO_DIR/bin/make-notifier.sh"   "$TARGET/make-notifier.sh"
 link "$REPO_DIR/bin/prune-self-sessions.sh" "$TARGET/prune-self-sessions.sh"
 link "$REPO_DIR/bin/slim-transcript.sh"     "$TARGET/slim-transcript.sh"
+# Linked even though run.sh does not call it yet: helper resolution under launchd is
+# $SCRIPT_DIR (the INSTALLED dir, since the plist invokes $TARGET/run.sh) then
+# $AUTODREAM_DIR (the same dir), so an unlinked helper is simply never found. Linking it
+# with the script keeps the wiring commit from having to remember.
+link "$REPO_DIR/bin/linearize-omp-session.sh" "$TARGET/linearize-omp-session.sh"
 link "$REPO_DIR/bin/session-stats.sh"        "$TARGET/session-stats.sh"
 link "$REPO_DIR/bin/overlap-stats.sh"        "$TARGET/overlap-stats.sh"
 link "$REPO_DIR/bin/oversized-gate.sh"       "$TARGET/oversized-gate.sh"

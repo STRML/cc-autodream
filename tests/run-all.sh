@@ -880,6 +880,200 @@ test_slim_transcript(){
   rm -rf "$root"
 }
 
+# ---- OMP (oh-my-pi) source ingest -------------------------------------------------
+# An OMP session file is not a flat transcript: entries carry id/parentId and the file
+# physically retains branches the user backed out of. Everything downstream (stats,
+# noise gate, slimming, L1) must see only the live leaf chain, or abandoned work gets
+# triaged as if it happened.
+#
+# Fixture: title slot, session header with cwd, then a tree whose live chain is
+# e1 -> e3 -> e4. e2 hangs off e1 as an ABANDONED branch and is deliberately NOT last
+# in file order, because the leaf is the last entry.
+mk_omp_session(){ # $1=path
+  cat > "$1" <<'OMPEOF'
+{"type":"title","v":1,"title":"omp fixture","source":"auto","updatedAt":"2020-01-02T12:00:00.000Z"}
+{"type":"session","version":3,"id":"s1","timestamp":"2020-01-02T12:00:00.000Z","cwd":"/tmp/proj-omp"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2020-01-02T12:00:01.000Z","message":{"role":"user","attribution":"user","content":[{"type":"text","text":"KEEP-ROOT"}]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2020-01-02T12:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ABANDONED-BRANCH"}]}}
+{"type":"message","id":"e3","parentId":"e1","timestamp":"2020-01-02T12:04:03.000Z","message":{"role":"user","attribution":"user","content":[{"type":"text","text":"KEEP-MIDDLE"}]}}
+{"type":"message","id":"e4","parentId":"e3","timestamp":"2020-01-02T12:04:04.000Z","message":{"role":"assistant","model":"anthropic/claude-opus-5","content":[{"type":"text","text":"KEEP-LEAF"},{"type":"toolCall","id":"c1","name":"bash","intent":"Checking status","arguments":{"command":"git status"}}]}}
+OMPEOF
+}
+
+test_linearize_omp(){
+  echo "# linearize-omp-session collapses the entry tree to the live leaf chain"
+  local LZ="$REPO/bin/linearize-omp-session.sh"
+  [ -x "$LZ" ] || { no "linearize-omp-session executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  local src="$root/omp.jsonl" out="$root/lin.jsonl"
+  mk_omp_session "$src"
+
+  "$LZ" "$src" "$out" || no "linearizer exited non-zero on a valid omp session"
+  assert_grep   "$out" 'KEEP-ROOT'        "keeps the root entry"
+  assert_grep   "$out" 'KEEP-MIDDLE'      "keeps the mid-chain entry"
+  assert_grep   "$out" 'KEEP-LEAF'        "keeps the leaf entry"
+  assert_nogrep "$out" 'ABANDONED-BRANCH' "drops the abandoned branch"
+
+  # Root-first order: replay must read oldest -> newest, like the live transcript.
+  local lroot lleaf
+  lroot=$(grep -n 'KEEP-ROOT' "$out" | cut -d: -f1 | head -1)
+  lleaf=$(grep -n 'KEEP-LEAF' "$out" | cut -d: -f1 | head -1)
+  [ -n "$lroot" ] && [ -n "$lleaf" ] && [ "$lroot" -lt "$lleaf" ] \
+    && ok "emits entries root-first" || no "emits entries root-first (root=$lroot leaf=$lleaf)"
+
+  # Meta must be a JSON entry, not a '#' banner: slim-transcript.sh runs one jq pass
+  # over the whole stream and falls back wholesale on any non-JSON line, which would
+  # silently disable omp payload stripping downstream.
+  assert_grep "$out" '"type":"autodream_meta"' "meta line is a JSON entry"
+  assert_grep "$out" '"cwd":"/tmp/proj-omp"'   "meta carries the header cwd (project identity)"
+  assert_grep "$out" '"dropped":1'             "meta reports the dropped branch count"
+  jq -e . "$out" >/dev/null 2>&1 && ok "output is pure JSONL" || no "output is pure JSONL"
+
+  # A Claude Code transcript is not an omp tree. Refuse it loudly: run.sh must skip the
+  # session with an error finding rather than fall back to the raw file, since a raw
+  # read is exactly the abandoned-branch bug this script exists to prevent.
+  local cc="$root/cc.jsonl" ccout="$root/cc.lin.jsonl"
+  printf '{"type":"user","cwd":"/tmp/x","message":{"role":"user","content":"hi"}}\n' > "$cc"
+  "$LZ" "$cc" "$ccout" 2>/dev/null \
+    && no "must reject a non-omp transcript" || ok "rejects a non-omp transcript"
+  assert_no_file "$ccout" "leaves no output for a rejected transcript"
+
+  # Corruption must fail CLOSED, not degrade quietly. A dropped or unparseable entry can
+  # make an abandoned branch look like the last leaf, which yields confidently wrong
+  # triage; a named skip costs one session's findings and says so. Each case must
+  # terminate (not spin), exit nonzero, and leave no output for a caller to mistake for
+  # a clean normalization.
+  local cyc="$root/cyc.jsonl" cycout="$root/cyc.lin.jsonl"
+  {
+    printf '{"type":"title","v":1,"title":"cyc"}\n'
+    printf '{"type":"session","version":3,"id":"s2","cwd":"/tmp/c"}\n'
+    printf '{"type":"message","id":"a","parentId":"b","message":{"role":"user","content":[{"type":"text","text":"CYC-A"}]}}\n'
+    printf '{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"text","text":"CYC-B"}]}}\n'
+  } > "$cyc"
+  ( ulimit -t 20; "$LZ" "$cyc" "$cycout" >/dev/null 2>&1 )
+  local rc=$?
+  [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ] && ok "rejects a parentId cycle (rc=$rc)" \
+    || no "must reject a parentId cycle without hanging (rc=$rc)"
+  assert_no_file "$cycout" "leaves no output for a cyclic tree"
+
+  # A parentId naming an entry that is not in the file: the chain cannot be proven
+  # complete, so it must not be emitted as if it were.
+  local dang="$root/dangling.jsonl" dangout="$root/dangling.lin.jsonl"
+  {
+    printf '{"type":"title","v":1,"title":"dangling"}\n'
+    printf '{"type":"session","version":3,"id":"s3","cwd":"/tmp/d"}\n'
+    printf '{"type":"message","id":"z","parentId":"gone","message":{"role":"user","content":[{"type":"text","text":"ORPHAN"}]}}\n'
+  } > "$dang"
+  "$LZ" "$dang" "$dangout" 2>/dev/null \
+    && no "must reject a dangling parentId" || ok "rejects a dangling parentId"
+  assert_no_file "$dangout" "leaves no output for a dangling parentId"
+
+  # A torn final line (crash or scan mid-append) is corruption too. Skipping it silently
+  # would move the inferred leaf onto whatever line precedes it.
+  local torn="$root/torn.jsonl" tornout="$root/torn.lin.jsonl"
+  {
+    printf '{"type":"title","v":1,"title":"torn"}\n'
+    printf '{"type":"session","version":3,"id":"s4","cwd":"/tmp/t"}\n'
+    printf '{"type":"message","id":"t1","parentId":null,"message":{"role":"user","content":[{"type":"text","text":"WHOLE"}]}}\n'
+    printf '{"type":"message","id":"t2","parentId":"t1","message":{"role":"assist\n'
+  } > "$torn"
+  "$LZ" "$torn" "$tornout" 2>/dev/null \
+    && no "must reject a malformed line" || ok "rejects a malformed line"
+  assert_no_file "$tornout" "leaves no output for a malformed line"
+  rm -rf "$root"
+}
+
+# Heavy omp payloads must lose their bulk but keep their head: sandbox_friction and
+# tool_loop triage live in the FIRST line of a tool result ("Operation not permitted")
+# and in a toolCall's command text, so wholesale stripping would blind L1.
+# AUTODREAM_SLIM_MAXLINE is raised past the fixture width on purpose, to disable the
+# line-based `cut` net so these assertions can only pass via the structural jq pass.
+mk_omp_payload_session(){ # $1=path
+  local blob; blob=$(awk 'BEGIN{ s=""; for(i=0;i<20000;i++) s=s "Z"; print s }')
+  local payload="HEAD-SIGNAL Operation not permitted ${blob} TAIL-SENTINEL"
+  {
+    printf '{"type":"title","v":1,"title":"big"}\n'
+    printf '{"type":"session","version":3,"id":"s1","cwd":"/tmp/p"}\n'
+    printf '{"type":"message","id":"a1","parentId":null,"message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"write","intent":"Writing file","arguments":{"path":"/x","content":"%s"}}]}}\n' "$payload"
+    printf '{"type":"message","id":"r1","parentId":"a1","message":{"role":"toolResult","toolCallId":"c1","toolName":"write","isError":false,"content":[{"type":"text","text":"%s"}]}}\n' "$payload"
+  } > "$1"
+}
+
+test_slim_omp_payloads(){
+  echo "# slim-transcript strips omp toolResult/toolCall payloads"
+  local SL="$REPO/bin/slim-transcript.sh"
+  [ -x "$SL" ] || { no "slim-transcript executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  local src="$root/omp-big.jsonl" out="$root/omp-slim.jsonl"
+  mk_omp_payload_session "$src"
+
+  AUTODREAM_SLIM_MAXLINE=100000 "$SL" "$src" "$out"
+  assert_grep   "$out" 'payload stripped'        "replaces the omp toolResult payload with a marker"
+  assert_grep   "$out" '"toolName":"write"'      "preserves toolName so triage can attribute the call"
+  assert_grep   "$out" 'Operation not permitted' "keeps the payload head (the friction signal)"
+  assert_nogrep "$out" 'TAIL-SENTINEL'           "drops the payload tail"
+  # The strip must leave replayable JSON, not a mid-string amputation.
+  grep -v '^\.\.\.\[' "$out" | grep -v '^$' | jq -e . >/dev/null 2>&1 \
+    && ok "slimmed omp entries stay valid JSON" || no "slimmed omp entries stay valid JSON"
+  rm -rf "$root"
+}
+
+test_linearize_then_slim(){
+  echo "# linearize -> slim is the real omp ingest path"
+  local LZ="$REPO/bin/linearize-omp-session.sh" SL="$REPO/bin/slim-transcript.sh"
+  { [ -x "$LZ" ] && [ -x "$SL" ]; } || { no "omp ingest scripts executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  local src="$root/s.jsonl" lin="$root/s.lin.jsonl" out="$root/s.slim.jsonl"
+  local blob; blob=$(awk 'BEGIN{ s=""; for(i=0;i<20000;i++) s=s "Z"; print s }')
+  mk_omp_session "$src"
+  # A heavy toolResult hanging off the leaf: the chain that survives linearization is
+  # also the chain that must get payload-stripped.
+  printf '{"type":"message","id":"e5","parentId":"e4","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","isError":false,"content":[{"type":"text","text":"HEAD-SIGNAL %s TAIL-SENTINEL"}]}}\n' "$blob" >> "$src"
+
+  "$LZ" "$src" "$lin" || no "linearizer failed inside the ingest pipeline"
+  AUTODREAM_SLIM_MAXLINE=100000 "$SL" "$lin" "$out"
+  assert_grep   "$out" 'payload stripped'  "slim still strips payloads after linearization"
+  assert_grep   "$out" '"toolName":"bash"' "keeps the tool name through both stages"
+  assert_grep   "$out" 'KEEP-LEAF'         "keeps the live chain through both stages"
+  assert_nogrep "$out" 'ABANDONED-BRANCH'  "abandoned branch stays dropped after slimming"
+  assert_nogrep "$out" 'TAIL-SENTINEL'     "no oversized payload survives"
+  rm -rf "$root"
+}
+
+test_session_stats_omp(){
+  echo "# session-stats reads omp transcripts (else the noise gate stubs every omp session)"
+  local ST="$REPO/bin/session-stats.sh" LZ="$REPO/bin/linearize-omp-session.sh"
+  { [ -x "$ST" ] && [ -x "$LZ" ]; } || { no "session-stats.sh + linearizer executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  local src="$root/omp.jsonl" lin="$root/omp.lin.jsonl" out="$root/omp.stats.json"
+  mk_omp_session "$src"
+
+  # THE production input is the linearized copy, not the raw file: run.sh normalizes
+  # first so no consumer ever counts an abandoned branch. The linearizer folds the
+  # `type:"session"` header into its `autodream_meta` record, so stats must recognise
+  # that shape too — detecting only the raw header sends the linearized file down the
+  # Claude branch, which reports zero user turns and gates every omp session away.
+  "$LZ" "$src" "$lin" || no "linearizer failed before stats"
+  "$ST" "$lin" "$out" || no "session-stats exited non-zero on a linearized omp transcript"
+  assert_eq "$(jq -r '.user_message_count' "$out")" "2" "counts omp user turns (linearized)"
+  assert_eq "$(jq -r '.tool_call_count'    "$out")" "1" "counts omp toolCall blocks (linearized)"
+  assert_eq "$(jq -r '.tools_used | join(",")' "$out")" "bash" "names the omp tool used"
+  assert_eq "$(jq -r '.models_used | join(",")' "$out")" "anthropic/claude-opus-5" "records the omp model"
+  # 12:00:01 -> 12:04:04 along the live chain: ~4 minutes, clears the duration gate.
+  assert_eq "$(jq -r '.duration_minutes' "$out")" "4.1" "computes omp duration from entry timestamps"
+
+  # The raw file is still readable (diagnostic use), and counting it must not silently
+  # fall through to the Claude selectors either.
+  local rawout="$root/omp.raw.stats.json"
+  "$ST" "$src" "$rawout" || no "session-stats exited non-zero on a raw omp transcript"
+  assert_eq "$(jq -r '.user_message_count' "$rawout")" "2" "counts omp user turns (raw)"
+  rm -rf "$root"
+}
+
 test_facet_fields_plumbed(){
   echo "# pilot facet fields flow L1 -> findings JSON -> L2 input"
   # Plumbing only: the L2 mock ignores findings content, so assertions stop at
@@ -1633,6 +1827,10 @@ test_self_audit_stats_failure_denominator
 test_self_audit_stats_precached_disambiguation
 test_normalize_project
 test_slim_transcript
+test_linearize_omp
+test_slim_omp_payloads
+test_linearize_then_slim
+test_session_stats_omp
 test_facet_fields_plumbed
 test_noise_gate_trivial
 test_noise_gate_short_duration

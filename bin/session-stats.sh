@@ -1,5 +1,18 @@
 #!/bin/bash
 # Deterministic, model-free session statistics sidecar for cc-autodream L1 triage.
+#
+# Handles both transcript schemas. Claude Code entries are flat (`type: "user"` /
+# `"assistant"`); OMP (oh-my-pi) entries are tree nodes (`type: "message"` with a
+# `message.role`) behind a `type: "session"` header. The two produce the same keys,
+# because every consumer — the noise gate in run.sh above all — reads this sidecar
+# without caring which harness wrote the session. Getting this wrong is not a degraded
+# stat but a silent feature-off switch: OMP counted with Claude's selectors yields
+# user_message_count 0, which sends every OMP session down the below_noise_gate path
+# without ever reaching a model.
+#
+# For OMP, pass the LINEARIZED transcript (bin/linearize-omp-session.sh). Run against a
+# raw OMP file these counts include branches the user abandoned, which is exactly the
+# over-count the linearizer exists to remove.
 
 set -u
 
@@ -23,6 +36,76 @@ mtime=$(stat -f %m "$transcript" 2>/dev/null) || {
 }
 
 mkdir -p "$(dirname "$output")" || exit 1
+
+# ---- OMP (oh-my-pi) sessions ------------------------------------------------------
+# Structural detection, not a guess, and it must accept BOTH shapes this script is fed:
+#   raw        — `type:"session"` header with a string id (title slot, then header)
+#   linearized — bin/linearize-omp-session.sh folds that header into its leading
+#                `type:"autodream_meta"` record, so the raw header is gone
+# The linearized file is the production input. Detecting only the raw header would send
+# it down the Claude branch, which reports zero user turns and therefore gates every OMP
+# session away before a model ever sees it. Claude Code transcripts carry neither entry.
+if head -n 4 "$transcript" | jq -R -s -e '
+     [ split("\n")[] | fromjson? | select(type == "object") ]
+     | any(.[];
+         (.type == "session" and (.id | type) == "string")
+         or (.type == "autodream_meta" and .source == "omp")
+       )
+   ' >/dev/null 2>&1; then
+  jq -R -s \
+    --argjson transcript_bytes "${bytes:-0}" \
+    --argjson transcript_mtime "${mtime:-0}" \
+    '
+    def ts: select(type == "string") | try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch empty;
+
+    [ split("\n")[] | fromjson? | select(type == "object") ] as $lines
+    | [ $lines[] | select(.type == "message") ] as $msgs
+    # A spawned subagent session records its own init entry. It is the OMP analogue of
+    # the Claude isSidechain flag: legitimate work, often short on user turns, so like
+    # sidechains it is never noise-gated.
+    | (any($lines[]?; .type == "session_init")) as $is_subagent
+    # Real user input only: an entry whose attribution is "agent" was injected by the
+    # harness (steering, hook output), not typed by the user.
+    | [ $msgs[]
+        | select((.message.role) == "user")
+        | select((.message.attribution // "user") == "user")
+        | select((.message.content | type) == "array" and any(.message.content[]?; .type == "text"))
+      ] as $user_entries
+    | ( [ $user_entries[] | .timestamp | ts ] | sort ) as $user_turn_timestamps
+    | [ $msgs[] | select((.message.role) == "user" or (.message.role) == "assistant") ] as $turns
+    | [ $msgs[]
+        | select((.message.role) == "assistant" and (.message.content | type) == "array")
+        | .message.content[]
+        | select(.type == "toolCall")
+      ] as $tool_calls
+    | [ $msgs[] | select((.message.role) == "assistant") | .message.model | select(type == "string" and length > 0) ] as $msg_models
+    | [ $lines[] | select(.type == "model_change") | .model | select(type == "string" and length > 0) ] as $changed_models
+    | ( if ($msg_models | length) > 0 then $msg_models else $changed_models end ) as $models
+    | [ $lines[] | select(.type != "session" and .type != "title" and .type != "autodream_meta") | .timestamp | ts ] as $timestamps
+    # No compliance_markers here on purpose. The markers are a Claude-rules artifact,
+    # origin/retire-compliance-markers removes them from this script outright, and that
+    # branch would merge cleanly over an OMP copy of the counting logic — leaving retired
+    # telemetry alive only for OMP. PROMPT.md already defaults the key to 0 when a
+    # findings record omits it, so absence costs nothing.
+    | {
+        user_message_count: ($user_entries | length),
+        turn_count: ($turns | length),
+        tool_call_count: ($tool_calls | length),
+        tools_used: ($tool_calls | map(.name) | map(select(type == "string")) | unique | sort),
+        models_used: ($models | unique | sort),
+        duration_minutes: (
+          if ($timestamps | length) < 2 then 0
+          else (((($timestamps | max) - ($timestamps | min)) / 60) * 10 | round) / 10
+          end
+        ),
+        transcript_bytes: $transcript_bytes,
+        transcript_mtime: $transcript_mtime,
+        isSidechain: $is_subagent,
+        user_turn_timestamps: $user_turn_timestamps
+      }
+    ' "$transcript" > "$output"
+  exit
+fi
 
 jq -R -s \
   --argjson transcript_bytes "${bytes:-0}" \
