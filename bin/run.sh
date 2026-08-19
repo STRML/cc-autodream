@@ -393,7 +393,8 @@ session_is_omp() {
 # The path every consumer should read for a session: the normalized copy when one
 # exists, otherwise the file itself (every Claude session).
 read_path_for() {
-  local norm="$FINDINGS_DIR/$(session_hash "$1").norm.jsonl"
+  local norm
+  norm="$FINDINGS_DIR/$(session_hash "$1").norm.jsonl"
   if [ -s "$norm" ]; then printf '%s' "$norm"; else printf '%s' "$1"; fi
 }
 
