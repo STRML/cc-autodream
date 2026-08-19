@@ -157,6 +157,9 @@ fi
 # Oversized-transcript slimmer (resolved the same way; exported to the L1 workers).
 SLIM="$SCRIPT_DIR/slim-transcript.sh"
 [ -x "$SLIM" ] || SLIM="$AUTODREAM_DIR/slim-transcript.sh"
+# OMP tree normalizer (resolved the same way; exported to the L1 workers).
+LINEARIZE="$SCRIPT_DIR/linearize-omp-session.sh"
+[ -x "$LINEARIZE" ] || LINEARIZE="$AUTODREAM_DIR/linearize-omp-session.sh"
 # Deterministic session-stat pre-pass (resolved like the other helper scripts).
 # AUTODREAM_STATS_BIN overrides the resolved path outright, with no existability
 # fallback, for the same reason AUTODREAM_OVERLAP_BIN does below (#26): tests need to
@@ -286,11 +289,7 @@ probe_roots() {
   if [ -z "$SESSION_ROOTS" ] && [ "$PROJECTS_DIR_EXPLICIT" = "1" ]; then
     SESSION_ROOTS="$PROJECTS_DIR"
   fi
-  if [ -n "$SESSION_ROOTS" ]; then
-    log "session roots: ${SESSION_ROOTS//:/, }"
-    return 0
-  fi
-  if [ -x "$ROOT_PROBE" ]; then
+  if [ -z "$SESSION_ROOTS" ] && [ -x "$ROOT_PROBE" ]; then
     # Scan the decided roots only: primary + the ones root-choices.conf says index.
     # An unasked root is held out of the report until the user decides on it — that is
     # the point of the flag file (write_unindexed_flag) the report reads: "found a
@@ -299,6 +298,16 @@ probe_roots() {
     SESSION_ROOTS=$("$ROOT_PROBE" --consolidated 2>/dev/null) || SESSION_ROOTS=""
   fi
   [ -n "$SESSION_ROOTS" ] || SESSION_ROOTS="$HOME/.claude/projects"
+  # OMP roots are scanned like any other root AND recorded as OMP by provenance. Root
+  # membership, not file content, is the authoritative source marker: a corrupt OMP
+  # header would fail a structural probe, and "not recognisably OMP" must never
+  # degrade into "treat as Claude and read the raw tree". Content detection below
+  # still catches an OMP file sitting in an unknown root.
+  OMP_SESSION_ROOTS="${OMP_SESSION_ROOTS:-}"
+  if [ -n "$OMP_SESSION_ROOTS" ]; then
+    SESSION_ROOTS="$SESSION_ROOTS:$OMP_SESSION_ROOTS"
+    log "omp session roots: ${OMP_SESSION_ROOTS//:/, }"
+  fi
   log "session roots: ${SESSION_ROOTS//:/, }"
 }
 
@@ -340,6 +349,97 @@ scan_roots() {
   RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
 }
 
+# ---- OMP (oh-my-pi) source ingest ---------------------------------------------------
+# An OMP session file is an append-only TREE: entries carry id/parentId, branching moves
+# a leaf pointer instead of rewriting the file, and abandoned branches stay on disk
+# forever. Read line-by-line it reports work the user backed out of as if it happened.
+# So every OMP session is normalized to its live leaf chain FIRST, and everything
+# downstream — the substantive filter, stats, the noise gate, slimming, the L1 worker —
+# reads that copy via read_path_for(). See docs/design/omp-source-ingest-2026-08-19.md.
+
+session_hash() { printf "%s" "$1" | shasum -a 1 | cut -c1-12; }
+
+# Is this session file under one of the declared OMP roots? Provenance is the primary
+# and authoritative marker, because it holds for a file whose content cannot be parsed
+# — precisely the case where guessing "Claude" would hand a raw OMP tree to L1.
+session_from_omp_root() {
+  local sp="$1" r
+  [ -n "${OMP_SESSION_ROOTS:-}" ] || return 1
+  local -a oroots
+  IFS=: read -ra oroots <<< "$OMP_SESSION_ROOTS"
+  for r in "${oroots[@]}"; do
+    [ -n "$r" ] || continue
+    case "$sp" in "$r"/*|"$r") return 0 ;; esac
+  done
+  return 1
+}
+
+# Structural probe: an OMP file opens with a fixed-width title slot and a
+# `type:"session"` header carrying a string id. Claude transcripts have no such entry.
+# Only the first lines are read, so this is cheap enough to run per session. It
+# SUPPLEMENTS provenance (an OMP file in an unknown root) and is never the only guard.
+session_is_omp() {
+  session_from_omp_root "$1" && return 0
+  head -n 4 "$1" 2>/dev/null | jq -R -s -e '
+      [ split("\n")[] | fromjson? | select(type == "object") ]
+      | any(.[]; .type == "session" and (.id | type) == "string")
+    ' >/dev/null 2>&1
+}
+
+# The path every consumer should read for a session: the normalized copy when one
+# exists, otherwise the file itself (every Claude session).
+read_path_for() {
+  local norm="$FINDINGS_DIR/$(session_hash "$1").norm.jsonl"
+  if [ -s "$norm" ]; then printf '%s' "$norm"; else printf '%s' "$1"; fi
+}
+
+# Normalize every OMP session in the worklist. A session that cannot be normalized is
+# DROPPED from the worklist with an error findings record: falling back to the raw tree
+# would reinstate exactly the abandoned-branch bug this pass exists to prevent, and a
+# named skip is recoverable where confidently wrong triage is not.
+# Sets OMP_SESSIONS / OMP_NORMALIZED / OMP_FAILED / OMP_BRANCHES_DROPPED for run-stats.
+normalize_omp_sessions() {
+  OMP_SESSIONS=0; OMP_NORMALIZED=0; OMP_FAILED=0; OMP_BRANCHES_DROPPED=0
+  [ -s "$SESSIONS_LIST" ] || return 0
+  local kept="$SESSIONS_LIST.normalized" session hash norm dropped cwd
+  : > "$kept"
+  while IFS= read -r session; do
+    [ -n "$session" ] || continue
+    if ! [ -r "$session" ] || ! session_is_omp "$session"; then
+      printf '%s\n' "$session" >> "$kept"      # Claude session: nothing to normalize
+      continue
+    fi
+    OMP_SESSIONS=$(( OMP_SESSIONS + 1 ))
+    hash=$(session_hash "$session")
+    norm="$FINDINGS_DIR/$hash.norm.jsonl"
+    if [ -x "$LINEARIZE" ] && "$LINEARIZE" "$session" "$norm" 2>>"$RUN_LOG" && [ -s "$norm" ]; then
+      OMP_NORMALIZED=$(( OMP_NORMALIZED + 1 ))
+      # The metadata record carries the counts and the header cwd.
+      dropped=$(jq -r 'select(.type=="autodream_meta") | .dropped' "$norm" 2>/dev/null | head -1)
+      case "$dropped" in ''|*[!0-9]*) dropped=0 ;; esac
+      OMP_BRANCHES_DROPPED=$(( OMP_BRANCHES_DROPPED + dropped ))
+      # Project identity is the header cwd, encoded the way Claude encodes its buckets,
+      # so the same real project groups together instead of splitting per harness. The
+      # sidecar is what the project-normalization pass reads after L1.
+      cwd=$(jq -r 'select(.type=="autodream_meta") | .cwd // empty' "$norm" 2>/dev/null | head -1)
+      if [ -n "$cwd" ]; then
+        printf '%s' "$cwd" | sed 's#[/.]#-#g' > "$FINDINGS_DIR/$hash.project"
+      fi
+      printf '%s\n' "$session" >> "$kept"
+      log "  omp normalized: $session (dropped $dropped abandoned entr(ies))"
+    else
+      OMP_FAILED=$(( OMP_FAILED + 1 ))
+      rm -f "$norm"
+      printf '{"session_path":"%s","source":"omp","error":"omp normalization failed (unparseable or broken entry tree); session skipped rather than read raw","findings":[]}\n' \
+        "$session" > "$FINDINGS_DIR/$hash.json"
+      log "  omp NORMALIZATION FAILED: $session — skipped (no raw fallback); see $hash.json"
+    fi
+  done < "$SESSIONS_LIST"
+  mv "$kept" "$SESSIONS_LIST"
+  [ "$OMP_SESSIONS" -gt 0 ] && log "omp: $OMP_SESSIONS session(s), $OMP_NORMALIZED normalized, $OMP_FAILED failed, $OMP_BRANCHES_DROPPED abandoned entr(ies) dropped"
+  return 0
+}
+
 # ---- Empty-session filter: drop 0-turn shells before fanout ----
 # Most of a quiet night's corpus is auto-opened/aborted sessions that hold no user
 # input (observed: ~150 of 163 files on 2026-05-30 were single-line `ai-title` shells).
@@ -359,10 +459,19 @@ filter_empty_sessions() {
 }
 
 # exit 0 = keep (substantive or unparseable), 1 = skip (provably a 0-turn shell).
+# Reads the normalized copy for OMP sessions, and matches BOTH schemas: an OMP user turn
+# is `type:"message"` with `message.role == "user"`, so the Claude-only predicate scored
+# every OMP session as a 0-turn shell and filtered the whole source out before fanout.
 session_is_substantive() {
-  local sp="$1" verdict
+  local sp verdict
+  sp=$(read_path_for "$1")
   [ -r "$sp" ] || return 0
-  verdict=$(jq -s 'if any(.[]; .type=="user" and (.isMeta != true)) then 1 else 0 end' "$sp" 2>/dev/null) || return 0
+  verdict=$(jq -s '
+      if any(.[];
+          (.type == "user" and (.isMeta != true))
+          or (.type == "message" and (.message.role == "user"))
+        ) then 1 else 0 end
+    ' "$sp" 2>/dev/null) || return 0
   [ "$verdict" = "0" ] && return 1
   return 0
 }
@@ -488,7 +597,9 @@ compute_session_stats() {
     hash=$(printf "%s" "$session" | shasum -a 1 | cut -c1-12)
     stats="$FINDINGS_DIR/$hash.stats.json"
     rm -f "$stats"
-    if [ -x "$STATS" ] && "$STATS" "$session" "$stats" >/dev/null 2>&1 \
+    # Stats must describe the LIVE conversation: for an OMP session that is the
+    # normalized copy, never the raw tree with its abandoned branches.
+    if [ -x "$STATS" ] && "$STATS" "$(read_path_for "$session")" "$stats" >/dev/null 2>&1 \
       && [ -s "$stats" ] && jq -e 'type == "object"' "$stats" >/dev/null 2>&1; then
       echo "stats: $session ($hash)" >&2
     else
@@ -584,18 +695,31 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       fi
     fi
 
+    # An OMP session is read through its normalized copy (live leaf chain only); a
+    # Claude session reads its own file. Slimming then applies to whatever the worker
+    # will actually read, and is sized on that file rather than on the raw tree.
+    readpath="$FINDINGS_DIR/$hash.norm.jsonl"
+    if [ -s "$readpath" ]; then
+      echo "normalized: $session -> $readpath ($hash)" >&2
+    else
+      readpath="$session"
+    fi
+
     # Oversized transcripts (multi-MB, base64 images, giant tool outputs) blow the
     # worker token budget so it errors out instead of triaging. Slim those first and
     # point the worker at the reduced copy; small sessions are read verbatim. The
     # findings session_path is rewritten back to the original after a successful run.
-    readpath="$session"
     slimfile=""
+    # sz stays the size of the ORIGINAL transcript: the #12 oversized measurement and
+    # the metadata stub both mean the real session, not an intermediate copy.
+    # (No apostrophes in this block — it lives inside a single-quoted bash -c script.)
     sz=$(wc -c < "$session" | tr -d " ")
-    if [ "${sz:-0}" -gt "${AUTODREAM_SLIM_BYTES:-262144}" ] && [ -x "$SLIM" ]; then
+    readsz=$(wc -c < "$readpath" | tr -d " ")
+    if [ "${readsz:-0}" -gt "${AUTODREAM_SLIM_BYTES:-262144}" ] && [ -x "$SLIM" ]; then
       slimfile="$FINDINGS_DIR/$hash.slim.jsonl"
-      if "$SLIM" "$session" "$slimfile" 2>/dev/null && [ -s "$slimfile" ]; then
+      if "$SLIM" "$readpath" "$slimfile" 2>/dev/null && [ -s "$slimfile" ]; then
         readpath="$slimfile"
-        echo "slimmed: $session ($sz bytes) ($hash)" >&2
+        echo "slimmed: $session ($readsz bytes read) ($hash)" >&2
       else
         rm -f "$slimfile"; slimfile=""
       fi
@@ -633,11 +757,17 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
       > /dev/null 2> "$errlog"
 
     if [ -s "$output" ]; then
-      # Reported path should be the real session, not the temp slim copy. Then drop
-      # the slim file (regenerable; keeps the findings dir clean).
+      # Reported path should be the real session, not an intermediate copy. Then drop
+      # the slim file (regenerable; keeps the findings dir clean). The normalized copy
+      # is KEPT: the project-normalization pass reads its metadata, and it is the
+      # artifact that shows which branches were dropped.
       if [ -n "$slimfile" ]; then
         sed -i "" "s#$slimfile#$session#g" "$output" 2>/dev/null || true
         rm -f "$slimfile"
+      fi
+      normfile="$FINDINGS_DIR/$hash.norm.jsonl"
+      if [ -s "$normfile" ]; then
+        sed -i "" "s#$normfile#$session#g" "$output" 2>/dev/null || true
       fi
       rm -f "$errlog"
       echo "ok: $session ($hash)"
@@ -757,6 +887,13 @@ run() {
   COUNT_AFTER_PRUNE=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
   EXCLUDED=$(( RAW - COUNT_AFTER_PRUNE ))
 
+  # Normalize OMP session trees to their live leaf chain BEFORE anything reads them.
+  # Ordering is load-bearing: the substantive filter, the stats sidecar, the noise gate,
+  # slimming and the L1 worker must all see the live conversation, and an unnormalizable
+  # session has to leave the worklist here rather than reach a model as a raw tree.
+  normalize_omp_sessions
+  COUNT_AFTER_NORMALIZE=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
+
   # Drop 0-turn shells (auto-opened/aborted sessions with no user input) before fanout.
   # Independent of the self-prune above, so the two telemetry counts don't overlap.
   SKIPPED_EMPTY=0
@@ -766,8 +903,10 @@ run() {
       || rm -f "$SESSIONS_LIST.nonempty"
   fi
   COUNT=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
-  SKIPPED_EMPTY=$(( COUNT_AFTER_PRUNE - COUNT ))
-  log "found $RAW session files; excluded $EXCLUDED autodream-own, skipped $SKIPPED_EMPTY empty; $COUNT to triage"
+  # Against the POST-normalize count, so a dropped OMP session is not also counted as an
+  # empty shell — the two telemetry numbers have to stay disjoint to mean anything.
+  SKIPPED_EMPTY=$(( COUNT_AFTER_NORMALIZE - COUNT ))
+  log "found $RAW session files; excluded $EXCLUDED autodream-own, dropped $OMP_FAILED unnormalizable omp, skipped $SKIPPED_EMPTY empty; $COUNT to triage"
 
   if [ "$COUNT" -eq 0 ]; then
     log "no sessions to triage; writing stub report and exiting"
@@ -940,7 +1079,21 @@ for path in glob.glob(os.path.join(findings_dir, "*.json")):
     sp = data.get("session_path")
     if not sp:
         continue
+    # An OMP session's project comes from its header cwd, encoded the way Claude
+    # encodes its buckets, so the same real project groups together across harnesses
+    # instead of splitting into "-sites" and "-Users-sean-sites". normalize_omp_sessions
+    # wrote that sidecar next to the findings JSON; everything else keeps using the
+    # session path's parent directory.
     proj = os.path.basename(os.path.dirname(sp))
+    sidecar = path[: -len(".json")] + ".project" if path.endswith(".json") else None
+    if sidecar and os.path.exists(sidecar):
+        try:
+            with open(sidecar) as f:
+                encoded = f.read().strip()
+            if encoded:
+                proj = encoded
+        except OSError:
+            pass
     if proj and data.get("project") != proj:
         data["project"] = proj
         tmp = path + ".tmp"
@@ -992,6 +1145,14 @@ PY
     printf 'sessions_found_raw: %s\n' "$RAW"
     printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
     printf 'sessions_skipped_empty: %s\n' "$SKIPPED_EMPTY"
+    # OMP source ingest. omp_sessions being 0 on a day the operator worked in omp is the
+    # signal that this source silently stopped being seen — the failure mode the
+    # Claude-selector noise gate produced before session-stats.sh learned both schemas.
+    # omp_normalization_failed > 0 names sessions skipped rather than read as raw trees.
+    printf 'omp_sessions: %s\n' "${OMP_SESSIONS:-0}"
+    printf 'omp_normalized: %s\n' "${OMP_NORMALIZED:-0}"
+    printf 'omp_normalization_failed: %s\n' "${OMP_FAILED:-0}"
+    printf 'omp_branches_dropped: %s\n' "${OMP_BRANCHES_DROPPED:-0}"
     printf 'sessions_triaged: %s\n' "$COUNT"
     # Sessions within sessions_triaged that were skipped before any model call
     # (noise gate). Structurally cannot appear in l1_findings_with_error since

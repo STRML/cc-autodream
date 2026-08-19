@@ -180,6 +180,121 @@ test_report_only_leaves_memory_untouched(){
   rm -rf "$root"
 }
 
+# ---- OMP sessions end-to-end through run.sh -----------------------------------------
+# The OMP root is just another SESSION_ROOTS entry; what differs is that each session
+# must be normalized (tree -> live chain) BEFORE stats, the noise gate, slimming, and
+# the L1 worker see it, and a session that cannot be normalized must be skipped rather
+# than read raw.
+mk_omp_session_in(){ # $1=dir $2=name — live chain e1->e3->e4, e2 abandoned
+  mkdir -p "$1"
+  local f="$1/$2.jsonl"
+  cat > "$f" <<'OMPEOF'
+{"type":"title","v":1,"title":"omp fixture","source":"auto"}
+{"type":"session","version":3,"id":"s1","timestamp":"2020-01-02T12:00:00.000Z","cwd":"/tmp/proj-a"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2020-01-02T12:00:01.000Z","message":{"role":"user","attribution":"user","content":[{"type":"text","text":"start the omp task"}]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2020-01-02T12:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ABANDONED-BRANCH"}]}}
+{"type":"message","id":"e3","parentId":"e1","timestamp":"2020-01-02T12:04:03.000Z","message":{"role":"user","attribution":"user","content":[{"type":"text","text":"keep going"}]}}
+{"type":"message","id":"e4","parentId":"e3","timestamp":"2020-01-02T12:04:04.000Z","message":{"role":"assistant","model":"anthropic/claude-opus-5","content":[{"type":"text","text":"done"},{"type":"toolCall","id":"c1","name":"bash","intent":"Checking","arguments":{"command":"git status"}}]}}
+OMPEOF
+  touch -t "$STAMP" "$f"
+}
+mk_broken_omp_session_in(){ # $1=dir $2=name — dangling parentId: unnormalizable
+  mkdir -p "$1"
+  local f="$1/$2.jsonl"
+  {
+    printf '{"type":"title","v":1,"title":"broken"}\n'
+    printf '{"type":"session","version":3,"id":"s9","cwd":"/tmp/proj-a"}\n'
+    printf '{"type":"message","id":"z","parentId":"gone","message":{"role":"user","attribution":"user","content":[{"type":"text","text":"orphan turn"}]}}\n'
+  } > "$f"
+  touch -t "$STAMP" "$f"
+}
+omp_run(){ # $1=root — the claude root plus an OMP root, declared as OMP by provenance
+  OMP_SESSION_ROOTS="$1/omp" SESSION_ROOTS="$1/projects" run_dream "$1"
+}
+
+test_omp_session_triaged(){
+  echo "# omp: a session in an omp root is normalized, stat'd, and triaged"
+  # Deliberately the ONLY session in the run, and FANOUT=1, so the mock's single
+  # l1-stdin.txt capture unambiguously belongs to this session. (Mixed claude+omp runs
+  # are covered by the failure test below.)
+  local root; root=$(setup_env)
+  mk_omp_session_in "$root/omp/-tmp-proj-a" ompsess1
+  local sess="$root/omp/-tmp-proj-a/ompsess1.jsonl"
+  local h; h=$(hash_of "$sess")
+  export MOCK_CALL_LOG="$root/calls.txt" MOCK_CAPTURE_DIR="$root/cap" FANOUT=1
+  omp_run "$root"
+  unset MOCK_CALL_LOG MOCK_CAPTURE_DIR FANOUT
+
+  assert_file "$(fdir "$root")/$h.norm.jsonl" "the omp session is normalized to a sidecar"
+  assert_nogrep "$(fdir "$root")/$h.norm.jsonl" 'ABANDONED-BRANCH' "the normalized copy drops the abandoned branch"
+  assert_file "$(fdir "$root")/$h.json" "findings JSON written for the omp session"
+  # Stats must come from the normalized copy, or the noise gate stubs it at 0 user turns.
+  assert_eq "$(jq -r '.user_message_count' "$(fdir "$root")/$h.stats.json" 2>/dev/null)" "2" \
+    "stats sidecar counts the omp user turns"
+  assert_nogrep "$(fdir "$root")/$h.json" 'below_noise_gate' "the omp session is not noise-gated"
+  assert_grep "$root/calls.txt" "$h" "the model was actually invoked for the omp session"
+  # The worker must read the normalized copy, never the raw tree. Line 1 of the L1
+  # prompt is the transcript path run.sh handed it.
+  local l1sess; l1sess=$(sed -n '1p' "$root/cap/l1-stdin.txt" 2>/dev/null)
+  case "$l1sess" in
+    *"$h.norm.jsonl") ok "the L1 worker is pointed at the normalized copy" ;;
+    *) no "the L1 worker must read the normalized copy (got [$l1sess])" ;;
+  esac
+  assert_grep "$(fdir "$root")/run-stats.txt" 'omp_sessions: 1'          "run-stats counts the omp session"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'omp_normalized: 1'        "run-stats counts the normalization"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'omp_normalization_failed: 0' "run-stats reports no failures"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'omp_branches_dropped: 1'  "run-stats counts the dropped branch"
+  rm -rf "$root"
+}
+
+test_omp_normalization_failure_is_skipped(){
+  echo "# omp: an unnormalizable session is skipped with an error finding, never read raw"
+  local root; root=$(setup_env); mk_session "$root" claude1
+  mk_broken_omp_session_in "$root/omp/-tmp-proj-a" broken1
+  local sess="$root/omp/-tmp-proj-a/broken1.jsonl"
+  local h; h=$(hash_of "$sess")
+  export MOCK_CALL_LOG="$root/calls.txt"; omp_run "$root"; unset MOCK_CALL_LOG
+
+  assert_no_file "$(fdir "$root")/$h.norm.jsonl" "no normalized copy for a broken tree"
+  assert_grep "$(fdir "$root")/$h.json" '"error"' "an error finding records the skip"
+  assert_grep "$(fdir "$root")/$h.json" 'normaliz' "the error says normalization failed"
+  # The whole point: no raw fallback. The model must never have been called for it.
+  assert_nogrep "$root/calls.txt" "$h" "the model was never invoked on the raw tree"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'omp_normalization_failed: 1' "run-stats counts the failure"
+  # The claude session in the same run is unaffected.
+  assert_nonempty "$root/dreams/$DATE.md" "the run still produces a report"
+
+  # A file in an OMP root whose header is unparseable must ALSO be skipped. Content
+  # detection cannot recognise it, so only root provenance keeps it out of L1 — without
+  # that, "unrecognisable" degrades into "treat as Claude and read the raw tree", which
+  # is the exact failure the normalizer exists to prevent.
+  local garbage="$root/omp/-tmp-proj-a/garbage.jsonl"
+  printf 'not json at all\n{"type":"message","id":"g1"\n' > "$garbage"
+  touch -t "$STAMP" "$garbage"
+  local gh; gh=$(hash_of "$garbage")
+  export MOCK_CALL_LOG="$root/calls2.txt"; AUTODREAM_FORCE=1 omp_run "$root"; unset MOCK_CALL_LOG
+  assert_grep   "$(fdir "$root")/$gh.json" '"error"' "a malformed-header omp file gets an error finding"
+  assert_nogrep "$root/calls2.txt" "$gh" "a malformed-header omp file never reaches the model"
+  rm -rf "$root"
+}
+
+test_omp_project_from_cwd(){
+  echo "# omp: project identity comes from the header cwd, not the storage bucket"
+  command -v python3 >/dev/null 2>&1 || { echo "  skip - python3 not available"; return 0; }
+  local root; root=$(setup_env)
+  mk_omp_session_in "$root/omp/-tmp-proj-a" ompsess1
+  local sess="$root/omp/-tmp-proj-a/ompsess1.jsonl"
+  local h; h=$(hash_of "$sess")
+  # l1_badproject makes the mock emit a real session_path with a wrong project, which is
+  # what the normalization pass exists to correct.
+  export MOCK_MODE=l1_badproject; omp_run "$root"; unset MOCK_MODE
+  # cwd /tmp/proj-a encoded the way Claude encodes its buckets, so the same real project
+  # groups together across harnesses instead of splitting by bucket name.
+  assert_eq "$(jq -r '.project' "$(fdir "$root")/$h.json" 2>/dev/null)" "-tmp-proj-a" \
+    "project is the encoded header cwd"
+  rm -rf "$root"
+}
+
 # ---------------------------------------------------------------------------
 
 # ---- Operator notes: notes.md + vault inbox merged into operator-notes.md ----------
@@ -1895,6 +2010,9 @@ test_self_audit_stats_failure_denominator
 test_self_audit_stats_precached_disambiguation
 test_normalize_project
 test_slim_transcript
+test_omp_session_triaged
+test_omp_normalization_failure_is_skipped
+test_omp_project_from_cwd
 test_linearize_omp
 test_slim_omp_payloads
 test_linearize_then_slim
