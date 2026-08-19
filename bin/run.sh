@@ -462,14 +462,23 @@ filter_empty_sessions() {
 # Reads the normalized copy for OMP sessions, and matches BOTH schemas: an OMP user turn
 # is `type:"message"` with `message.role == "user"`, so the Claude-only predicate scored
 # every OMP session as a 0-turn shell and filtered the whole source out before fanout.
+#
+# A nested OMP session (advisor or spawned child) legitimately has NO user turn at all —
+# its instructions come from the parent, not the operator — so the user-turn rule would
+# drop it here, before the noise gate ever gets to exempt it. Keep it when it carries any
+# conversation at all. This is the same judgement the Claude path gets for free, because
+# a sidechain transcript opens with the task prompt as a `user` turn.
 session_is_substantive() {
   local sp verdict
   sp=$(read_path_for "$1")
   [ -r "$sp" ] || return 0
   verdict=$(jq -s '
-      if any(.[];
+      (any(.[]; .type == "autodream_meta" and .nested == true)
+       or any(.[]; .type == "session_init")) as $child
+      | if any(.[];
           (.type == "user" and (.isMeta != true))
           or (.type == "message" and (.message.role == "user"))
+          or ($child and .type == "message")
         ) then 1 else 0 end
     ' "$sp" 2>/dev/null) || return 0
   [ "$verdict" = "0" ] && return 1

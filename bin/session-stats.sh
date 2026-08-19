@@ -60,10 +60,19 @@ if head -n 4 "$transcript" | jq -R -s -e '
 
     [ split("\n")[] | fromjson? | select(type == "object") ] as $lines
     | [ $lines[] | select(.type == "message") ] as $msgs
-    # A spawned subagent session records its own init entry. It is the OMP analogue of
-    # the Claude isSidechain flag: legitimate work, often short on user turns, so like
-    # sidechains it is never noise-gated.
-    | (any($lines[]?; .type == "session_init")) as $is_subagent
+    # The OMP analogue of the Claude isSidechain flag: a child session is legitimate
+    # work that is often short on user turns, so like a sidechain it must never be
+    # noise-gated. (No apostrophes here — this block is inside a single-quoted program.)
+    # TWO signals, because one is not enough. A spawned task child records its own
+    # `session_init`; an advisor child records none — on this host session_init covers
+    # all 16 task children and none of the 20 `__advisor.jsonl` sessions, and the
+    # 2026-08-18 pilot gated away an advisor transcript with 26 turns and 4 tool calls.
+    # The authoritative signal is the `nested` flag the linearizer stamps from directory
+    # provenance, which holds whatever entries the file happens to contain.
+    | (
+        (any($lines[]?; .type == "session_init"))
+        or (any($lines[]?; .type == "autodream_meta" and .nested == true))
+      ) as $is_subagent
     # Real user input only: an entry whose attribution is "agent" was injected by the
     # harness (steering, hook output), not typed by the user.
     | [ $msgs[]

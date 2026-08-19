@@ -208,6 +208,74 @@ mk_broken_omp_session_in(){ # $1=dir $2=name — dangling parentId: unnormalizab
   } > "$f"
   touch -t "$STAMP" "$f"
 }
+# OMP nests child sessions in a directory named after the parent session file:
+#   <bucket>/<stamp>_<id>.jsonl              the parent
+#   <bucket>/<stamp>_<id>/__advisor.jsonl    a child
+# The advisor child is the case that bites: it holds real tool work but NO user turns,
+# and unlike spawned task children it carries no `session_init` entry, so a session_init
+# probe reports it as top-level and the noise gate throws it away. Provenance —
+# "dirname + .jsonl exists" — is what identifies it, and on the real corpus it catches
+# all 36 nested sessions where session_init catches only the 16 named task children.
+mk_omp_advisor_child_in(){ # $1=dir $2=parent-name — writes the parent AND its advisor child
+  mk_omp_session_in "$1" "$2"
+  local d="$1/$2"; mkdir -p "$d"
+  local f="$d/__advisor.jsonl"
+  cat > "$f" <<'OMPEOF'
+{"type":"title","v":1,"title":"advisor","source":"auto"}
+{"type":"session","version":3,"id":"adv1","timestamp":"2020-01-02T12:00:00.000Z","cwd":"/tmp/proj-a"}
+{"type":"message","id":"a1","parentId":null,"timestamp":"2020-01-02T12:00:05.000Z","message":{"role":"assistant","model":"anthropic/claude-opus-5","content":[{"type":"text","text":"advisor note"},{"type":"toolCall","id":"c9","name":"read","intent":"Reviewing","arguments":{"path":"/x"}}]}}
+{"type":"message","id":"a2","parentId":"a1","timestamp":"2020-01-02T12:02:05.000Z","message":{"role":"toolResult","toolCallId":"c9","toolName":"read","isError":false,"content":[{"type":"text","text":"file body"}]}}
+{"type":"message","id":"a3","parentId":"a2","timestamp":"2020-01-02T12:03:05.000Z","message":{"role":"assistant","model":"anthropic/claude-opus-5","content":[{"type":"text","text":"advisor verdict"}]}}
+OMPEOF
+  touch -t "$STAMP" "$f"
+}
+
+test_omp_nested_session_provenance(){
+  echo "# omp: a nested child session is stamped as nested during linearization"
+  local LZ="$REPO/bin/linearize-omp-session.sh"
+  [ -x "$LZ" ] || { no "linearize-omp-session executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mk_omp_advisor_child_in "$root/bucket" parent1
+  local child="$root/bucket/parent1/__advisor.jsonl" out="$root/child.lin.jsonl"
+  "$LZ" "$child" "$out" || no "linearizer failed on a nested child"
+  assert_grep "$out" '"nested":true' "the child is stamped nested"
+  assert_grep "$out" 'parent1.jsonl' "the child records its parent session file"
+
+  local pout="$root/parent.lin.jsonl"
+  "$LZ" "$root/bucket/parent1.jsonl" "$pout" || no "linearizer failed on the parent"
+  assert_grep "$pout" '"nested":false' "a top-level session is stamped not-nested"
+  rm -rf "$root"
+}
+
+test_omp_nested_session_is_sidechain(){
+  echo "# omp: a nested child counts as a sidechain, so the noise gate exempts it"
+  local LZ="$REPO/bin/linearize-omp-session.sh" ST="$REPO/bin/session-stats.sh"
+  { [ -x "$LZ" ] && [ -x "$ST" ]; } || { no "omp ingest scripts executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mk_omp_advisor_child_in "$root/bucket" parent1
+  local child="$root/bucket/parent1/__advisor.jsonl" lin="$root/c.lin.jsonl" st="$root/c.stats.json"
+  "$LZ" "$child" "$lin" && "$ST" "$lin" "$st" || no "ingest failed for the nested child"
+  # No user turns at all — this is exactly what the gate keys on, so without the
+  # sidechain exemption the session is discarded despite carrying real tool work.
+  assert_eq "$(jq -r '.user_message_count' "$st")" "0" "the advisor child has no user turns"
+  assert_eq "$(jq -r '.tool_call_count'    "$st")" "1" "the advisor child did real tool work"
+  assert_eq "$(jq -r '.isSidechain'        "$st")" "true" "the advisor child is marked isSidechain"
+  rm -rf "$root"
+}
+
+test_omp_nested_session_not_gated(){
+  echo "# omp: an advisor child survives the noise gate in a real run"
+  local root; root=$(setup_env)
+  mk_omp_advisor_child_in "$root/omp/-tmp-proj-a" parent1
+  local child="$root/omp/-tmp-proj-a/parent1/__advisor.jsonl"
+  local ch; ch=$(hash_of "$child")
+  export MOCK_CALL_LOG="$root/calls.txt"; omp_run "$root"; unset MOCK_CALL_LOG
+  assert_nogrep "$(fdir "$root")/$ch.json" 'below_noise_gate' "the advisor child is not noise-gated"
+  assert_grep   "$root/calls.txt" "$ch" "the model was invoked for the advisor child"
+  rm -rf "$root"
+}
 omp_run(){ # $1=root — the claude root plus an OMP root, declared as OMP by provenance
   OMP_SESSION_ROOTS="$1/omp" SESSION_ROOTS="$1/projects" run_dream "$1"
 }
@@ -2001,6 +2069,9 @@ test_framing
 test_changelog
 test_prune_helper
 test_self_session_excluded
+test_omp_nested_session_provenance
+test_omp_nested_session_is_sidechain
+test_omp_nested_session_not_gated
 test_skip_empty_sessions
 test_skip_empty_disabled
 test_l1_retry

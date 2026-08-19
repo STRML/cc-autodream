@@ -47,6 +47,27 @@ if ! head -n 4 "$src" | jq -R -s -e '
   exit 2
 fi
 
+# ---- Nested-session provenance ----
+# OMP stores a child session inside a directory named after its parent session file:
+#   <bucket>/<stamp>_<id>.jsonl           the parent
+#   <bucket>/<stamp>_<id>/__advisor.jsonl a child
+# So "my directory, plus .jsonl, is a session file" identifies a child exactly.
+#
+# This matters because a child is the OMP analogue of a Claude sidechain and must be
+# exempt from the noise gate: an advisor child holds real tool work but NO user turns,
+# which is precisely what the gate discards. A `session_init` probe is not enough — on
+# this host it covers all 16 spawned task children and none of the 20 `__advisor.jsonl`
+# sessions, and the 2026-08-18 pilot duly threw away an advisor transcript carrying 26
+# turns and 4 tool calls. Provenance holds for every nested session regardless of which
+# entries it happens to contain.
+parent_candidate="$(dirname "$src").jsonl"
+if [ -f "$parent_candidate" ]; then
+  omp_nested=true
+  omp_parent="$parent_candidate"
+else
+  omp_nested=false
+  omp_parent=""
+fi
 tmp="$dst.tmp.$$"
 # Everything here fails closed. Lenient parsing is not an option: a skipped line can
 # move the inferred leaf onto an abandoned branch, and the result — confidently wrong
@@ -57,7 +78,8 @@ tmp="$dst.tmp.$$"
 # The walk is bounded by the entry count, so a cycle terminates instead of spinning; a
 # cycle or a dangling parentId then surfaces as a chain whose root still has a parent,
 # which is checked before anything is emitted.
-if ! jq -R -s -c --arg src "$src" '
+if ! jq -R -s -c --arg src "$src" \
+     --argjson nested "$omp_nested" --arg parent "$omp_parent" '
   def die($msg): ($msg + " in " + $src) | halt_error(4);
 
   [ split("\n")[] | select(test("^[[:space:]]*$") | not) ] as $raw
@@ -96,6 +118,12 @@ if ! jq -R -s -c --arg src "$src" '
         type: "autodream_meta",
         source: "omp",
         source_path: $src,
+        # Nested (child) sessions are the OMP analogue of a Claude sidechain. Recorded
+        # from directory provenance, not from entry contents, because an advisor child
+        # carries no session_init and no user turns — see the comment above the shell
+        # detection. Consumers use this to exempt children from the noise gate.
+        nested: $nested,
+        parent_session_file: (if $parent == "" then null else $parent end),
         session_id: ($header.id // null),
         # cwd is project identity: it is the same real path across harnesses, whereas
         # the storage bucket name is source-specific.
