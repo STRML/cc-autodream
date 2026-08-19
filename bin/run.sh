@@ -183,6 +183,10 @@ else
   OVERLAP="$SCRIPT_DIR/overlap-stats.sh"
   [ -x "$OVERLAP" ] || OVERLAP="$AUTODREAM_DIR/overlap-stats.sh"
 fi
+# Report citation resolver (resolved the same way; exported to nothing — run.sh calls it
+# directly after L2). Deterministic artifact check, no model calls.
+CITECHECK="$SCRIPT_DIR/citation-check.sh"
+[ -x "$CITECHECK" ] || CITECHECK="$AUTODREAM_DIR/citation-check.sh"
 # Operator-note collector and X-bookmark fetcher. Both are context-gatherers for L2 and
 # both are opt-in: vault-notes.sh degrades to the plain notes.md when no vault is set,
 # x-bookmarks.sh to a "not configured" stub when no credentials exist. Overrides are
@@ -1437,6 +1441,29 @@ PY
 
   if [ -f "$REPORT_PATH" ]; then
     log "report bytes: $(wc -c < "$REPORT_PATH" | tr -d ' ')"
+
+    # ---- Report citation integrity (appended to run-stats.txt) ----
+    # Deliberately here and not in the run-stats block above: those keys are written
+    # BEFORE L2 runs, and this check needs the finished report. Appending keeps one
+    # self-audit artifact to read in the morning instead of a second sidecar.
+    # Never fatal — a citation defect is a measurement, and the report still ships.
+    if [ -x "$CITECHECK" ]; then
+      if CITE_OUT=$("$CITECHECK" "$REPORT_PATH" "$FINDINGS_DIR" 2>>"$RUN_LOG"); then
+        printf '%s\n' "$CITE_OUT" >> "$FINDINGS_DIR/run-stats.txt"
+        CITE_BAD=$(printf '%s\n' "$CITE_OUT" | awk -F': ' '/^citations_(unresolved|to_gated): /{n+=$2} END{print n+0}')
+        if [ "$CITE_BAD" -gt 0 ]; then
+          log "WARNING: $CITE_BAD report citation(s) do not resolve to a triaged session — see citations_* in run-stats.txt"
+        else
+          log "citations: all resolved to triaged sessions"
+        fi
+      else
+        # The checker could not run (missing jq, unreadable inputs). Record that rather
+        # than leaving the keys absent, which reads as "this runner predates the stat".
+        printf 'citations_total: unmeasured\ncitations_unresolved: unmeasured\ncitations_to_gated: unmeasured\n' \
+          >> "$FINDINGS_DIR/run-stats.txt"
+        log "citations: check did not run (keys recorded as unmeasured)"
+      fi
+    fi
 
     # ---- Drop open-questions file into Sublime (no-op if zero questions) ----
     if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
