@@ -179,6 +179,37 @@ host's OMP sessions with 0 rejections and plausible non-zero stats.
    and `dirname "${BASH_SOURCE[0]}"` does not follow the symlink — then
    `$AUTODREAM_DIR`, which is the same dir. An unlinked helper is never found.
    (`run.sh` does walk its own symlink, but only for `RUNNER_COMMIT` provenance.)
+6. **Report-only enforcement, before the first real run.** L2 has no concept of a
+   source: it applies `PROMPT.md`'s auto-memory-write gate (`confidence: high AND
+   count >= 2 AND severity: high` → 📌 pin) to whatever findings it is given, and it
+   holds `Write`/`Edit` under `--permission-mode bypassPermissions`, so it edits
+   `~/.claude/projects/*/memory/MEMORY.md` itself and records `touched-projects.txt`
+   for `run.sh` to hand to `claude-memory gc`. Left alone, the first OMP run pins
+   OMP-derived advice into Claude memory — permanently, by design of pins — before the
+   Phase 3 taxonomy or the Phase 4 sink decision exists.
+
+   Note what does **not** enforce this. Withholding the memory path from the prompt
+   does not: L2 can Glob for it. Skipping the GC step does not: the `MEMORY.md` edit
+   already happened before GC. A `PROMPT.md` instruction does not: it is a request to a
+   model on an unvalidated path, which is precisely where compliance cannot be assumed.
+
+   The boundary has to be the **tool surface**. Report-only mode invokes the aggregator
+   with no mutating tools — `--tools Glob Read`, no `Write`, no `Edit` — and has it emit
+   the report on stdout, which `run.sh` captures and writes to `$REPORT_PATH` itself.
+   That makes memory mutation unreachable rather than discouraged, and leaves `run.sh`
+   as the only writer. The existing truncated-report guards keyed on the
+   `open-questions=N` marker still apply to the captured text, and the GC step is
+   skipped as a second line of defence, not the first.
+
+   `PROMPT.md` additionally states that findings whose `source` is not `claude` are
+   report-only and ineligible for the memory-write gate, citing issue #15's quarantine.
+   That is for later mixed runs, where removing `Write` wholesale is too blunt — but a
+   mixed run is only trustworthy once the OMP taxonomy has been through the pilot.
+
+   Test: an integration test checksums every `MEMORY.md` under the sandbox's projects
+   tree (plus `touched-projects.txt`) before and after a report-only run containing an
+   OMP-source finding, and asserts byte-identical. Asserted on the filesystem, not on
+   model behavior, since the L2 mock cannot model L2's judgment.
 
 **Conflict watch:** open PR #5 (`dy/triage-dream`) touches `bin/run.sh`,
 `prompts/SESSION_TRIAGE.md`, `prompts/PROMPT.md` — the same files Phases 2 and 3 edit.
@@ -215,8 +246,13 @@ quality is validated by a production pilot** — a week of nightly runs plus a m
 
 ## First real run (the immediate goal)
 
-After Phase 2, force a rebuild for a date with real OMP activity and read the report.
+After Phase 2 — **including its report-only boundary**, which is a hard gate on running
+this at all — force a rebuild for a date with real OMP activity and read the report.
 What to check, in order:
+
+0. Memory files are byte-identical before and after the run. Check it on this host, not
+   only in the suite: the pins are permanent and the whole point of the first run is
+   that its judgment is not yet trusted.
 
 1. `run-stats.txt`: `omp_sessions` non-zero, `omp_normalization_failed` zero,
    `gated` not suspiciously equal to the OMP session count (the noise-gate failure
@@ -253,3 +289,4 @@ symlink targets and do one manual run before trusting a nightly.
 | OMP findings phrased in Claude terms | Phase 3 fragment; caught by reading the first reports |
 | Phase 2/3 collide with PR #5 | Phase 1 independent; rebase when #5 lands |
 | Retired telemetry resurrected for OMP only | No `compliance_markers` in the OMP branch |
+| OMP findings pin permanent advice into Claude `MEMORY.md` | Report-only boundary is the tool surface (no `Write`/`Edit`, `run.sh` captures stdout), not a flag or a prompt line; checksum test; GC skip as second line |
