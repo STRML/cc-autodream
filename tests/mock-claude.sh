@@ -19,7 +19,14 @@
 #   MOCK_CALL_LOG=<file>     append the L1 output path for every invocation of
 #                            this mock, one per line — lets a test prove the
 #                            model was (or was not) invoked for a given session
-#                            (e.g. a noise-gated session should never appear).
+#                     (e.g. a noise-gated session should never appear).
+#   MOCK_MODE=l2_memory_writer  L2 also writes a project MEMORY.md pin and a
+#                            touched-projects.txt, i.e. what the real aggregator does
+#                            when the memory-write gate fires. It does so ONLY when
+#                            `Write` appears in its own argv: this mock stands in for
+#                            the CLI, not the model, and the CLI is what enforces
+#                            --tools. Needs MOCK_MEMORY_FILE.
+#   MOCK_MEMORY_FILE=<path>  where l2_memory_writer writes its pin.
 
 input=$(cat)
 mode="${MOCK_MODE:-good}"
@@ -54,6 +61,13 @@ else
     printf '%s\n' "$@" > "$MOCK_CAPTURE_DIR/l2-args.txt"
   fi
   rep=$(printf '%s' "$line2" | sed 's/^Write the report to this literal absolute path: //')
+  # Report-only mode hands the aggregator no Write tool and asks for the report on
+  # stdout, so there is no path on line 2 to write to.
+  report_only=0
+  printf '%s' "$line2" | grep -q '^Print the report to stdout' && report_only=1
+  # Emulate the CLI's --tools enforcement: a tool absent from argv is unavailable.
+  granted_write=0
+  printf '%s\n' "$@" | grep -qx 'Write' && granted_write=1
   if [ "$mode" = "l2_fail" ]; then
     echo "mock: aggregator failed" >&2
     exit 1
@@ -68,7 +82,26 @@ else
   fi
   # The open-questions marker is part of the real contract (PROMPT.md mandates it) and
   # run.sh now treats its absence as a truncated write, so the mock must emit it too.
-  printf '# Autodream — mock\n\nmock aggregate report\n\n<!-- autodream:open-questions=0 -->\n' > "$rep"
+  report_body='# Autodream — mock
+
+mock aggregate report
+
+<!-- autodream:open-questions=0 -->'
+
+  # A model that tries to touch memory. Gated on the tool actually being granted,
+  # which is what makes the report-only boundary observable in a test.
+  if [ "$mode" = "l2_memory_writer" ] && [ "$granted_write" = "1" ] && [ -n "${MOCK_MEMORY_FILE:-}" ]; then
+    mkdir -p "$(dirname "$MOCK_MEMORY_FILE")"
+    printf '📌 mock pin written by the aggregator\n' >> "$MOCK_MEMORY_FILE"
+    findings_dir=$(printf '%s' "$line1" | sed 's/^Findings directory to aggregate (literal absolute path): //')
+    [ -d "$findings_dir" ] && printf 'proj-a\n' >> "$findings_dir/touched-projects.txt"
+  fi
+
+  if [ "$report_only" = "1" ]; then
+    printf '%s\n' "$report_body"
+    exit 0
+  fi
+  printf '%s\n' "$report_body" > "$rep"
   echo "report: $rep"
   echo "mock: 1 session reviewed, 0 findings, 0 edits"
 fi

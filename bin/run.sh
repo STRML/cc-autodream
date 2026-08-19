@@ -34,6 +34,11 @@
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
 #   AUTODREAM_L2_MODEL   override the L2 aggregator model            default: fable-5 until 2026-06-20, claude-opus-4-7 from 2026-06-21
+#   AUTODREAM_REPORT_ONLY set 1 to run the aggregator with no mutating tools (Glob+Read
+#                         only), take the report from its stdout, and skip the memory
+#                         GC. Makes project MEMORY.md unreachable for the run, which is
+#                         the required mode for an unvalidated source (see
+#                         docs/design/omp-source-ingest-2026-08-19.md)  default: 0
 #   AUTODREAM_MIN_USER_TURNS  noise-gate floor on user_message_count  default: 2
 #   AUTODREAM_MIN_MINUTES     noise-gate floor on duration_minutes    default: 1
 #   AUTODREAM_STATS_BIN       override the resolved session-stats.sh path, authoritative
@@ -1128,34 +1133,70 @@ PY
   L2_ATTEMPTS="${AUTODREAM_L2_ATTEMPTS:-3}"
   L2_START=$(date +%s)
   L2_RC=1
+
+  # ---- Report-only mode: make memory unreachable, not merely discouraged ----
+  # L2 normally runs with Write/Edit under bypassPermissions, so it edits project
+  # MEMORY.md itself and 📌 pins are permanent. For a source whose findings are not yet
+  # trusted (the OMP pilot), the boundary has to be the TOOL SURFACE: withholding the
+  # memory path does not work (it can Glob for it) and skipping GC does not either (the
+  # edit already happened by then). So report-only hands it Glob+Read only, asks for the
+  # report on stdout, and run.sh becomes the only writer. The captured text lands at
+  # $REPORT_PATH exactly as a model-written report would, so the marker check, the
+  # retry loop, and the truncated-report guards below all still apply unchanged.
+  if [ "${AUTODREAM_REPORT_ONLY:-0}" = "1" ]; then
+    L2_LINE2="Print the report to stdout as your entire response. Write no files."
+    L2_TOOLS=(Glob Read)
+    L2_SYS="Headless aggregator in REPORT-ONLY mode. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then print the complete report — including the autodream:open-questions marker — to stdout as your entire response. That path is a literal string, not a shell variable — never \$-expand it. You have no Write or Edit tool. The document below is the normal prompt and its file-writing instructions are SUPERSEDED here: step 5 (write the report to a path), step 6 and the \"Memory writes\" section (edit a project MEMORY.md, append to touched-projects.txt) do not apply. Do not attempt any of them — print the report instead, and make no memory edits. The runner writes the report itself from your stdout."
+    log "L2 report-only: aggregator gets Glob+Read only; run.sh writes the report; project memory is unreachable"
+  else
+    L2_LINE2="Write the report to this literal absolute path: $REPORT_PATH"
+    L2_TOOLS=(Glob Read Write Edit)
+    L2_SYS="Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
+  fi
+
+  # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
+  # comment): keep the paths as literal data the aggregator hands to Glob/Read/Write,
+  # and preserve the blank-line separator before PROMPT.md instead of letting a
+  # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
+  # Called in a subshell so the cwd change (isolating the AI-title stub into
+  # $WORK_BUCKET, same as L1) is scoped to the call and doesn't leak into the
+  # notify/GC steps below.
+  l2_invoke() {
+    cd "$WORK_DIR" 2>/dev/null || true
+    {
+      printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
+      printf '%s\n\n' "$L2_LINE2"
+      cat "$AUTODREAM_DIR/PROMPT.md"
+    } | "$CLAUDE_BIN" \
+      --print \
+      --permission-mode bypassPermissions \
+      --model "$AUTODREAM_L2_MODEL" \
+      --no-session-persistence \
+      --tools "${L2_TOOLS[@]}" \
+      --disable-slash-commands \
+      --strict-mcp-config \
+      --settings '{"disableAllHooks":true}' \
+      --append-system-prompt "$L2_SYS"
+  }
+
   for attempt in $(seq 1 "$L2_ATTEMPTS"); do
     log "L2 aggregation attempt $attempt/$L2_ATTEMPTS..."
-    # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
-    # comment): keep the paths as literal data the aggregator hands to Glob/Read/Write,
-    # and preserve the blank-line separator before PROMPT.md instead of letting a
-    # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
-    # Subshell so the cwd change (isolating the AI-title stub into $WORK_BUCKET, same
-    # as L1) is scoped to this call and doesn't leak into the notify/GC steps below.
-    # $? after the subshell is the pipeline's exit (claude's), exactly as before.
-    (
-      cd "$WORK_DIR" 2>/dev/null || true
-      {
-        printf "Findings directory to aggregate (literal absolute path): %s\n" "$FINDINGS_DIR"
-        printf "Write the report to this literal absolute path: %s\n\n" "$REPORT_PATH"
-        cat "$AUTODREAM_DIR/PROMPT.md"
-      } | "$CLAUDE_BIN" \
-        --print \
-        --permission-mode bypassPermissions \
-        --model "$AUTODREAM_L2_MODEL" \
-        --no-session-persistence \
-        --tools Glob Read Write Edit \
-        --disable-slash-commands \
-        --strict-mcp-config \
-        --settings '{"disableAllHooks":true}' \
-        --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
-    )
-
-    L2_RC=$?
+    if [ "${AUTODREAM_REPORT_ONLY:-0}" = "1" ]; then
+      # Stage the captured stdout, then publish it under the same name a model-written
+      # report would have. An empty capture is removed so the "wrote no report" branch
+      # below reports it exactly as it would a silent model.
+      L2_CAPTURE="$REPORT_PATH.capture-$$"
+      ( l2_invoke ) > "$L2_CAPTURE" 2>>"$RUN_LOG"
+      L2_RC=$?
+      if [ -s "$L2_CAPTURE" ]; then
+        mv "$L2_CAPTURE" "$REPORT_PATH" \
+          || log "WARNING: could not publish the captured report to $REPORT_PATH"
+      fi
+      rm -f "$L2_CAPTURE"
+    else
+      ( l2_invoke )
+      L2_RC=$?
+    fi
     report_complete && break
     if [ -s "$REPORT_PATH" ]; then
       log "L2 attempt $attempt left a report with no open-questions marker — treating it as truncated and retrying (exit $L2_RC)"
@@ -1287,7 +1328,13 @@ PY
     #      or AUTODREAM_GC=0). Iterates the touched-projects sidecar
     #      Layer 2 wrote — re-uses the cwd recorded in each project's
     #      session JSONLs to give claude-memory the right project root.
-    if [ "${AUTODREAM_GC:-1}" != "0" ] && command -v claude-memory >/dev/null 2>&1; then
+    # Report-only runs never reach it: with no Write/Edit there are no new pins to
+    # consolidate around, and a touched-projects.txt from an earlier non-report-only run
+    # of this same date must not pull this run into mutating memory. This is the second
+    # line of defence, not the boundary — the boundary is the tool surface above.
+    if [ "${AUTODREAM_REPORT_ONLY:-0}" = "1" ]; then
+      log "report-only: skipping project memory GC and the touched-projects sidecar"
+    elif [ "${AUTODREAM_GC:-1}" != "0" ] && command -v claude-memory >/dev/null 2>&1; then
       TOUCHED="$FINDINGS_DIR/touched-projects.txt"
       if [ -s "$TOUCHED" ]; then
         log "claude-memory detected; running GC for $(wc -l < "$TOUCHED" | tr -d ' ') touched project(s)..."

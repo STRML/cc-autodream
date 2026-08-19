@@ -112,6 +112,74 @@ run_dream_broken_pipe(){ # $1=root
 }
 fdir(){ printf '%s' "$1/autodream/findings/$DATE"; }   # findings dir for a root
 
+# ---- Report-only mode: the memory boundary is the tool surface ----------------------
+# The aggregator runs with --permission-mode bypassPermissions and normally holds
+# Write/Edit, so it edits project MEMORY.md itself and 📌 pins are permanent. A pilot
+# over an unvalidated source (OMP) must not be able to reach them. Withholding the path
+# does not stop it (it can Glob), and skipping GC does not either (the edit already
+# happened) — so report-only mode removes the mutating tools and takes the report from
+# stdout, leaving run.sh the only writer.
+report_only_run(){ # $1=root
+  AUTODREAM_REPORT_ONLY=1 run_dream "$1"
+}
+
+test_report_only_tool_surface(){
+  echo "# report-only: the aggregator is invoked with no mutating tools, report via stdout"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export MOCK_CAPTURE_DIR="$root/cap"; report_only_run "$root"; unset MOCK_CAPTURE_DIR
+  local args="$root/cap/l2-args.txt" stdin="$root/cap/l2-stdin.txt"
+  assert_grep   "$args" '^Glob$'  "Glob is granted (findings still have to be read)"
+  assert_grep   "$args" '^Read$'  "Read is granted"
+  assert_nogrep "$args" '^Write$' "Write is NOT granted"
+  assert_nogrep "$args" '^Edit$'  "Edit is NOT granted"
+  assert_grep "$stdin" 'Print the report to stdout' "prompt asks for the report on stdout"
+  # Line 2 is the framing run.sh controls. PROMPT.md's body legitimately contains the
+  # phrase as an example and in its steps, so only the framing line can be asserted on.
+  local line2; line2=$(sed -n '2p' "$stdin")
+  case "$line2" in
+    *"Write the report to this literal absolute path"*)
+      no "framing line 2 must not offer a report path (got [$line2])" ;;
+    *) ok "framing line 2 offers no report path" ;;
+  esac
+  # PROMPT.md still tells the aggregator to write the report and update MEMORY.md
+  # (steps 5-6, "Memory writes"). Report-only must say those are superseded, or a real
+  # model burns attempts trying a Write it does not have.
+  assert_grep "$root/cap/l2-args.txt" 'SUPERSEDED' "the system prompt supersedes PROMPT.md's write/memory steps"
+  # run.sh must still land a complete report, since it is now the writer.
+  assert_nonempty "$root/dreams/$DATE.md" "run.sh writes the captured report"
+  assert_grep "$root/dreams/$DATE.md" 'autodream:open-questions=' "captured report keeps the marker"
+  assert_grep "$root/run.out" 'report-only' "the run says it was report-only"
+  rm -rf "$root"
+}
+
+test_report_only_leaves_memory_untouched(){
+  echo "# report-only: no MEMORY.md write, no touched-projects, no GC"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local mem="$root/projects/proj-a/memory/MEMORY.md"
+  mkdir -p "$(dirname "$mem")"; printf 'existing pin\n' > "$mem"
+  local before; before=$(shasum -a 1 < "$mem")
+
+  # Control: a normal run with an aggregator that DOES write memory must change the file.
+  # Without this the test could pass because nothing ever writes, proving nothing.
+  export MOCK_MODE=l2_memory_writer MOCK_MEMORY_FILE="$mem"
+  run_dream "$root"
+  local after_normal; after_normal=$(shasum -a 1 < "$mem")
+  [ "$before" != "$after_normal" ] && ok "control: a normal run's aggregator does write MEMORY.md" \
+                                   || no "control: normal run should have written MEMORY.md"
+  assert_file "$(fdir "$root")/touched-projects.txt" "control: touched-projects.txt written"
+
+  # Report-only: same aggregator, no Write granted, so memory is unreachable.
+  printf 'existing pin\n' > "$mem"
+  rm -f "$(fdir "$root")/touched-projects.txt"
+  AUTODREAM_FORCE=1 report_only_run "$root"
+  unset MOCK_MODE MOCK_MEMORY_FILE
+  local after_ro; after_ro=$(shasum -a 1 < "$mem")
+  assert_eq "$after_ro" "$before" "report-only leaves MEMORY.md byte-identical"
+  assert_no_file "$(fdir "$root")/touched-projects.txt" "report-only writes no touched-projects.txt"
+  assert_grep "$root/run.out" 'skipping .*memory' "the run says memory sinks were skipped"
+  rm -rf "$root"
+}
+
 # ---------------------------------------------------------------------------
 
 # ---- Operator notes: notes.md + vault inbox merged into operator-notes.md ----------
@@ -1831,6 +1899,8 @@ test_linearize_omp
 test_slim_omp_payloads
 test_linearize_then_slim
 test_session_stats_omp
+test_report_only_tool_surface
+test_report_only_leaves_memory_untouched
 test_facet_fields_plumbed
 test_noise_gate_trivial
 test_noise_gate_short_duration
