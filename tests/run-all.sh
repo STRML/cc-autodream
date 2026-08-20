@@ -94,6 +94,9 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
   PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
   bash "$RUN" "$DATE" > "$1/run.out" 2>&1
+  # Exposed because "did this exit cleanly?" is itself a contract for some modes: an
+  # intentional early stop must not look like a failed run to launchd.
+  RUN_RC=$?
   # An unattended run logs to its file rather than through a pipe, so that stdout carries
   # only a pointer now. Fold the real log in, so every assertion below still reads what a
   # nightly run actually recorded rather than what a tty run happens to echo.
@@ -452,6 +455,78 @@ test_complete_report_retires_partials(){
   rm -rf "$root"
 }
 
+# ---- L1-only mode ----
+# For a host running two autodream installs (one per harness), the useful division is:
+# each install triages its own sessions, and ONE aggregation runs over the union. Without
+# a way to stop after L1 that costs an extra L2 per install, every night, for reports
+# nobody reads. AUTODREAM_L2_ATTEMPTS=0 almost does it (`seq 1 0` is empty) but then takes
+# the no-report path: warning logged, non-zero exit, and the date looks abandoned.
+test_l1_only_stops_after_findings(){
+  echo "# L1-only: findings land, no report, exit 0"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  AUTODREAM_L1_ONLY=1 run_dream "$root"
+  assert_eq "$RUN_RC" "0" "an intentional stop is not a failure"
+  assert_file    "$(fdir "$root")/$h.json"      "the findings JSON is written"
+  assert_file    "$(fdir "$root")/run-stats.txt" "the self-audit is written"
+  assert_no_file "$root/dreams/$DATE.md"         "no report is produced"
+  assert_grep    "$root/run.out" 'L1-only' "the run says why it stopped"
+  rm -rf "$root"
+}
+
+test_l1_only_consumes_nothing(){
+  echo "# L1-only: no inbox file, no memory writes, nothing archived"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  # A note in the vault inbox is the sharpest probe: the consume gates live after L2, so
+  # returning early must leave it for the run that actually assembles a report.
+  local vault="$root/vault"; mkdir -p "$vault/inbox"
+  printf 'a note for the aggregator\n' > "$vault/inbox/note.md"
+  local mem="$root/projects/proj-a/memory/MEMORY.md"
+  mkdir -p "$(dirname "$mem")"; printf 'existing pin\n' > "$mem"
+  local before; before=$(shasum -a 1 < "$mem")
+  AUTODREAM_VAULT_DIR="$vault" MOCK_MODE=l2_memory_writer MOCK_MEMORY_FILE="$mem" \
+    AUTODREAM_L1_ONLY=1 run_dream "$root"
+  assert_file    "$vault/inbox/note.md" "the vault note stays in the inbox"
+  assert_eq      "$(shasum -a 1 < "$mem")" "$before" "project memory is untouched"
+  assert_no_file "$(fdir "$root")/touched-projects.txt" "no touched-projects sidecar"
+  assert_eq      "$(ls "$root/inbox" 2>/dev/null | wc -l | tr -d ' ')" "0" "no open-questions inbox file"
+  rm -rf "$root"
+}
+
+test_l1_only_date_is_not_reported_abandoned(){
+  echo "# L1-only: an intentionally unassembled date is not flagged as a failure"
+  local root; root=$(setup_env); mk_session "$root" s1
+  # A prior date left by an L1-only run: findings, no report, and the marker that says
+  # the omission was deliberate. Without the marker check this warning would fire every
+  # night on a host that splits triage from aggregation.
+  local prior="$root/autodream/findings/2020-01-01"
+  mkdir -p "$prior"
+  printf '{"session_path":"x","project":"proj-a","findings":[]}\n' > "$prior/aaaaaaaaaaaa.json"
+  : > "$prior/l1-only"
+  run_dream "$root"
+  assert_grep   "$(fdir "$root")/run-stats.txt" 'unassembled_dates: *$' "an L1-only date is not listed"
+  assert_nogrep "$root/run.out" 'findings but no complete report' "and no warning is logged"
+  # Control: the same findings dir WITHOUT the marker is still reported, so the marker is
+  # doing the work rather than the scan having been broken.
+  rm -f "$prior/l1-only" "$root/dreams/$DATE.md"
+  run_dream "$root"
+  assert_grep "$(fdir "$root")/run-stats.txt" 'unassembled_dates: 2020-01-01' "without the marker it is listed"
+  rm -rf "$root"
+}
+
+test_l1_only_then_assemble(){
+  echo "# L1-only: a later normal run assembles the same date without re-triaging"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  AUTODREAM_L1_ONLY=1 run_dream "$root"
+  local h; h=$(hash_of "$root/projects/proj-a/sess1.jsonl")
+  export MOCK_CALL_LOG="$root/calls.txt"; run_dream "$root"; unset MOCK_CALL_LOG
+  assert_file "$root/dreams/$DATE.md" "the report lands on the assembling run"
+  # MOCK_CALL_LOG records one line per L1 invocation. L1 is idempotent, so the assembling
+  # run must spend no worker on an already-triaged session — that is the entire economic
+  # argument for splitting the phases.
+  assert_nogrep "$root/calls.txt" "$h" "no L1 worker ran for the already-triaged session"
+  rm -rf "$root"
+}
 test_no_sessions_stub_carries_marker(){
   echo "# the no-sessions stub is a complete report and must carry the marker"
   local root; root=$(setup_env)     # no sessions at all
@@ -1689,6 +1764,10 @@ test_complete_report_retires_partials
 test_dead_stdout_does_not_kill_the_run
 test_unassembled_dates_are_surfaced
 test_unassembled_ignores_a_finished_date
+test_l1_only_stops_after_findings
+test_l1_only_consumes_nothing
+test_l1_only_date_is_not_reported_abandoned
+test_l1_only_then_assemble
 test_no_sessions_stub_carries_marker
 test_old_date_reprocess_does_not_consume
 test_config_unbound_var_does_not_kill_run

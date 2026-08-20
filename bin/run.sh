@@ -34,6 +34,8 @@
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
 #   AUTODREAM_L2_MODEL   override the L2 aggregator model            default: fable-5 until 2026-06-20, claude-opus-4-7 from 2026-06-21
+#   AUTODREAM_L1_ONLY    set 1 to stop after L1: findings + run-stats are written, L2 is
+#                        skipped, nothing is consumed, exit 0                default: 0
 #   AUTODREAM_MIN_USER_TURNS  noise-gate floor on user_message_count  default: 2
 #   AUTODREAM_MIN_MINUTES     noise-gate floor on duration_minutes    default: 1
 #   AUTODREAM_STATS_BIN       override the resolved session-stats.sh path, authoritative
@@ -679,6 +681,10 @@ unassembled_dates() {
     # Findings JSONs only. A dir holding nothing but *.stats.json sidecars was never
     # triaged, so it has nothing to assemble and is not a failure.
     found=$(find "$d" -maxdepth 1 -type f -name '*.json' ! -name '*.stats.json' 2>/dev/null | head -1)
+    # An L1-only run leaves findings and no report on purpose, and says so with a marker.
+    # Without this the warning fires every night on a host that splits triage from
+    # aggregation, which is exactly the way to teach someone to ignore it.
+    [ -f "$d/l1-only" ] && continue
     [ -n "$found" ] || continue
     report="$DREAMS_DIR/$date_label.md"
     if [ -s "$report" ] && grep -q 'autodream:open-questions=' "$report" 2>/dev/null; then
@@ -1070,6 +1076,33 @@ PY
     [ -n "$XQID_SOURCE" ] || XQID_SOURCE=not_attempted
   fi
   printf 'x_queryid_source: %s\n' "$XQID_SOURCE" >> "$FINDINGS_DIR/run-stats.txt"
+
+  # ---- L1-only: stop here, deliberately, with everything L2 would need on disk ----
+  # For a host running one install per harness, the sane division is "each install
+  # triages its own sessions, ONE aggregation runs over the union" — otherwise every
+  # install pays for an L2 whose report nobody reads. This is the seam for that.
+  #
+  # Placed after the L2 *inputs* are assembled (findings, run-stats, changelog window,
+  # operator notes, bookmarks) and before anything that acts on a report: the findings dir
+  # is left as a complete aggregation package for whoever assembles it. And placed BEFORE
+  # the stale-report move below, which would otherwise rename a perfectly good report out
+  # of the way for a replacement this run is never going to write.
+  #
+  # Everything downstream that consumes input — the vault-notes archive, the x-bookmark
+  # mark-read, project-memory GC, the open-questions inbox — is gated on a complete report
+  # and is skipped by construction. The marker file says the omission was intentional, so
+  # the unassembled-dates scan does not report it as an abandoned date every night.
+  #
+  # AUTODREAM_L2_ATTEMPTS=0 is not a substitute: `seq 1 0` is empty, so L2 never runs, but
+  # the run then takes the no-report path — a WARNING, a non-zero exit, and a date that
+  # looks abandoned. Fine for a one-off experiment, wrong for a nightly.
+  if [ "${AUTODREAM_L1_ONLY:-0}" = "1" ]; then
+    : > "$FINDINGS_DIR/l1-only"
+    log "L1-only: findings ready at $FINDINGS_DIR; skipping L2, consuming nothing"
+    log "         assemble with: AUTODREAM_FORCE=1 $AUTODREAM_DIR/run.sh $TARGET_DATE"
+    log "===== autodream end: $(date) ====="
+    return 0
+  fi
 
   # ---- Layer 2: opus aggregate, retried until a report lands ----
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
