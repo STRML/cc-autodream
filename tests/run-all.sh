@@ -25,7 +25,136 @@ assert_no_file(){  [ ! -e "$1" ] && ok "$2" || no "$2 (unexpected: $1)"; }
 assert_nonempty(){ [ -s "$1" ] && ok "$2" || no "$2 (empty/missing: $1)"; }
 assert_grep(){     grep -q "$2" "$1" 2>/dev/null && ok "$3" || no "$3 (no /$2/ in $1)"; }
 assert_nogrep(){   grep -q "$2" "$1" 2>/dev/null && no "$3 (/$2/ unexpectedly in $1)" || ok "$3"; }
+# Same as assert_grep but against captured stdout rather than a file, for helpers whose
+# contract is what they print (citation-check writes KEY: VALUE lines to stdout so the
+# caller decides where they land).
+assert_grep_str(){ printf '%s\n' "$1" | grep -q "$2" 2>/dev/null && ok "$3" || no "$3 (no /$2/ in output)"; }
 assert_eq(){       [ "$1" = "$2" ] && ok "$3" || no "$3 (got [$1] want [$2])"; }
+
+# ---- Report citation integrity ----
+# L2 cites sessions by their 12-hex findings hash. On 2026-08-18 it attached a real,
+# correctly-analysed Bitwarden finding (which lives in 6f38f3cbed43) to 47eba605cf1e —
+# a DIFFERENT session in the same project, and one that was noise-gated, so its findings
+# record is an empty stub the aggregator never had content for. A gated stub still
+# carries `project`, which is what makes the wrong hash look plausible. 10 of 11
+# citations that night were sound, so this is a per-citation defect, not a broken
+# report: the counters make it measurable instead of a thing a human happens to notice.
+mk_report(){ # $1=path $2..=cited hashes
+  local r="$1"; shift
+  mkdir -p "$(dirname "$r")"
+  { printf '# Autodream — fixture\n\n## Top patterns\n'
+    for h in "$@"; do printf -- '- `%s` (example) did a thing\n' "$h"; done
+    printf '\n<!-- autodream:open-questions=0 -->\n'
+  } > "$r"
+}
+mk_findings(){ # $1=dir $2=hash $3=gated|real
+  mkdir -p "$1"
+  if [ "$3" = "gated" ]; then
+    printf '{"session_path":"/x/%s.jsonl","skipped":"below_noise_gate","findings":[],"project":"-p"}\n' "$2" > "$1/$2.json"
+  else
+    printf '{"session_path":"/x/%s.jsonl","project":"-p","findings":[{"severity":"high","category":"x","summary":"s"}]}\n' "$2" > "$1/$2.json"
+  fi
+}
+
+test_citation_check_resolves(){
+  echo "# citations: every cited hash is resolved against the findings dir"
+  local CC="$REPO/bin/citation-check.sh"
+  [ -x "$CC" ] || { no "citation-check executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mk_findings "$root/f" aaaaaaaaaaaa real
+  mk_findings "$root/f" bbbbbbbbbbbb real
+  mk_report "$root/r.md" aaaaaaaaaaaa bbbbbbbbbbbb
+  local out; out=$("$CC" "$root/r.md" "$root/f") || no "citation-check exited non-zero on a clean report"
+  assert_grep_str "$out" 'citations_total: 2'      "counts every cited hash"
+  assert_grep_str "$out" 'citations_unresolved: 0' "no unresolved citations"
+  assert_grep_str "$out" 'citations_to_gated: 0'   "no citations to gated stubs"
+  rm -rf "$root"
+}
+
+test_citation_check_flags_gated_and_missing(){
+  echo "# citations: a gated stub and an unknown hash are both counted, and named"
+  local CC="$REPO/bin/citation-check.sh"
+  [ -x "$CC" ] || { no "citation-check executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mk_findings "$root/f" aaaaaaaaaaaa real
+  mk_findings "$root/f" 47eba605cf1e gated
+  # cccccccccccc has no findings record at all — a hash the aggregator invented.
+  mk_report "$root/r.md" aaaaaaaaaaaa 47eba605cf1e cccccccccccc
+  local out; out=$("$CC" "$root/r.md" "$root/f") || no "citation-check exited non-zero"
+  assert_grep_str "$out" 'citations_total: 3'      "counts every cited hash"
+  assert_grep_str "$out" 'citations_unresolved: 1' "counts the invented hash"
+  assert_grep_str "$out" 'citations_to_gated: 1'   "counts the gated stub"
+  # Naming them is the point: a count alone cannot be chased down next morning.
+  assert_grep_str "$out" '47eba605cf1e' "names the gated citation"
+  assert_grep_str "$out" 'cccccccccccc' "names the unresolved citation"
+  rm -rf "$root"
+}
+
+test_citation_counters_in_run_stats(){
+  echo "# citations: the counters land in run-stats.txt, after L2 has written the report"
+  local root; root=$(setup_env)
+  mk_session "$root" s1
+  run_dream "$root"
+  local rs; rs="$(fdir "$root")/run-stats.txt"
+  assert_grep "$rs" 'citations_total:'      "run-stats carries the citation total"
+  assert_grep "$rs" 'citations_unresolved:' "run-stats carries the unresolved count"
+  assert_grep "$rs" 'citations_to_gated:'   "run-stats carries the gated count"
+  rm -rf "$root"
+}
+
+test_citation_check_counts_bare_hashes(){
+  echo "# citations: bare (un-backticked) hashes are citations too"
+  local CC="$REPO/bin/citation-check.sh"
+  [ -x "$CC" ] || { no "citation-check executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mk_findings "$root/f" aaaaaaaaaaaa real
+  mk_findings "$root/f" 47eba605cf1e gated
+  # The real 2026-08-18 pre-fix report wrote them exactly like this — a parenthesised
+  # comma list, no backticks. Anchoring only on backticks scored that report
+  # citations_total: 0, which is a false all-clear: the one output this check exists to
+  # prevent. A stray hex token is allowed to surface as unresolved; a missed citation is not.
+  mkdir -p "$root"
+  { printf '# Autodream — fixture\n\n'
+    printf -- '- Four findings (aaaaaaaaaaaa, 47eba605cf1e, dddddddddddd) flag the same thing\n'
+    printf '\n<!-- autodream:open-questions=0 -->\n'
+  } > "$root/bare.md"
+  local out; out=$("$CC" "$root/bare.md" "$root/f") || no "citation-check exited non-zero"
+  assert_grep_str "$out" 'citations_total: 3'    "counts bare hashes"
+  assert_grep_str "$out" 'citations_to_gated: 1' "classifies a bare gated citation"
+  assert_grep_str "$out" 'citations_unresolved: 1' "classifies a bare unknown citation"
+
+  # A 40-char commit SHA contains 12-hex runs but is not a citation: the neighbouring
+  # characters are hex, so boundary matching must not split it.
+  { printf '# Autodream — fixture\n\nSee commit 3f6b1a92c4de77081b2e5c9a0d4f8e6b71c25a93 for context\n'
+    printf '\n<!-- autodream:open-questions=0 -->\n'
+  } > "$root/sha.md"
+  out=$("$CC" "$root/sha.md" "$root/f") || no "citation-check exited non-zero"
+  assert_grep_str "$out" 'citations_total: 0' "does not mistake a long SHA for citations"
+  rm -rf "$root"
+}
+test_citation_check_resolves_session_id_tail(){
+  echo "# citations: a hash that is an omp session UUID tail resolves, not 'unresolved'"
+  local CC="$REPO/bin/citation-check.sh"
+  [ -x "$CC" ] || { no "citation-check executable"; return 0; }
+  command -v jq >/dev/null 2>&1 || { echo "  skip - jq not available"; return 0; }
+  local root; root=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$root/f"
+  # An OMP session filename ends in a UUID whose tail is 12 hex characters, so L2 cites
+  # omp sessions by that tail instead of the findings hash — observed on 2026-08-18,
+  # where `87b5b1392572` was the tail of .../2026-08-18T15-43-51-432Z_01a0158b-1488-7000-bf4a-87b5b1392572.jsonl.
+  # That is a real citation to a real triaged session; reporting it as unresolved would
+  # train the reader to ignore the counter.
+  printf '{"session_path":"/s/2026-08-18T15-43-51-432Z_01a0158b-1488-7000-bf4a-87b5b1392572.jsonl","project":"-p","findings":[]}\n' > "$root/f/aaaaaaaaaaaa.json"
+  mk_report "$root/r.md" 87b5b1392572
+  local out; out=$("$CC" "$root/r.md" "$root/f") || no "citation-check exited non-zero"
+  assert_grep_str "$out" 'citations_total: 1'              "counts the citation"
+  assert_grep_str "$out" 'citations_unresolved: 0'         "a session-id tail is not unresolved"
+  assert_grep_str "$out" 'citations_resolved_by_path: 1'   "and it is reported as resolved by session path"
+  rm -rf "$root"
+}
 
 # Fresh sandbox: projects/ (session inputs) + autodream/ (prompts + state) + dreams/.
 setup_env(){
@@ -1632,6 +1761,11 @@ test_self_audit_stats
 test_self_audit_stats_failure_denominator
 test_self_audit_stats_precached_disambiguation
 test_normalize_project
+test_citation_check_resolves
+test_citation_check_flags_gated_and_missing
+test_citation_counters_in_run_stats
+test_citation_check_counts_bare_hashes
+test_citation_check_resolves_session_id_tail
 test_slim_transcript
 test_facet_fields_plumbed
 test_noise_gate_trivial
