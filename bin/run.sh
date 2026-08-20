@@ -34,6 +34,10 @@
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
 #   AUTODREAM_L2_MODEL   override the L2 aggregator model            default: fable-5 until 2026-06-20, claude-opus-4-7 from 2026-06-21
+#   AUTODREAM_MARKER_EPOCH    first date whose report is REQUIRED to carry the
+#                             open-questions marker; earlier unmarked reports are treated
+#                             as complete (legacy) rather than abandoned
+#                                                                     default: 2026-08-19
 #   AUTODREAM_MIN_USER_TURNS  noise-gate floor on user_message_count  default: 2
 #   AUTODREAM_MIN_MINUTES     noise-gate floor on duration_minutes    default: 1
 #   AUTODREAM_STATS_BIN       override the resolved session-stats.sh path, authoritative
@@ -662,16 +666,30 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
 }
 
 # Dates in the trailing window whose findings were produced but never assembled into a
-# complete report (#36). Echoes a comma-separated list, empty when there are none.
+# complete report (#36). Echoes "unassembled|legacy", both comma-separated, either empty.
 #
 # The completeness test is the open-questions marker, not `-s`, for the same reason every
 # other consumer uses it: a report killed mid-write is not a report. TARGET_DATE is skipped
 # because this run is about to assemble it, and a stub findings dir left by an earlier
 # attempt at the same date would otherwise report itself as a failure.
+#
+# The marker became mandatory partway through this tool's life, so every report written
+# before that is non-empty, complete, and unmarked. Judged by the marker alone they all
+# look abandoned: on this host the check named six consecutive good reports every single
+# night, which is exactly how a real warning gets trained into background noise. Dates
+# before AUTODREAM_MARKER_EPOCH therefore accept a non-empty report, and are reported
+# under their own key so the exemption is visible rather than silent.
+#
+# Why a date and not a heuristic: "non-empty but unmarked" is genuinely ambiguous - it is
+# either a legacy report or a truncated capture - and the only fact that separates them is
+# when the contract began. The exposure is bounded by design: the scan looks back
+# AUTODREAM_UNASSEMBLED_WINDOW days, so an epoch that is wrong for a given install
+# self-corrects within a week of upgrading. Set it when backfilling older dates.
 unassembled_dates() {
   local window="${AUTODREAM_UNASSEMBLED_WINDOW:-7}" root="$AUTODREAM_DIR/findings"
-  local d date_label report found out=""
-  [ -d "$root" ] || return 0
+  local epoch="${AUTODREAM_MARKER_EPOCH:-2026-08-19}"
+  local d date_label report found out="" legacy=""
+  [ -d "$root" ] || { printf '|'; return 0; }
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     date_label=$(basename "$d")
@@ -681,13 +699,20 @@ unassembled_dates() {
     found=$(find "$d" -maxdepth 1 -type f -name '*.json' ! -name '*.stats.json' 2>/dev/null | head -1)
     [ -n "$found" ] || continue
     report="$DREAMS_DIR/$date_label.md"
-    if [ -s "$report" ] && grep -q 'autodream:open-questions=' "$report" 2>/dev/null; then
-      continue
+    if [ -s "$report" ]; then
+      grep -q 'autodream:open-questions=' "$report" 2>/dev/null && continue
+      # Non-empty and unmarked. Before the epoch that is a legacy report; on or after it,
+      # it is a truncated capture and stays on the abandoned list. ISO dates compare
+      # lexicographically, so this is chronological.
+      if [[ "$date_label" < "$epoch" ]]; then
+        legacy="${legacy:+$legacy, }$date_label"
+        continue
+      fi
     fi
     out="${out:+$out, }$date_label"
   done < <(find "$root" -maxdepth 1 -type d -name '2[0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]' 2>/dev/null \
     | sort | tail -n "$window")
-  printf '%s' "$out"
+  printf '%s|%s' "$out" "$legacy"
 }
 
 run() {
@@ -720,10 +745,18 @@ run() {
   # Recovery is cheap whenever the findings survive (`autodream-now.sh <date>` skips
   # straight to L2), so the gap was never the data. It was that nobody was told. This says
   # so in the log and in run-stats.txt, which puts it in the next morning's report.
-  UNASSEMBLED=$(unassembled_dates)
+  _UNASSEMBLED_RAW=$(unassembled_dates)
+  UNASSEMBLED="${_UNASSEMBLED_RAW%%|*}"
+  LEGACY_MARKER="${_UNASSEMBLED_RAW##*|}"
   if [ -n "$UNASSEMBLED" ]; then
     log "WARNING: these dates have findings but no complete report: $UNASSEMBLED"
     log "         rebuild one cheaply with: $AUTODREAM_DIR/autodream-now.sh <date>"
+  fi
+  # Not a warning: these reports are fine, they just predate the marker. Logged so the
+  # exemption is auditable - if a date shows up here that should NOT be legacy, the epoch
+  # is wrong and that is worth seeing rather than inferring from a missing warning.
+  if [ -n "$LEGACY_MARKER" ]; then
+    log "note: unmarked reports predating AUTODREAM_MARKER_EPOCH (treated as complete): $LEGACY_MARKER"
   fi
 
   # ---- Idempotency guard: a finished report means we're done ----
@@ -1030,6 +1063,10 @@ PY
     # window, which is the reading that matters — this is the key that gets a killed run
     # noticed the next morning instead of during an unrelated investigation two days on.
     printf 'unassembled_dates: %s\n' "${UNASSEMBLED:-}"
+    # Always emitted, even empty: a reader should never have to tell "no legacy reports"
+    # apart from "this runner predates the key", which is the same ambiguity the epoch
+    # exists to resolve.
+    printf 'legacy_marker_reports: %s\n' "${LEGACY_MARKER:-}"
   } > "$FINDINGS_DIR/run-stats.txt"
 
   # ---- Upstream changelog window (writes changelog-window.md for L2 to read) ----

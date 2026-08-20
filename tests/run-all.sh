@@ -413,11 +413,44 @@ test_unassembled_ignores_a_finished_date(){
   printf '# report\n\nautodream:open-questions=0\n' > "$root/dreams/2020-01-01.md"
   run_dream "$root"
   assert_grep "$(fdir "$root")/run-stats.txt" "unassembled_dates: *$" "the finished date is not listed"
-  # A truncated report is not a finished one, and must come back onto the list.
+  # A truncated report is not a finished one, and must come back onto the list. The epoch
+  # is pinned to this fixture's date so the marker is REQUIRED here: that is the contract
+  # under test, and leaving it at the default would exempt every 2020 fixture date.
   printf '# report with no marker\n' > "$root/dreams/2020-01-01.md"
   rm -f "$root/dreams/$DATE.md"
-  run_dream "$root"
+  AUTODREAM_MARKER_EPOCH=2020-01-01 run_dream "$root"
   assert_grep "$(fdir "$root")/run-stats.txt" "unassembled_dates: 2020-01-01" "but a marker-less one is"
+  rm -rf "$root"
+}
+
+test_pre_marker_report_is_not_abandoned(){
+  echo "# a report written before the marker contract is complete, not abandoned"
+  local root; root=$(setup_env); mk_session "$root" s1
+  local prior="$root/autodream/findings/2020-01-01"
+  mkdir -p "$prior" "$root/dreams"
+  printf '{"findings":[]}\n' > "$prior/abc123def456.json"
+  # Real report, real content, no marker - exactly the six reports sitting in
+  # ~/.claude/dreams on this host, which the check called abandoned every single night.
+  printf '# Autodream - 2020-01-01\n\nreal content\n\n## Open questions\nNone.\n' > "$root/dreams/2020-01-01.md"
+  AUTODREAM_MARKER_EPOCH=2020-06-01 run_dream "$root"
+  assert_grep "$(fdir "$root")/run-stats.txt" "unassembled_dates: *$" "a pre-epoch report is not called abandoned"
+  assert_nogrep "$root/run.out" "findings but no complete report" "and no warning is logged for it"
+  assert_grep "$(fdir "$root")/run-stats.txt" "legacy_marker_reports: 2020-01-01" \
+    "it is counted separately, so the exemption is visible rather than silent"
+  rm -rf "$root"
+}
+
+test_missing_report_still_abandoned_before_epoch(){
+  echo "# the exemption is for unmarked reports only, never for a missing one"
+  local root; root=$(setup_env); mk_session "$root" s1
+  local prior="$root/autodream/findings/2020-01-01"
+  mkdir -p "$prior" "$root/dreams"
+  printf '{"findings":[]}\n' > "$prior/abc123def456.json"
+  # No report at all, and an epoch that would exempt an unmarked one. Findings with no
+  # report is the real failure the scan exists to catch; the epoch must not swallow it.
+  AUTODREAM_MARKER_EPOCH=2020-06-01 run_dream "$root"
+  assert_grep "$(fdir "$root")/run-stats.txt" "unassembled_dates: 2020-01-01" \
+    "a date with findings and no report is still abandoned"
   rm -rf "$root"
 }
 
@@ -1689,6 +1722,8 @@ test_complete_report_retires_partials
 test_dead_stdout_does_not_kill_the_run
 test_unassembled_dates_are_surfaced
 test_unassembled_ignores_a_finished_date
+test_pre_marker_report_is_not_abandoned
+test_missing_report_still_abandoned_before_epoch
 test_no_sessions_stub_carries_marker
 test_old_date_reprocess_does_not_consume
 test_config_unbound_var_does_not_kill_run
