@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **bash 3.2 compatible.** No associative arrays, no `mapfile`/`readarray`, no `${var^^}`. macOS ships bash 3.2 and the nightly runs there.
-- **Behavior must not change.** The full suite is green at 279 passed / 0 failed on `origin/main` at `e231314`. Every task ends with that number holding or rising. It must never fall.
+- **Behavior must not change.** The full suite is green at 283 passed / 0 failed on `origin/main` at `e231314`. Every task ends with that number holding or rising. It must never fall.
 - **`shellcheck --severity=warning bin/*.sh adapters/*/*.sh` clean; `--severity=error tests/*.sh` clean.** Matches the repo's CI.
 - **Adapter identity is the directory basename**, matching `[a-z][a-z0-9_-]*`, never a manifest field, and the directory must `realpath` to a path under the adapters root.
 - **The artifact hash formula does not change.** It stays `sha1(bare session path)` truncated to 12 characters. Archived findings dirs and `bin/oversized-gate.sh` recompute it and must keep working.
@@ -122,7 +122,7 @@ Expected: `passed: 7   failed: 0`
 - [ ] **Step 5: Verify the full suite still passes**
 
 Run: `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 bash tests/run-all.sh 2>&1 | tail -3`
-Expected: `passed: 279   failed: 0`
+Expected: `passed: 283   failed: 0`
 
 - [ ] **Step 6: Lint**
 
@@ -258,7 +258,7 @@ Expected: `passed: 7   failed: 0`
 - [ ] **Step 5: Verify the full suite still passes**
 
 Run: `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 bash tests/run-all.sh 2>&1 | tail -3`
-Expected: `passed: 279   failed: 0`
+Expected: `passed: 283   failed: 0`
 
 - [ ] **Step 6: Lint**
 
@@ -445,7 +445,7 @@ Expected: `passed: 12   failed: 0`
 - [ ] **Step 5: Verify the full suite still passes**
 
 Run: `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 bash tests/run-all.sh 2>&1 | tail -3`
-Expected: `passed: 279   failed: 0`
+Expected: `passed: 283   failed: 0`
 
 - [ ] **Step 6: Lint**
 
@@ -653,7 +653,7 @@ Expected: `passed: 9   failed: 0`
 - [ ] **Step 8: Verify the full suite still passes**
 
 Run: `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 bash tests/run-all.sh 2>&1 | tail -3`
-Expected: `passed: 279   failed: 0`
+Expected: `passed: 283   failed: 0`
 
 - [ ] **Step 9: Lint**
 
@@ -766,7 +766,7 @@ In the `run-stats.txt` writer (near `bin/run.sh:986`), add:
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 bash tests/run-all.sh 2>&1 | tail -3`
-Expected: `passed: 282   failed: 0` (279 baseline + 3 new assertions)
+Expected: `passed: 286   failed: 0` (283 baseline + 3 new assertions)
 
 - [ ] **Step 6: Lint**
 
@@ -890,7 +890,7 @@ In the `run-stats.txt` writer, add:
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 bash tests/run-all.sh 2>&1 | tail -3`
-Expected: `passed: 287   failed: 0` (282 + 5 new assertions)
+Expected: `passed: 291   failed: 0` (286 + 5 new assertions)
 
 - [ ] **Step 6: Lint**
 
@@ -1066,7 +1066,7 @@ Expected: `passed: 12   failed: 0`
 - [ ] **Step 7: Verify the fixture is excluded from the real run**
 
 Run: `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 bash tests/run-all.sh 2>&1 | rg 'adapters_enabled|passed:' | tail -3`
-Expected: `adapters_enabled: claude` and `passed: 287   failed: 0`
+Expected: `adapters_enabled: claude` and `passed: 291   failed: 0`
 
 - [ ] **Step 8: Lint**
 
@@ -1157,7 +1157,7 @@ overrides them.
 - [ ] **Step 6: Run test to verify it passes**
 
 Run: `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 bash tests/run-all.sh 2>&1 | tail -3`
-Expected: `passed: 289   failed: 0` (287 + 2 new assertions)
+Expected: `passed: 293   failed: 0` (291 + 2 new assertions)
 
 - [ ] **Step 7: Prove behavior did not change**
 
@@ -1199,5 +1199,5 @@ Three further plans follow, each producing working software on its own:
 ## Self-review notes
 
 - **Spec coverage for this plan's slice:** canonical project identity (Task 1), preflight (Task 2), manifest JSON and identity containment (Task 3), the claude adapter and `facts.md` (Task 4), NUL transport and newline rejection (Task 5), source sidecar plus duplicate and collision detection (Task 6), fixture adapter (Task 7), wiring (Task 8). The spec's L2, pin, GC and rename sections are explicitly deferred to Plans 2–4.
-- **Assertion arithmetic:** 279 baseline, +3 (Task 5), +5 (Task 6), +2 (Task 8) = 289 in `run-all.sh`, plus four standalone suites (`lib-project`, `preflight`, `adapters`, `adapter-claude`, `adapter-contract`) run separately.
+- **Assertion arithmetic:** 283 baseline, +3 (Task 5), +5 (Task 6), +2 (Task 8) = 293 in `run-all.sh`, plus four standalone suites (`lib-project`, `preflight`, `adapters`, `adapter-claude`, `adapter-contract`) run separately.
 - **Known gap carried into Plan 2:** `adapter_run` does not yet pass a per-adapter engine or model; nothing in this plan needs it, because the claude adapter's L1 invocation still goes through the existing `run.sh` path. Plan 2 introduces it when a second engine exists.
