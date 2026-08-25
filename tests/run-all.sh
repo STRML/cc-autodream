@@ -2352,6 +2352,25 @@ test_unwritable_collision_index_fails_closed(){
   rm -rf "$root"
 }
 
+test_broken_shasum_never_collapses_sessions(){
+  echo "# hash: a shasum that fails at runtime must not send every session to one artifact"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # Preflight only checks that shasum EXISTS. This one exists and fails, which
+  # used to yield an empty hash — and an empty hash means every session in the
+  # night targets ".json", the silent overwrite reached from the other direction.
+  printf '#!/bin/bash\nexit 3\n' > "$root/home/.local/bin/shasum"
+  chmod +x "$root/home/.local/bin/shasum"
+  run_dream_collision "$root" || true
+  local d; d=$(fdir "$root")
+  assert_no_file "$d/.json" "no artifact is written under an empty hash"
+  # Whatever else happens, two sessions must never share one findings record.
+  local n; n=$(find "$d" -maxdepth 1 -name '*.json' ! -name '*.stats.json' 2>/dev/null | wc -l | tr -d ' ')
+  [ "${n:-0}" -le 2 ] && ok "no more than one record per session" || no "no more than one record per session (got $n)"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2376,6 +2395,7 @@ test_three_way_collision_counts_paths_not_lines
 test_mixed_collision_run_attributes_correctly
 test_persistent_sidecar_failure_counts_rows_not_attempts
 test_unwritable_collision_index_fails_closed
+test_broken_shasum_never_collapses_sessions
 test_all_excluded_corpus_says_so
 
 echo

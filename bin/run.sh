@@ -407,8 +407,15 @@ enabled_adapters() {
 }
 
 scan_roots() {
-  : > "$SESSIONS_LIST.raw"
-  : > "$SESSIONS_LIST.src"     # internal <source>\t<path> — source FIRST, see the writer
+  # BOTH lists, checked. build_source_sidecar reads .src, so a raw worklist that
+  # holds two colliding paths while .src has lost a row means detection runs over
+  # an incomplete input and both paths reach dispatch — the same fail-open
+  # overwrite, one stage earlier than the collision index.
+  if ! { : > "$SESSIONS_LIST.raw"; } 2>/dev/null \
+     || ! { : > "$SESSIONS_LIST.src"; } 2>/dev/null; then
+    log "FATAL: cannot write the session lists in $FINDINGS_DIR"
+    return 1
+  fi
   REJECTED_PATHS=0
   local src adapters
   adapters=$(enabled_adapters)
@@ -522,11 +529,17 @@ scan_one_adapter() { # $1=adapter name
           continue
           ;;
       esac
-      printf '%s\n' "$sp" >> "$SESSIONS_LIST.raw"
+      # Paired writes, both checked. Losing either half desynchronises the
+      # worklist from its provenance, and the collision detector reads the
+      # provenance half.
       # source FIRST: the adapter name is a validated safe identifier with no tab,
       # so `read -r src sp` lets sp absorb the whole remainder. The reverse order
       # truncated any path holding a tab and silently lost its provenance.
-      printf '%s\t%s\n' "$src" "$sp" >> "$SESSIONS_LIST.src"
+      if ! printf '%s\n' "$sp" >> "$SESSIONS_LIST.raw" 2>/dev/null \
+         || ! printf '%s\t%s\n' "$src" "$sp" >> "$SESSIONS_LIST.src" 2>/dev/null; then
+        log "FATAL: could not record $sp in the session lists"
+        return 1
+      fi
     done < "$nulfile"
     rm -f "$nulfile"
   done < <(adapter_roots "$src")
@@ -567,6 +580,29 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
 # the same reason. Instead the two ways two adapters can land on one artifact are
 # detected: the same path claimed twice (a misconfiguration — keep the first),
 # and two DIFFERENT paths truncating to one hash (no sensible winner — skip both).
+# The artifact key, validated. Nothing may derive a hash any other way.
+#
+# `h=$(printf %s "$p" | shasum -a 1 | cut -c1-12)` has two silent failure modes
+# and both end in the same place. `cut` masks shasum's exit status, so a shasum
+# that exists (preflight is satisfied) but fails at runtime yields an EMPTY
+# hash — and every session in the night then targets the same artifact, which is
+# precisely the silent overwrite the collision machinery exists to prevent,
+# arrived at from the other direction. A short or non-hex result does the same.
+#
+# So the contract is exact: 12 lowercase hex characters, or a nonzero status and
+# no output. Callers decide whether that is survivable; none of them may guess.
+session_hash() { # $1=session path -> 12 hex chars on stdout, or exit 1
+  local out h
+  out=$(printf '%s' "$1" | shasum -a 1 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  h=${out:0:12}
+  case "$h" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+      printf '%s' "$h" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Sort a file unique, in place, atomically, and report failure.
 #
 # `sort -u FILE -o FILE` can leave FILE empty or partial when it fails, and every
@@ -645,10 +681,22 @@ build_source_sidecar() {
       *) log "FATAL: could not check the worklist for $sp (grep exit $prc); refusing to build provenance over an unreadable list"
          return 1 ;;
     esac
-    h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
+    if ! h=$(session_hash "$sp"); then
+      log "FATAL: could not derive an artifact hash for $sp; refusing to run collision detection on unusable keys"
+      return 1
+    fi
     # The stored path is everything after the 12-char hash and its tab, taken by
     # offset rather than by field split, so no delimiter inside the path matters.
-    prev=$(awk -v k="$h" 'substr($0,1,12)==k {print substr($0,14); exit}' "$seen" 2>/dev/null)
+    #
+    # awk's status is checked: a read error returns empty, which is
+    # indistinguishable from "hash unseen". A write-only .hash-to-path passes the
+    # truncate and append guards and still cannot be read, so every path would
+    # look new, .collided would stay empty, and both colliding sessions reach
+    # dispatch.
+    if ! prev=$(awk -v k="$h" 'substr($0,1,12)==k {print substr($0,14); exit}' "$seen" 2>/dev/null); then
+      log "FATAL: could not read the collision index; refusing to detect collisions blind"
+      return 1
+    fi
     if [ -n "$prev" ]; then
       if [ "$prev" = "$sp" ]; then
         DUPLICATE_PATHS=$((DUPLICATE_PATHS + 1))
@@ -687,7 +735,10 @@ build_source_sidecar() {
     fi
     printf '%s\t%s\n' "$h" "$src" >> "$sidecar" 2>/dev/null || :
     counts="$counts$src"$'\n'
-  done < "$SESSIONS_LIST.src"
+  done < "$SESSIONS_LIST.src" || {
+    log "FATAL: could not read the session source list; refusing to detect collisions over an unreadable input"
+    return 1
+  }
   rm -f "$seen"
 
   # Actually remove the colliding sessions from the worklist. Without this the
@@ -733,7 +784,7 @@ build_source_sidecar() {
     # hashes with no findings record.
     while IFS= read -r sp; do
       [ -n "$sp" ] || continue
-      h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
+      h=$(session_hash "$sp") || continue
       # Survivable: a stale row overstates sessions_by_source by one and the
       # helper has already said so. The worklist, which is not survivable, was
       # handled above.
@@ -751,7 +802,8 @@ build_source_sidecar() {
     if stale_hashes=$(
          while IFS= read -r sp; do
            [ -n "$sp" ] || continue
-           printf '%s' "$sp" | shasum -a 1 | cut -c1-12
+           session_hash "$sp" || exit 1
+           printf '\n'
          done < "$drop" | sort -u
        ); then
       SIDECAR_STALE_ROWS=0
@@ -912,7 +964,9 @@ l1_missing_count() { # count sessions in $SESSIONS_LIST that still have no findi
   local m=0 s h
   while IFS= read -r s; do
     [ -n "$s" ] || continue
-    h=$(printf "%s" "$s" | shasum -a 1 | cut -c1-12)
+    # An unvalidated hash here counts the session missing forever and the retry
+    # loop re-dispatches it every round.
+    h=$(session_hash "$s") || { m=$((m + 1)); continue; }
     jq -e .findings "$FINDINGS_DIR/$h.json" >/dev/null 2>&1 || m=$((m + 1))
   done < "$SESSIONS_LIST"
   printf '%s' "$m"
@@ -927,7 +981,7 @@ compute_session_stats() {
   local session hash stats
   while IFS= read -r session; do
     [ -n "$session" ] || continue
-    hash=$(printf "%s" "$session" | shasum -a 1 | cut -c1-12)
+    hash=$(session_hash "$session") || continue
     stats="$FINDINGS_DIR/$hash.stats.json"
     rm -f "$stats"
     if [ -x "$STATS" ] && "$STATS" "$session" "$stats" >/dev/null 2>&1 \
@@ -984,7 +1038,16 @@ compute_overlap_stats() {
 dispatch_l1() { # one parallel pass; idempotent worker → only the still-missing sessions run
   < "$SESSIONS_LIST" xargs -P "$FANOUT" -I {} bash -c '
     session="$1"
-    hash=$(printf "%s" "$session" | shasum -a 1 | cut -c1-12)
+    # Same contract as session_hash in the parent, inlined: this is a separate
+    # bash -c and the function is not in scope. No apostrophes anywhere in this
+    # body — one silently breaks the single-quoted block while bash -n still
+    # passes. An empty hash would send every worker to the same artifact.
+    hashout=$(printf "%s" "$session" | shasum -a 1 2>/dev/null) || exit 0
+    hash=${hashout:0:12}
+    case "$hash" in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+      *) exit 0 ;;
+    esac
     output="$FINDINGS_DIR/$hash.json"
     errlog="$output.err"
 
@@ -1403,7 +1466,7 @@ EOF
   STATS_SIDECARS_UNPARSEABLE=0
   while IFS= read -r session; do
     [ -n "$session" ] || continue
-    hash=$(printf "%s" "$session" | shasum -a 1 | cut -c1-12)
+    hash=$(session_hash "$session") || continue
     statsfile="$FINDINGS_DIR/$hash.stats.json"
     sz=""
     [ -s "$statsfile" ] && sz=$(jq -r '.transcript_bytes | numbers | floor' "$statsfile" 2>/dev/null)
