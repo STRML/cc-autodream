@@ -113,7 +113,7 @@ run_contract(){ # $1=adapter name
     no "[$name] a file was planted inside the directory destination: $(ls -A "$tmp/destdir" | head -1)"
   fi
 
-  # --- slim and stats write through a temp, like normalize ---
+  # --- slim and stats do not write the destination directly ---
   # The design doc requires this of EVERY subcommand that writes a file
   # (docs/design/unify-harness-adapters-2026-08-23.md:131), and the earlier
   # contract asserted it only for `normalize`. The claude adapter then handed
@@ -122,12 +122,10 @@ run_contract(){ # $1=adapter name
   # caller's `-s` check accepts and sends to L1 as a whole session.
   #
   # The interrupt window itself cannot be opened from a unit test. What CAN be
-  # tested is the property that closes it: the write goes to a temp in the
-  # destination directory and renames. A read-only destination directory
-  # separates the two implementations exactly — truncating an existing file in
-  # place needs no directory write, so a direct writer clobbers it, while a
-  # temp-and-rename writer cannot create its temp and must fail with the old
-  # file intact.
+  # tested is a property that closes it, using a read-only destination directory.
+  # Exactly what that does and does not prove is spelled out at the assertions
+  # below, deliberately, because two review seats independently read a stronger
+  # guarantee into this paragraph than the test delivers.
   local rodir
   rodir="$tmp/ro"; mkdir -p "$rodir"
   if [ "$(id -u)" = "0" ]; then
@@ -138,7 +136,25 @@ run_contract(){ # $1=adapter name
       printf 'SENTINEL\n' > "$rodir/$sub.out"
       chmod 500 "$rodir"
       "$A" "$sub" "$S" "$rodir/$sub.out" >/dev/null 2>&1
+      rrc=$?
       chmod 700 "$rodir"
+      # BOTH halves, and what they prove together is narrower than the section
+      # heading suggests. The sentinel rules out a DIRECT writer: truncating an
+      # existing file in place needs no directory write, so a direct writer
+      # clobbers it here while a temp-and-rename writer cannot create its temp.
+      # The status rules out reporting success while writing nothing.
+      #
+      # What neither rules out is an implementation that rejects an unwritable
+      # destination up front without attempting a temp at all. That is fine —
+      # such an implementation satisfies the contract this test exists to defend
+      # (no partial write, no false success), so the distinction has no
+      # behavioural consequence. Saying so here rather than letting the next
+      # reader infer a stronger guarantee from the name.
+      if [ "$rrc" -ne 0 ]; then
+        ok "[$name] $sub failed rather than writing when its temp could not be created"
+      else
+        no "[$name] $sub reported success with an unwritable destination directory"
+      fi
       if [ "$(cat "$rodir/$sub.out" 2>/dev/null)" = "SENTINEL" ]; then
         ok "[$name] $sub could not write its temp, so it left the old output intact"
       else
