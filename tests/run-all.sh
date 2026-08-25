@@ -2031,6 +2031,28 @@ test_failing_enumerator_aborts_the_run(){
   rm -rf "$root"
 }
 
+# ---- A corpus that exists but yields nothing is not an empty night ----------
+# COUNT=0 has three distinct causes and they used to read identically: no files
+# at all, every file an autodream worker transcript, or every file an empty
+# shell. The stub said "No session files were modified" for all three, and the
+# zero-session run-stats omitted the two counters that would have said otherwise.
+test_all_excluded_corpus_says_so(){
+  echo "# zero sessions: an all-excluded corpus reports why, not 'nothing was modified'"
+  local root; root=$(setup_env)
+  # One autodream worker transcript, nothing else. RAW is 1, COUNT is 0.
+  local f="$root/projects/proj-a/worker.jsonl"
+  printf '%s\n' '{"type":"user","message":{"content":"Session transcript to analyze (literal absolute path): /x"}}' > "$f"
+  touch -t "$STAMP" "$f"
+  run_dream "$root"
+  local d; d=$(fdir "$root")
+  assert_file "$d/run-stats.txt" "run-stats is written for a zero-session night"
+  assert_grep "$d/run-stats.txt" 'self_sessions_excluded: 1' "the self-exclusion is counted"
+  assert_grep "$d/run-stats.txt" 'sessions_found_raw: 1' "the raw count shows a file WAS there"
+  assert_nogrep "$root/dreams/$DATE.md" 'No session files were modified' "the stub does not claim an empty night"
+  assert_grep "$root/dreams/$DATE.md" 'autodream-own' "the stub names why nothing was triaged"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2045,6 +2067,7 @@ test_preflight_stops_a_run_missing_a_dependency
 test_install_deploys_the_adapter_runtime
 test_unrepresentable_characters_are_refused
 test_failing_enumerator_aborts_the_run
+test_all_excluded_corpus_says_so
 
 echo
 echo "----------------------------------------"

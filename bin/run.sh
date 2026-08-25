@@ -1046,6 +1046,11 @@ run() {
       printf 'runner_dirty: %s\n' "$RUNNER_DIRTY"
       printf 'sessions_found_raw: %s\n' "$RAW"
       printf 'sessions_triaged: 0\n'
+      # Already computed above and previously omitted here. Without them a night
+      # where every session was a worker transcript or an empty shell looks
+      # identical to a night with no files at all.
+      printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
+      printf 'sessions_skipped_empty: %s\n' "$SKIPPED_EMPTY"
       printf 'sessions_rejected_path: %s\n' "$REJECTED_PATHS"
       printf 'sessions_duplicate_path: %s\n' "$DUPLICATE_PATHS"
       printf 'sessions_hash_collision: %s\n' "$HASH_COLLISIONS"
@@ -1057,7 +1062,12 @@ run() {
 
 No sessions were triaged on this date.
 
-$( [ "$refused" -gt 0 ] && printf 'Sessions were REFUSED rather than absent: %s path(s) unrepresentable, and %s hash-collision event(s) each dropping two or more paths. See run-stats.txt — this is not an empty night.' "$REJECTED_PATHS" "$HASH_COLLISIONS" || printf 'No session files were modified.' )
+$( if [ "$RAW" -eq 0 ] && [ "$refused" -eq 0 ]; then
+     printf 'No session files were modified.'
+   else
+     printf '%s session file(s) were modified but none was triaged: %s autodream-own, %s with no substantive turns, %s with an unrepresentable path, and %s hash-collision event(s) each dropping two or more paths. See run-stats.txt — this is not an empty night.' \
+       "$RAW" "$EXCLUDED" "$SKIPPED_EMPTY" "$REJECTED_PATHS" "$HASH_COLLISIONS"
+   fi )
 
 (Generated $(date -u +%Y-%m-%dT%H:%M:%SZ))
 
