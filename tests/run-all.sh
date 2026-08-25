@@ -2190,6 +2190,86 @@ test_fresh_host_with_no_store_is_not_a_failure(){
   rm -rf "$T"
 }
 
+# ---- A total outage must leave a trace ------------------------------------
+# adapters/claude/adapter.sh losing its exec bit is a mundane accident — a
+# tarball copy, a restrictive umask, core.fileMode=false — and _adapter_ok
+# demands -x. The loader then accepts nothing, scan_roots goes fatal, and run()
+# returns ~600 lines before notify.sh with no findings JSON and no run-stats.txt.
+# A host that reported fine last night reports nothing, every night, and the only
+# record is a log line nobody reads.
+test_no_usable_adapter_leaves_a_trace(){
+  echo "# adapters: a total outage writes a fatal marker the next night can see"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  local ad="$root/adapters"; mkdir -p "$ad/claude"
+  printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
+  cp "$REPO/adapters/claude/adapter.sh" "$ad/claude/adapter.sh"
+  chmod -x "$ad/claude/adapter.sh"          # the whole trigger
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  assert_eq "$rc" "1" "the run still refuses to scan"
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^fatal: ' \
+    "a fatal marker is left behind rather than nothing at all"
+  # And the next night must surface it. Run a LATER date and check it names this one.
+  local later=2020-01-03
+  mk_session_dated "$root" b "$later" 2>/dev/null || true
+  chmod +x "$ad/claude/adapter.sh"
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$later" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$later" > "$root/run2.out" 2>&1
+  cat "$root/autodream/logs/run-$later.log" >> "$root/run2.out" 2>/dev/null || true
+  assert_grep "$root/run2.out" "$DATE" "the next night's run names the date that died"
+  rm -rf "$root"
+}
+
+# ---- The adapter set is resolved once, not once per caller ------------------
+# The first attempt at this was a memoised enabled_adapters that every caller
+# invoked as $(enabled_adapters), so the cache assignment died with the subshell
+# and the loader re-ran on every call — the exact trap adapters.sh's header
+# documents.
+#
+# What this test pins is the user-visible shape: the not-adapter-aware warning
+# appears once. It does NOT discriminate against that subshell bug — checked, by
+# restoring the broken memo and re-running, and it still passed. The bug is a
+# repeated INVOCATION, and the second invocation happens on a path whose warning
+# does not reach the log a second time, so no assertion over log content can see
+# it. Measuring it needs the function instrumented, which a test cannot do to a
+# script it invokes rather than sources; it was measured that way by hand
+# instead — 2 invocations before the fix, 1 after.
+#
+# Left in because the warning multiplying IS worth pinning, and said plainly so
+# the next reader does not mistake this for coverage of the subshell trap.
+test_enabled_adapters_resolves_once(){
+  echo "# adapters: a second installed adapter warns once per run, not once per caller"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  local ad="$root/adapters"
+  mkdir -p "$ad/claude" "$ad/other"
+  printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
+  cp "$REPO/adapters/claude/adapter.sh" "$ad/claude/adapter.sh"
+  chmod +x "$ad/claude/adapter.sh"
+  printf '{"name":"other","engine_bin":"true","writes_memory":false}\n' > "$ad/other/manifest.json"
+  printf '#!/bin/bash\nexit 2\n' > "$ad/other/adapter.sh"; chmod +x "$ad/other/adapter.sh"
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  local n
+  n=$(grep -c "is enabled but per-session dispatch" "$root/run.out" 2>/dev/null || true)
+  n=${n:-0}
+  assert_eq "$n" "1" "the not-adapter-aware warning is emitted exactly once"
+  assert_nonempty "$root/dreams/$DATE.md" "the run still produced a report"
+  rm -rf "$root"
+}
+
 # ---- Upgrade lag: run.sh is a symlink, the libraries are not there yet -------
 # The live install symlinks each script individually into ~/.claude/autodream, so
 # merging a branch changes run.sh the instant it lands while lib-project.sh,
@@ -2467,6 +2547,8 @@ test_install_deploys_the_adapter_runtime
 test_unrepresentable_characters_are_refused
 test_failing_enumerator_aborts_the_run
 test_one_failed_root_does_not_kill_the_night
+test_enabled_adapters_resolves_once
+test_no_usable_adapter_leaves_a_trace
 test_partial_enumeration_keeps_what_it_read
 test_all_roots_unavailable_fails
 test_fresh_host_with_no_store_is_not_a_failure

@@ -117,11 +117,20 @@ Each adapter is a directory with three required files and one optional one.
 
 | Subcommand | Contract | Absorbs |
 | --- | --- | --- |
-| `enumerate <root> <date>` | prints absolute session paths, one per line | `root-probe.sh` 11% |
+| `enumerate <root> <target-date> <next-date>` | prints absolute session paths **NUL-delimited** (`find -print0`), for modification times in `[target-date, next-date)`; the runner reads them with `read -r -d ''` | `root-probe.sh` 11% |
 | `normalize <in> <out>` | writes a triage-ready transcript to `<out>`; nonzero exit means skip this session | new |
 | `project <session>` | prints the session's real working directory, absolute and symlink-resolved | new |
 | `stats <session>` | prints the stats sidecar JSON | `session-stats.sh` 9% |
 | `slim <in> <out>` | writes a size-reduced transcript to `<out>` | `slim-transcript.sh` |
+
+**`enumerate` is NUL-delimited, and the delimiter is load-bearing.** An earlier
+draft of this table said "one per line" and named two arguments, which is neither
+what ships nor what the runner can consume. An adapter written to that row emits
+newline-separated paths; `read -r -d ''` then takes the entire listing as one
+path, the reject filter drops it for containing newlines, and the whole root's
+corpus disappears with `sessions_rejected_path: 1` as the only trace. The
+line-based artifact is `sessions.txt`, which is a different thing from the
+transport — see the note on that split below.
 | `is-self <session>` | exit 0 if this is one of autodream's own worker transcripts | `prune-self-sessions.sh` 19% |
 | `skills-inventory` | prints the active skill list, one per line | `omp-autodream/bin/skills-inventory.sh` |
 | `apply-pin <json>` | writes one pin; `0` wrote, `10` declined (reason on stdout), any other code is a failure | new |

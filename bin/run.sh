@@ -401,19 +401,27 @@ adapter_roots() { # $1=adapter name -> one root per line
 # here would hand its sessions to a Claude parser that reads them as empty and
 # drops them silently. Refusing out loud is the honest version of not supporting
 # it yet.
-# Memoised. Three callers (scan_roots and both run-stats writers) each re-ran the
-# whole loader, which re-emitted the "installed but not enumerating it" warning
-# once per caller for a single installed adapter.
-ENABLED_ADAPTERS_CACHE=""
+# Resolved ONCE into a global, by a function that prints nothing.
+#
+# The first version of this was a memoised `enabled_adapters` that every caller
+# invoked as `$(enabled_adapters)` — so the cache assignment happened inside a
+# command substitution and died with the subshell, leaving ENABLED_ADAPTERS_RESOLVED
+# at 0 in the parent on every call. The loader re-ran all three times and the
+# duplicate warning the memo was written to stop came straight back. Reproduced
+# directly: the uncached body ran 3/3 times and the cache stayed empty.
+#
+# That is precisely the trap adapters.sh's own header documents for
+# adapters_rejected, and writing it again a few hundred lines away is why that
+# header says a file crosses the boundary and a variable does not. Here the
+# boundary is crossed by not creating one: resolve_enabled_adapters assigns the
+# global and returns, callers read ENABLED_ADAPTERS.
+ENABLED_ADAPTERS=""
 ENABLED_ADAPTERS_RESOLVED=0
-enabled_adapters() {
-  if [ "$ENABLED_ADAPTERS_RESOLVED" = "1" ]; then
-    printf '%s' "$ENABLED_ADAPTERS_CACHE"
-    return 0
-  fi
-  ENABLED_ADAPTERS_CACHE=$(_enabled_adapters_uncached)
+resolve_enabled_adapters() {
+  [ "$ENABLED_ADAPTERS_RESOLVED" = "1" ] && return 0
+  ENABLED_ADAPTERS=$(_enabled_adapters_uncached)
   ENABLED_ADAPTERS_RESOLVED=1
-  printf '%s' "$ENABLED_ADAPTERS_CACHE"
+  return 0
 }
 _enabled_adapters_uncached() {
   # "Genuinely absent" means the loader is not sourced OR the adapters tree does
@@ -457,7 +465,8 @@ scan_roots() {
   fi
   REJECTED_PATHS=0
   local src adapters
-  adapters=$(enabled_adapters)
+  resolve_enabled_adapters
+  adapters="$ENABLED_ADAPTERS"
   # The accepted set, resolved once for enumerate_for's per-root gate.
   ACCEPTED_ADAPTERS=$(adapters_list 2>/dev/null)
   if [ -z "${adapters// /}" ]; then
@@ -472,6 +481,27 @@ scan_roots() {
       log "FATAL: the adapter loader ran and accepted no adapters (rejected: $(adapters_rejected 2>/dev/null)). Refusing to scan."
     fi
     RAW=0
+    # Leave a marker before returning. This path is a TOTAL outage with a mundane
+    # trigger — adapters/claude/adapter.sh losing its exec bit to a tarball copy,
+    # a restrictive umask or core.fileMode=false — and it returns ~600 lines
+    # before notify.sh, writes no findings JSON for unassembled_dates() to see,
+    # and writes no run-stats.txt. A host that produced a full report last night
+    # then produces nothing, every night, with one log line nobody reads as the
+    # only record.
+    #
+    # Not a stub REPORT: a report is what the idempotency guard reads as "this
+    # date is complete", and this date is not. A run-stats.txt carrying `fatal:`
+    # is the honest artifact, and unassembled_dates() below now looks for it, so
+    # the next night that does succeed names this date in its report.
+    mkdir -p "$FINDINGS_DIR" 2>/dev/null || true
+    {
+      printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
+      printf 'runner_commit: %s\n' "$RUNNER_COMMIT"
+      printf 'runner_dirty: %s\n' "$RUNNER_DIRTY"
+      printf 'fatal: no usable adapter\n'
+      printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null)"
+      printf 'sessions_triaged: 0\n'
+    } > "$FINDINGS_DIR/run-stats.txt" 2>/dev/null || true
     return 1
   fi
   for src in $adapters; do
@@ -626,7 +656,7 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
   # Gated on the adapter having been ACCEPTED, not merely on adapter.sh being
   # executable: an executable check alone would run a directory that failed
   # containment.
-  # ACCEPTED_ADAPTERS is resolved once by enabled_adapters. This used to call
+  # ACCEPTED_ADAPTERS is assigned directly in scan_roots. This used to call
   # adapters_list per root, and that walk does two realpaths plus a jq for every
   # adapter directory — repeated work whose answer cannot change mid-run, since
   # nothing writes to adapters/ while the scan is in flight.
@@ -1272,10 +1302,15 @@ unassembled_dates() {
     [ -n "$d" ] || continue
     date_label=$(basename "$d")
     [ "$date_label" = "$TARGET_DATE" ] && continue
-    # Findings JSONs only. A dir holding nothing but *.stats.json sidecars was never
-    # triaged, so it has nothing to assemble and is not a failure.
+    # Findings JSONs, OR a run-stats.txt carrying `fatal:`. A dir holding nothing
+    # but *.stats.json sidecars was never triaged, so it has nothing to assemble
+    # and is not a failure — but a dir holding only a fatal marker is a night that
+    # died before it could triage anything, which is the case with no other
+    # surface at all: no report, no notification, and no findings to rebuild from.
     found=$(find "$d" -maxdepth 1 -type f -name '*.json' ! -name '*.stats.json' 2>/dev/null | head -1)
-    [ -n "$found" ] || continue
+    if [ -z "$found" ]; then
+      grep -q '^fatal: ' "$d/run-stats.txt" 2>/dev/null || continue
+    fi
     report="$DREAMS_DIR/$date_label.md"
     if [ -s "$report" ] && grep -q 'autodream:open-questions=' "$report" 2>/dev/null; then
       continue
@@ -1435,7 +1470,7 @@ run() {
       printf 'session_roots: %s\n' "$(( $(printf '%s' "$SESSION_ROOTS" | tr -cd ':' | wc -c) + 1 ))"
       printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
       printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null)"
-      printf 'adapters_enabled: %s\n' "$(enabled_adapters 2>/dev/null | tr ' ' ',' | sed 's/,$//')"
+      printf 'adapters_enabled: %s\n' "$(printf '%s' "$ENABLED_ADAPTERS" | tr ' ' ',' | sed 's/,$//')"
       printf 'sessions_by_source: %s\n' "${SESSIONS_BY_SOURCE:-none}"
       # The rest of the key set, emitted as real zeroes rather than omitted.
       # PROMPT.md tells L2 that keys missing from run-stats.txt mean the runner
@@ -1733,7 +1768,7 @@ PY
     # Which harnesses produced this night's corpus. A source that drops to zero
     # on a day the user worked in it is the signal that its ingest broke, and
     # that is invisible without a per-source count.
-    printf 'adapters_enabled: %s\n' "$(enabled_adapters | tr ' ' ',' | sed 's/,$//')"
+    printf 'adapters_enabled: %s\n' "$(printf '%s' "$ENABLED_ADAPTERS" | tr ' ' ',' | sed 's/,$//')"
     # Refusals that still left claude accepted are otherwise completely silent —
     # a third-party adapter failing containment, a mismatched manifest name, a
     # lost exec bit. Same silent-shortfall class as overlap_measured and
