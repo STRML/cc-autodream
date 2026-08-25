@@ -34,6 +34,12 @@ case "$cmd" in
     # A unique temp in the DESTINATION directory. A fixed "$2.tmp" is a shared
     # name: two invocations writing the same output would clobber or remove each
     # other's temp file and leave the result from the wrong one, or none.
+    # A directory at the destination is refused. `mv -f "$t" "$2"` would move
+    # the temp INSIDE it and return success, so the adapter would report a write
+    # it never performed and leave a randomly-named file in the caller's
+    # directory. The delegates used to reject this themselves, because a `>`
+    # redirection to a directory fails; wrapping them removed that.
+    [ ! -d "$2" ] || exit 1
     t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
     cp "$1" "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
     mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }
@@ -80,11 +86,26 @@ case "$cmd" in
   # of every subcommand that writes a file), and both scripts have callers
   # outside this seam. Same shape as normalize above — a unique temp in the
   # DESTINATION directory, renamed on success, removed on failure.
+  #
+  # DELIBERATELY NO SIGNAL TRAP, and this was measured rather than assumed. A
+  # killed run leaves the temp behind, which is real but cosmetic: nothing reads
+  # `*.tmp.*` — the findings glob is `*.json` and slim output is read by exact
+  # path. Adding `trap 'rm -f "$t"' ... TERM` costs far more than it saves,
+  # because bash defers a TRAPPED signal until the foreground child returns. The
+  # delegate is that child, so the trap converts a prompt death into an adapter
+  # that ignores SIGTERM for as long as the delegate runs — verified here: the
+  # test below hung for 120s and left orphaned slim-transcript.sh processes
+  # holding their input open. Being killed mid-flight is this pipeline's normal
+  # failure, so trading a stale temp for a hung process is the wrong direction.
+  # Backgrounding the delegate and killing it from the trap would work and is
+  # five lines of signal plumbing in a file whose whole claim is that nothing is
+  # invented here. Tracked instead.
   stats|slim)
     case "$cmd" in
       stats) delegate="$BIN/session-stats.sh" ;;
       slim)  delegate="$BIN/slim-transcript.sh" ;;
     esac
+    [ ! -d "$2" ] || exit 1   # see the note on the first use above
     t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
     "$delegate" "$1" "$t" || { rm -f "$t"; exit 1; }
     mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }

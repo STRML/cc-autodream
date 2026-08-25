@@ -24,6 +24,12 @@ case "$cmd" in
   normalize) # $1=in $2=out
     [ -r "$1" ] || exit 1
     jq -e . "$1" >/dev/null 2>&1 || exit 1        # fail closed on malformed input
+    # A directory at the destination is refused. `mv -f "$t" "$2"` would move
+    # the temp INSIDE it and return success, so the adapter would report a write
+    # it never performed and leave a randomly-named file in the caller's
+    # directory. The delegates used to reject this themselves, because a `>`
+    # redirection to a directory fails; wrapping them removed that.
+    [ ! -d "$2" ] || exit 1
     t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
     cp "$1" "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
     mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }
@@ -47,6 +53,7 @@ case "$cmd" in
     [ -r "$1" ] || exit 1
     bytes=$(wc -c < "$1" | tr -d ' ')
     turns=$(jq -re '.turns // 0' "$1" 2>/dev/null) || turns=0
+    [ ! -d "$2" ] || exit 1   # see the note on the first use above
     t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
     printf '{"transcript_bytes":%s,"user_message_count":%s,"tool_call_count":0}\n' \
       "${bytes:-0}" "${turns:-0}" > "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
@@ -55,6 +62,7 @@ case "$cmd" in
 
   slim) # $1=in $2=out — a fixture is already small; the contract is what matters
     [ -r "$1" ] || exit 1
+    [ ! -d "$2" ] || exit 1   # see the note on the first use above
     t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
     cp "$1" "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
     mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }

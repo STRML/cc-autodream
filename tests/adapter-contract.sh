@@ -68,7 +68,12 @@ run_contract(){ # $1=adapter name
   if "$A" normalize "$S" "$tmp/n.out" 2>/dev/null; then ok "[$name] normalize exits 0"
   else no "[$name] normalize exits 0"; fi
   if [ -s "$tmp/n.out" ]; then ok "[$name] normalize wrote output"; else no "[$name] normalize wrote output"; fi
-  if [ -e "$tmp/n.out.tmp" ]; then no "[$name] normalize left no .tmp"; else ok "[$name] normalize left no .tmp"; fi
+  # Glob, not a literal. The temp is `<out>.tmp.XXXXXX`, so a check for exactly
+  # `<out>.tmp` matches nothing that is ever created and passes against an
+  # implementation leaking a temp on every call. `set --` then `-e "$1"` is the
+  # bash-3.2-safe way to ask whether a glob matched anything.
+  set -- "$tmp"/n.out.tmp.*
+  if [ -e "$1" ]; then no "[$name] normalize left no temp (found $(basename "$1"))"; else ok "[$name] normalize left no temp"; fi
   if "$A" normalize "$tmp/nope" "$tmp/bad.out" 2>/dev/null; then
     no "[$name] normalize on bad input exits nonzero"
   else ok "[$name] normalize on bad input exits nonzero"; fi
@@ -84,7 +89,29 @@ run_contract(){ # $1=adapter name
   # --- slim ---
   if "$A" slim "$S" "$tmp/sl.out" 2>/dev/null; then ok "[$name] slim exits 0"; else no "[$name] slim exits 0"; fi
   if [ -s "$tmp/sl.out" ]; then ok "[$name] slim wrote output"; else no "[$name] slim wrote output"; fi
-  if [ -e "$tmp/sl.out.tmp" ]; then no "[$name] slim left no .tmp"; else ok "[$name] slim left no .tmp"; fi
+  set -- "$tmp"/sl.out.tmp.*
+  if [ -e "$1" ]; then no "[$name] slim left no temp (found $(basename "$1"))"; else ok "[$name] slim left no temp"; fi
+
+  # --- a directory destination is refused, not written into ---
+  # `mv -f "$t" "$2"` with an existing directory at $2 moves the temp INSIDE it
+  # and returns success, so the adapter reports a write it did not perform and
+  # plants a randomly-named file in a directory the caller chose. The delegates
+  # used to reject this on their own, because a `>` redirection to a directory
+  # fails; wrapping them removed that and the wrap has to restore it.
+  mkdir -p "$tmp/destdir"
+  local subc
+  for subc in normalize slim stats; do
+    if "$A" "$subc" "$S" "$tmp/destdir" >/dev/null 2>&1; then
+      no "[$name] $subc must refuse a directory destination"
+    else
+      ok "[$name] $subc refuses a directory destination"
+    fi
+  done
+  if [ -z "$(ls -A "$tmp/destdir" 2>/dev/null)" ]; then
+    ok "[$name] nothing was planted inside the directory destination"
+  else
+    no "[$name] a file was planted inside the directory destination: $(ls -A "$tmp/destdir" | head -1)"
+  fi
 
   # --- slim and stats write through a temp, like normalize ---
   # The design doc requires this of EVERY subcommand that writes a file

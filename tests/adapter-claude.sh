@@ -77,6 +77,68 @@ echo "# claude adapter: slim writes a reduced copy"
 if "$A" slim "$S" "$tmp/slim.jsonl" 2>/dev/null; then ok "slim exits 0"; else no "slim exits 0"; fi
 if [ -s "$tmp/slim.jsonl" ]; then ok "slim wrote output"; else no "slim wrote output"; fi
 
+echo "# claude adapter: a signalled slim dies promptly and writes no destination"
+# Two properties, and the second one is here because trying to add a third broke
+# it. The temp-and-rename wrap must keep a partial write out of the destination
+# when a run is killed, AND the adapter must still die when signalled.
+#
+# It does NOT assert the temp is cleaned up. That would demand a signal trap, and
+# a trap makes this worse: bash defers a trapped signal until the foreground
+# child returns, so the adapter ignores SIGTERM for as long as the delegate runs.
+# The version of this test that asserted temp cleanup hung for the full timeout
+# against exactly that fix and left orphaned delegates behind. The stale temp is
+# tracked as an issue; the responsiveness assertion below is what stops a future
+# reader from "fixing" the leak the obvious way.
+#
+# The interrupt is made deterministic with a FIFO. `[ -r ]` on it succeeds, so
+# the delegate starts and its first read blocks forever with no writer, which
+# parks the adapter at a known point AFTER mktemp and BEFORE the rename.
+fifodir="$tmp/fifo"; mkdir -p "$fifodir"
+mkfifo "$fifodir/src.jsonl" 2>/dev/null
+if [ -p "$fifodir/src.jsonl" ]; then
+  "$A" slim "$fifodir/src.jsonl" "$fifodir/out.jsonl" >/dev/null 2>&1 &
+  slim_pid=$!
+  # Wait for the temp to APPEAR before signalling. A busy spin returns long
+  # before the adapter has reached mktemp, and killing it that early makes the
+  # assertion below vacuous — it passed against the untrapped code exactly once,
+  # for that reason. Poll on a real interval and assert the temp existed, so a
+  # test that never opened the window fails instead of reporting success.
+  waited=0; saw_tmp=0
+  while [ "$waited" -lt 100 ]; do
+    set -- "$fifodir"/out.jsonl.tmp.*
+    if [ -e "$1" ]; then saw_tmp=1; break; fi
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  if [ "$saw_tmp" = "1" ]; then ok "the temp was observed before signalling"
+  else no "the temp never appeared, so the interrupt assertions prove nothing"; fi
+  kill -TERM "$slim_pid" 2>/dev/null
+  # Poll for the adapter to actually go away rather than blocking in `wait`. A
+  # bare `wait` on a process that ignores the signal hangs the suite instead of
+  # failing it, which is how the trapped version presented.
+  died=0; waited=0
+  while [ "$waited" -lt 60 ]; do
+    kill -0 "$slim_pid" 2>/dev/null || { died=1; break; }
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  if [ "$died" = "1" ]; then
+    ok "a signalled slim terminates instead of ignoring SIGTERM"
+  else
+    no "a signalled slim did not terminate within 3s"
+    kill -9 "$slim_pid" 2>/dev/null
+  fi
+  wait "$slim_pid" 2>/dev/null
+  pkill -f "slim-transcript.sh $fifodir/src.jsonl" 2>/dev/null
+  if [ -e "$fifodir/out.jsonl" ]; then
+    no "a signalled slim wrote no destination file"
+  else
+    ok "a signalled slim wrote no destination file"
+  fi
+else
+  ok "mkfifo unavailable here; skipped the interrupt test"
+fi
+
 echo "# claude adapter: is-self defers to the one self-pollution predicate"
 W="$tmp/root/projects/-bucket/worker.jsonl"
 printf '%s\n' '{"type":"user","message":{"content":"Session transcript to analyze (literal absolute path): /x"}}' > "$W"
