@@ -2119,6 +2119,32 @@ test_all_roots_unavailable_fails(){
   rm -rf "$root"
 }
 
+# ---- A fresh host with no store is a quiet night, not a failure -------------
+# probe_roots falls back to $HOME/.claude/projects when discovery finds nothing.
+# The all-roots-unavailable fatal counted that fallback as a configured root and
+# aborted, so a machine that has simply never run Claude Code failed instead of
+# reporting an empty night. The fatal must fire only on roots someone actually
+# asked for.
+test_fresh_host_with_no_store_is_not_a_failure(){
+  echo "# roots: a fresh host with no session store reports empty, it does not fail"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home" "$T/autodream" "$T/dreams"
+  cp "$REPO/prompts/SESSION_TRIAGE.md" "$T/autodream/SESSION_TRIAGE.md"
+  cp "$REPO/prompts/PROMPT.md"         "$T/autodream/PROMPT.md"
+  # No SESSION_ROOTS, no PROJECTS_DIR, and a HOME with no .claude at all.
+  HOME="$T/home" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$T/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    AUTODREAM_DIR="$T/autodream" DREAMS_DIR="$T/dreams" \
+    bash "$RUN" "$DATE" > "$T/run.out" 2>&1
+  local rc=$?
+  cat "$T/autodream/logs/run-$DATE.log" >> "$T/run.out" 2>/dev/null || true
+  assert_eq "$rc" "0" "a fresh host exits 0"
+  assert_nonempty "$T/dreams/$DATE.md" "a fresh host still gets a report"
+  assert_nogrep "$T/run.out" 'configured session root' "no all-roots-unavailable fatal fires"
+  rm -rf "$T"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2135,6 +2161,7 @@ test_unrepresentable_characters_are_refused
 test_failing_enumerator_aborts_the_run
 test_partial_enumeration_keeps_what_it_read
 test_all_roots_unavailable_fails
+test_fresh_host_with_no_store_is_not_a_failure
 test_all_excluded_corpus_says_so
 
 echo

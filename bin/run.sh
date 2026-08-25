@@ -303,7 +303,15 @@ probe_roots() {
     # lie. Folders the user explicitly ignored are likewise skipped.
     SESSION_ROOTS=$("$ROOT_PROBE" --consolidated 2>/dev/null) || SESSION_ROOTS=""
   fi
-  [ -n "$SESSION_ROOTS" ] || SESSION_ROOTS="$HOME/.claude/projects"
+  # A last-resort default is NOT a configured root. Discovery returning nothing
+  # means a fresh host with no store yet, and that has to stay a legitimate quiet
+  # night — the all-roots-unavailable fatal below must not fire on a fallback
+  # nobody asked for. This flag is what tells the two apart.
+  SESSION_ROOTS_ARE_FALLBACK=0
+  if [ -z "$SESSION_ROOTS" ]; then
+    SESSION_ROOTS="$HOME/.claude/projects"
+    SESSION_ROOTS_ARE_FALLBACK=1
+  fi
   log "session roots: ${SESSION_ROOTS//:/, }"
 }
 
@@ -326,6 +334,7 @@ PARTIAL_ROOTS=0     # roots whose enumerator failed but still returned data
 ROOTS_CONFIGURED=0  # roots we were told to scan
 ROOTS_SCANNED=0     # roots that existed and were walked
 ROOTS_UNAVAILABLE=0 # roots that were configured but are not directories
+SESSION_ROOTS_ARE_FALLBACK=0  # 1 when SESSION_ROOTS is the bare default nobody configured
 DUPLICATE_PATHS=0   # one path claimed by more than one adapter
 HASH_COLLISIONS=0   # two different paths truncating to one artifact hash
 SESSIONS_BY_SOURCE=none
@@ -423,7 +432,8 @@ scan_roots() {
   # RAW would be 0, every shortfall counter would be 0, and the stub would say
   # no files were modified. A fresh host with NO roots configured is a different
   # thing and stays legitimate.
-  if [ "$ROOTS_CONFIGURED" -gt 0 ] && [ "$ROOTS_SCANNED" -eq 0 ]; then
+  if [ "${SESSION_ROOTS_ARE_FALLBACK:-0}" != "1" ] \
+     && [ "$ROOTS_CONFIGURED" -gt 0 ] && [ "$ROOTS_SCANNED" -eq 0 ]; then
     log "FATAL: all $ROOTS_CONFIGURED configured session root(s) are unavailable; refusing to report an empty night over a store that was never reached"
     return 1
   fi
@@ -616,8 +626,16 @@ build_source_sidecar() {
   # Actually remove the colliding sessions from the worklist. Without this the
   # detection is decorative.
   if [ -s "$drop" ]; then
-    grep -vxF -f "$drop" "$SESSIONS_LIST.raw" > "$SESSIONS_LIST.raw.tmp" 2>/dev/null || :
-    mv -f "$SESSIONS_LIST.raw.tmp" "$SESSIONS_LIST.raw" 2>/dev/null || :
+    # Same rule as the sidecar rewrite above: grep exit 0 or 1 is a legitimate
+    # result, anything higher is a real failure whose partial output must not be
+    # promoted over the worklist.
+    grep -vxF -f "$drop" "$SESSIONS_LIST.raw" > "$SESSIONS_LIST.raw.tmp" 2>/dev/null; grc=$?
+    if [ "$grc" -le 1 ]; then
+      mv -f "$SESSIONS_LIST.raw.tmp" "$SESSIONS_LIST.raw" 2>/dev/null || rm -f "$SESSIONS_LIST.raw.tmp"
+    else
+      rm -f "$SESSIONS_LIST.raw.tmp"
+      log "  WARNING: could not drop collided paths from the worklist (grep exit $grc); leaving it intact"
+    fi
     RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
     # Their provenance rows go too. Note the narrower claim: this removes rows
     # for COLLISION drops only. build_source_sidecar runs before the self-prune
@@ -628,8 +646,12 @@ build_source_sidecar() {
     while IFS= read -r sp; do
       [ -n "$sp" ] || continue
       h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
-      grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null || :
-      mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || rm -f "$sidecar.tmp"
+      grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null; grc=$?
+      if [ "$grc" -le 1 ]; then
+        mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || rm -f "$sidecar.tmp"
+      else
+        rm -f "$sidecar.tmp"
+      fi
     done < "$drop"
   fi
   rm -f "$drop"
@@ -1120,7 +1142,6 @@ run() {
       # regression to single-root scanning is exactly what would explain it.
       printf 'roots_partially_enumerated: %s\n' "$PARTIAL_ROOTS"
       printf 'roots_unavailable: %s\n' "$ROOTS_UNAVAILABLE"
-    printf 'roots_unavailable: %s\n' "$ROOTS_UNAVAILABLE"
       printf 'session_roots: %s\n' "$(( $(printf '%s' "$SESSION_ROOTS" | tr -cd ':' | wc -c) + 1 ))"
       printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
       printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null || printf none)"
