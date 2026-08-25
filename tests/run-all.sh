@@ -1842,6 +1842,33 @@ test_rootprobe_empty_home(){
   rm -rf "$T"
 }
 
+# ---- Enumeration transport: a path a line-based artifact cannot hold ----------
+# sessions.txt is line-delimited and STAYS that way: bin/run.sh:468 and :540 key
+# each artifact by sha1 of the whole line, bin/oversized-gate.sh:73 recomputes
+# that same hash from the file, and every archived findings dir depends on it.
+# So a path containing a newline cannot be represented, and today it is worse
+# than unrepresentable — `find` writes it as two lines and the runner invents a
+# second session that does not exist. Reject it at enumeration instead.
+test_newline_path_is_rejected_not_split(){
+  echo "# enumeration: a path containing a newline is rejected, never split into two"
+  local root; root=$(setup_env)
+  mk_session "$root" good
+  # Some filesystems refuse a newline in a name; if this one does, there is
+  # nothing to reject and the test says so rather than passing vacuously.
+  local bad; bad=$(printf '%s/projects/proj-a/ba\nd.jsonl' "$root")
+  if ! printf '%s\n' '{"type":"user","cwd":"/tmp/proj-a","message":{"content":"x"}}' > "$bad" 2>/dev/null; then
+    ok "the filesystem refuses newline filenames; nothing to reject here"
+    rm -rf "$root"; return 0
+  fi
+  touch -t "$STAMP" "$bad"
+  run_dream "$root"
+  local f; f=$(fdir "$root")
+  assert_eq "$(grep -c . "$f/sessions.txt.raw")" "1" "only the representable session is enumerated"
+  assert_grep "$f/run-stats.txt" 'sessions_rejected_path: 1' "the rejection is counted in run-stats"
+  assert_grep "$root/run.out" 'newline' "the log names the offending character"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -1849,6 +1876,7 @@ test_multiroot_flags_unindexed
 test_rootprobe_remembers_choice
 test_rootprobe_no_write_mode_flags_but_does_not_write
 test_rootprobe_empty_home
+test_newline_path_is_rejected_not_split
 
 echo
 echo "----------------------------------------"

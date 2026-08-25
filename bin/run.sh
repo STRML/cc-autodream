@@ -309,8 +309,12 @@ write_unindexed_flag() {
 }
 
 # Find sessions modified during the target day across every session root.
+NL=$'\n'            # for the newline-in-path check below
+REJECTED_PATHS=0    # session paths a line-based sessions.txt cannot represent
+
 scan_roots() {
   : > "$SESSIONS_LIST.raw"
+  REJECTED_PATHS=0
   local -a roots
   IFS=: read -ra roots <<< "$SESSION_ROOTS"
   local r
@@ -324,10 +328,27 @@ scan_roots() {
       log "WARNING: session root is not a directory (possible ':' in path — SESSION_ROOTS is colon-separated): $r"
       continue
     fi
-    find "$r" -type f -name '*.jsonl' \
-         -newermt "$TARGET_DATE 00:00:00" \
-         ! -newermt "$NEXT_DATE 00:00:00" \
-         2>/dev/null >> "$SESSIONS_LIST.raw"
+    # NUL transport for the fan-out, so a path carrying a space, a tab or a glob
+    # character survives intact. It does NOT save a path carrying a newline:
+    # sessions.txt is line-delimited and stays that way, because run.sh:468 and
+    # run.sh:540 key each artifact by sha1 of the whole line, oversized-gate.sh
+    # recomputes that same hash from the file, and every archived findings dir
+    # depends on the shape. Such a path is currently written as two lines and
+    # the runner then invents a session that does not exist, so it is rejected
+    # here — before either representation is built — rather than transported.
+    while IFS= read -r -d '' sp; do
+      case "$sp" in
+        *"$NL"*)
+          REJECTED_PATHS=$((REJECTED_PATHS + 1))
+          log "  skip: session path contains a newline, which a line-based sessions.txt cannot represent: $(printf '%q' "$sp")"
+          continue
+          ;;
+      esac
+      printf '%s\n' "$sp" >> "$SESSIONS_LIST.raw"
+    done < <(find "$r" -type f -name '*.jsonl' \
+                  -newermt "$TARGET_DATE 00:00:00" \
+                  ! -newermt "$NEXT_DATE 00:00:00" \
+                  -print0 2>/dev/null)
   done
   # A transcript reachable from two roots (e.g. one dir is a symlink of another) must
   # be triaged exactly once.
@@ -985,6 +1006,11 @@ PY
     printf 'session_roots: %s\n' "$SESSION_ROOT_COUNT"
     printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
     printf 'sessions_found_raw: %s\n' "$RAW"
+    # Paths dropped at enumeration because a line-based sessions.txt cannot hold
+    # them. Recorded rather than left implicit: a nonzero value here means a real
+    # transcript exists that no report will ever mention, which is exactly the
+    # kind of silent shortfall this file exists to make visible.
+    printf 'sessions_rejected_path: %s\n' "$REJECTED_PATHS"
     printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
     printf 'sessions_skipped_empty: %s\n' "$SKIPPED_EMPTY"
     printf 'sessions_triaged: %s\n' "$COUNT"
