@@ -632,9 +632,21 @@ build_source_sidecar() {
     grep -vxF -f "$drop" "$SESSIONS_LIST.raw" > "$SESSIONS_LIST.raw.tmp" 2>/dev/null; grc=$?
     if [ "$grc" -le 1 ]; then
       mv -f "$SESSIONS_LIST.raw.tmp" "$SESSIONS_LIST.raw" 2>/dev/null || rm -f "$SESSIONS_LIST.raw.tmp"
+      # Confirm the drop actually happened. "Leave it intact" is the wrong
+      # fallback here: intact means BOTH colliding paths are still in the
+      # worklist, so two workers target one <hash>.json and silently overwrite
+      # each other — precisely what this branch exists to prevent. Preserving the
+      # file is right; continuing the run over it is not.
+      if grep -qxF -f "$drop" "$SESSIONS_LIST.raw" 2>/dev/null; then
+        log "FATAL: collided paths could not be removed from the worklist; refusing to dispatch two sessions onto one artifact"
+        rm -f "$drop"
+        return 1
+      fi
     else
       rm -f "$SESSIONS_LIST.raw.tmp"
-      log "  WARNING: could not drop collided paths from the worklist (grep exit $grc); leaving it intact"
+      log "FATAL: could not rewrite the worklist to drop collided paths (grep exit $grc); refusing to dispatch two sessions onto one artifact"
+      rm -f "$drop"
+      return 1
     fi
     RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
     # Their provenance rows go too. Note the narrower claim: this removes rows
@@ -651,6 +663,9 @@ build_source_sidecar() {
         mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || rm -f "$sidecar.tmp"
       else
         rm -f "$sidecar.tmp"
+        # Say so. A stale row left here is still counted by SESSIONS_BY_SOURCE,
+        # which would overstate the source totals with nothing to explain it.
+        log "  WARNING: could not drop the provenance row for $h (grep exit $grc); source counts may be overstated by one"
       fi
     done < "$drop"
   fi
@@ -1086,7 +1101,7 @@ run() {
   export ADAPTERS_REJECT_LOG="$FINDINGS_DIR/.adapters-rejected"
   : > "$ADAPTERS_REJECT_LOG" 2>/dev/null || true
   scan_roots || return 1
-  build_source_sidecar
+  build_source_sidecar || return 1
 
   # Exclude autodream's OWN headless worker/aggregator transcripts. New runs leave none
   # (--no-session-persistence), but runs predating that fix littered ~/.claude/projects/

@@ -109,9 +109,14 @@ adapters_list() {
   local root d n
   root=$(adapters_root)
   [ -d "$root" ] || return 0
-  for d in "$root"/*/; do
+  # BOTH globs. "$root"/*/ never matches a dot-prefixed directory, so a hostile
+  # or malformed `.evil` was silently invisible rather than recorded as a
+  # refusal — and adapters_rejected then reported `none`, which reads as "nothing
+  # was refused" when something was.
+  for d in "$root"/*/ "$root"/.*/; do
     [ -d "$d" ] || continue
     n=$(basename "$d")
+    case "$n" in .|..) continue ;; esac
     _adapter_ok "$n" && printf '%s\n' "$n"
   done
   return 0

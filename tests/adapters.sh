@@ -57,6 +57,10 @@ has "claude" "$(adapters_rejected)" "the refusal is visible AFTER a \$(adapters_
 echo "# adapters: an unsafe basename is refused"
 root=$(sandbox); mk_adapter "$root" ".evil" ".evil"; use "$root"
 assert_eq "$(adapters_list)" "" "a dot-prefixed basename is refused"
+# Absent from the list is not the same as REFUSED. "$root"/*/ never matched a
+# dot-prefixed directory, so .evil was invisible rather than rejected and
+# adapters_rejected reported `none` — which reads as "nothing was refused".
+has ".evil" "$(adapters_rejected)" "a dot-prefixed dir is RECORDED as refused, not merely skipped"
 root=$(sandbox); mk_adapter "$root" "Bad" "Bad"; use "$root"
 assert_eq "$(adapters_list)" "" "an uppercase basename is refused"
 
