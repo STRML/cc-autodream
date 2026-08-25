@@ -47,6 +47,10 @@ else
 fi
 out3=$(AUTODREAM_PREFLIGHT_FORCE_MISSING=python3 "$PF" --l2-bin bash 2>&1)
 case "$out3" in *MISSING*python3*) no "python3 is not reported as MISSING" ;; *) ok "python3 is not reported as MISSING" ;; esac
+# Assert the DEGRADED line is actually emitted. Without this the test passed on
+# any host that HAS python3 — it simulated nothing and proved nothing.
+case "$out3" in *DEGRADED*python3*) ok "python3 absence emits a DEGRADED warning" ;;
+                *) no "python3 absence emits a DEGRADED warning (got: $out3)" ;; esac
 has "realpath" "$out" "names realpath"
 
 echo "# preflight: the reason is carried, not just the name"
@@ -57,8 +61,18 @@ echo "# preflight: a flag with no value is a usage error, never a hang"
 # `shift 2` with one argument left fails and shifts nothing, so the arg loop
 # spun forever. Preflight runs before the idempotency guard, so a wedged one
 # would also block every launchd catch-up trigger behind "label already running".
-timeout 5 "$PF" --l2-bin >/dev/null 2>&1; rc4=$?
-assert_eq "$rc4" "2" "--l2-bin with no value exits 2 rather than hanging"
+# macOS has no stock `timeout`, and the workflow installs coreutils for
+# `gtimeout` only — it deliberately keeps gnubin off PATH because the suite
+# depends on BSD date and touch. Same selection run-all.sh already uses.
+TO=""
+command -v timeout  >/dev/null 2>&1 && TO=timeout
+[ -n "$TO" ] || { command -v gtimeout >/dev/null 2>&1 && TO=gtimeout; }
+if [ -n "$TO" ]; then
+  "$TO" 5 "$PF" --l2-bin >/dev/null 2>&1; rc4=$?
+  assert_eq "$rc4" "2" "--l2-bin with no value exits 2 rather than hanging"
+else
+  ok "no timeout binary available; skipped the hang assertion"
+fi
 
 echo "# preflight: the failure is machine-readable for run-stats"
 has "preflight_missing:" "$out" "emits a preflight_missing key"

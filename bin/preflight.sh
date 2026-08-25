@@ -66,7 +66,7 @@ need shasum   "the artifact key is sha1 of the session path; without it the hash
 # show dupes)"), and making preflight fatal here contradicted that: on a host
 # where python3 is only a pyenv shim absent from the launchd PATH, the nightly
 # would go from a slightly-worse report to no report at all, every night.
-if ! command -v python3 >/dev/null 2>&1; then
+if _forced_missing python3 || ! command -v python3 >/dev/null 2>&1; then
   printf 'DEGRADED: python3 — project-field normalisation will be skipped; L2 grouping may show duplicate projects\n' >&2
 fi
 need realpath "adapter directory containment and cwd canonicalisation; without it containment is weaker, which is the failure this check exists to prevent"

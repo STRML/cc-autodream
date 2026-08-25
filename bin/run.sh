@@ -323,6 +323,9 @@ NL=$'\n'            # for the newline-in-path check below
 TAB=$'\t'           # ditto; the L1 xargs -I fan-out turns a tab into a space
 REJECTED_PATHS=0    # session paths a line-based sessions.txt cannot represent
 PARTIAL_ROOTS=0     # roots whose enumerator failed but still returned data
+ROOTS_CONFIGURED=0  # roots we were told to scan
+ROOTS_SCANNED=0     # roots that existed and were walked
+ROOTS_UNAVAILABLE=0 # roots that were configured but are not directories
 DUPLICATE_PATHS=0   # one path claimed by more than one adapter
 HASH_COLLISIONS=0   # two different paths truncating to one artifact hash
 SESSIONS_BY_SOURCE=none
@@ -415,6 +418,16 @@ scan_roots() {
   for src in $adapters; do
     scan_one_adapter "$src" || return 1
   done
+  # Roots were configured and not one of them was reachable. That is a broken
+  # SESSION_ROOTS or a vanished store, and it must not read as a quiet night:
+  # RAW would be 0, every shortfall counter would be 0, and the stub would say
+  # no files were modified. A fresh host with NO roots configured is a different
+  # thing and stays legitimate.
+  if [ "$ROOTS_CONFIGURED" -gt 0 ] && [ "$ROOTS_SCANNED" -eq 0 ]; then
+    log "FATAL: all $ROOTS_CONFIGURED configured session root(s) are unavailable; refusing to report an empty night over a store that was never reached"
+    return 1
+  fi
+
   # A transcript reachable from two roots (one dir a symlink of another) must be
   # triaged exactly once; the first source to claim a path keeps it.
   sort -u "$SESSIONS_LIST.raw" -o "$SESSIONS_LIST.raw"
@@ -429,10 +442,13 @@ scan_one_adapter() { # $1=adapter name
     # the split above already fragmented it. Catch the symptom — a fragment that is not
     # a directory (or that was split out of one) — and say why it's being skipped rather
     # than silently scanning nothing.
+    ROOTS_CONFIGURED=$((ROOTS_CONFIGURED + 1))
     if [ ! -d "$r" ]; then
+      ROOTS_UNAVAILABLE=$((ROOTS_UNAVAILABLE + 1))
       log "WARNING: session root is not a directory (possible ':' in path — SESSION_ROOTS is colon-separated): $r"
       continue
     fi
+    ROOTS_SCANNED=$((ROOTS_SCANNED + 1))
     # NUL transport for the fan-out, so a path carrying a space, a tab or a glob
     # character survives intact. It does NOT save a path carrying a newline:
     # sessions.txt is line-delimited and stays that way, because the hash
@@ -572,12 +588,22 @@ build_source_sidecar() {
         # Rewrite unconditionally. `grep -v` exits 1 when it removes the only line,
         # so a guarded `&& mv` left the stale mapping behind in exactly the
         # single-entry case.
-        grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null || :
+        # Check grep's OWN status. Swallowing it and then promoting the temp
+        # could install a truncated file when grep failed mid-write; only the mv
+        # was guarded before. grep -v exits 1 on "no lines left", which is a
+        # legitimate empty result, so 0 and 1 are both fine and anything else is
+        # a real failure that must not be promoted.
+        grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null; grc=$?
+        if [ "$grc" -gt 1 ]; then
+          rm -f "$sidecar.tmp"
+          log "  WARNING: could not rewrite the source sidecar (grep exit $grc); leaving the stale row"
+        else
         # If the replace fails (a full filesystem between the redirect and the
         # mv), LEAVE the stale row. Truncating the file was the old fallback and
         # it traded one wrong row for the loss of every row's provenance. The
         # colliding paths are dropped from the worklist regardless.
         mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || rm -f "$sidecar.tmp"
+        fi
       fi
       continue
     fi
@@ -1093,6 +1119,8 @@ run() {
       # zero-triage night does not read as an empty one, and a partial walk or a
       # regression to single-root scanning is exactly what would explain it.
       printf 'roots_partially_enumerated: %s\n' "$PARTIAL_ROOTS"
+      printf 'roots_unavailable: %s\n' "$ROOTS_UNAVAILABLE"
+    printf 'roots_unavailable: %s\n' "$ROOTS_UNAVAILABLE"
       printf 'session_roots: %s\n' "$(( $(printf '%s' "$SESSION_ROOTS" | tr -cd ':' | wc -c) + 1 ))"
       printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
       printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null || printf none)"
@@ -1338,6 +1366,7 @@ PY
     # night's corpus may be short by an unknown amount — not a failure, but not a
     # clean read either, and the aggregator should not treat the totals as complete.
     printf 'roots_partially_enumerated: %s\n' "$PARTIAL_ROOTS"
+    printf 'roots_unavailable: %s\n' "$ROOTS_UNAVAILABLE"
     # Which harnesses produced this night's corpus. A source that drops to zero
     # on a day the user worked in it is the signal that its ingest broke, and
     # that is invisible without a per-source count.

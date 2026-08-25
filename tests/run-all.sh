@@ -2053,6 +2053,72 @@ test_all_excluded_corpus_says_so(){
   rm -rf "$root"
 }
 
+# ---- A PARTIAL enumeration must not throw away the corpus it did read -------
+# The existing failing-enumerator test uses an adapter that returns NOTHING, so
+# it would pass under the old fatal-on-any-nonzero code too — it could not tell
+# the regression from the fix. This one is the actual case: BSD find exits 1 when
+# one subdirectory is unreadable or vanishes mid-walk WHILE still printing every
+# other match. Treating that as fatal produced no report on a night the old code
+# reported in full, which is worse than the silent zero the check exists to catch.
+test_partial_enumeration_keeps_what_it_read(){
+  echo "# enumeration: an enumerator that returns data AND fails continues, loudly"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  local sess="$root/projects/proj-a/a.jsonl"
+  local ad="$root/adapters"; mkdir -p "$ad/claude"
+  printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
+  # Emits one real NUL-delimited path, then exits nonzero — exactly find's shape.
+  { printf '#!/bin/bash\n'
+    printf 'case "${1:-}" in\n'
+    printf '  enumerate) printf "%%s\\0" "%s"; exit 1 ;;\n' "$sess"
+    printf '  project) printf "/tmp/proj-a" ;;\n'
+    printf '  memory-root) cd "$(dirname "$2")/../.." 2>/dev/null && pwd -P ;;\n'
+    printf '  normalize|slim) cp "$2" "$3" ;;\n'
+    printf '  stats) "%s/bin/session-stats.sh" "$2" "$3" ;;\n' "$REPO"
+    printf '  is-self) exit 1 ;;\n'
+    printf '  *) exit 2 ;;\n'
+    printf 'esac\n'
+  } > "$ad/claude/adapter.sh"
+  chmod +x "$ad/claude/adapter.sh"
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  local d; d=$(fdir "$root")
+  assert_eq "$rc" "0" "the run completes despite the enumerator failing"
+  assert_grep "$root/run.out" 'INCOMPLETE' "the log warns the corpus may be short"
+  assert_grep "$d/run-stats.txt" 'roots_partially_enumerated: 1' "the partial walk is counted"
+  assert_grep "$d/sessions.txt.raw" 'a.jsonl' "the path it DID return was kept"
+  assert_nonempty "$root/dreams/$DATE.md" "a report is still produced"
+  rm -rf "$root"
+}
+
+# ---- Every configured root unreachable is a failure, not a quiet night ------
+# scan_roots warned and skipped a non-directory root, so a broken SESSION_ROOTS
+# or a vanished store produced RAW=0 with every shortfall counter at 0 and a
+# stub saying no files were modified. A fresh host with NO roots configured is a
+# different thing and must stay legitimate.
+test_all_roots_unavailable_fails(){
+  echo "# roots: all configured roots unreachable fails rather than reporting empty"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  SESSION_ROOTS="$root/does-not-exist-a:$root/does-not-exist-b" \
+    AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  assert_eq "$rc" "1" "the run fails when no configured root is reachable"
+  assert_grep "$root/run.out" 'all .* configured session root' "the log names the cause"
+  assert_no_file "$root/dreams/$DATE.md" "no empty-night report is written"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2067,6 +2133,8 @@ test_preflight_stops_a_run_missing_a_dependency
 test_install_deploys_the_adapter_runtime
 test_unrepresentable_characters_are_refused
 test_failing_enumerator_aborts_the_run
+test_partial_enumeration_keeps_what_it_read
+test_all_roots_unavailable_fails
 test_all_excluded_corpus_says_so
 
 echo
