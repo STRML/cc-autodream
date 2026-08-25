@@ -85,6 +85,35 @@ else
   ok "no /bin/bash to test the collation behaviour against; skipped"
 fi
 
+echo "# lib-project: session_hash ITSELF rejects a non-lowercase-hex digest"
+# The collation check above tests a hard-coded pattern, not the function. A
+# regression putting [0-9a-f] back into session_hash would sail past it, so this
+# drives the FUNCTION through a shasum whose digest contains uppercase.
+#
+# The digest starts ABCDE and deliberately not ABCDEF. Under the en_US.UTF-8
+# collation the order runs ...eEfFgG..., so F sorts AFTER f and falls outside
+# a-f while A through E fall inside. A digest beginning ABCDEF is therefore
+# rejected by the range form too — for the wrong reason — and the test would pass
+# against the very regression it exists to catch. Verified character by
+# character on this host.
+upstub=$(mktemp -d "${TMPDIR:-/tmp}/hexstub.XXXXXX")
+printf '%s\n' '#!/bin/bash' 'cat >/dev/null 2>&1' 'echo "ABCDE0123456789abcdef0123456789abcdef012  -"' > "$upstub/shasum"
+chmod +x "$upstub/shasum"
+if PATH="$upstub:$PATH" session_hash "/x" >/dev/null 2>&1; then
+  no "session_hash must reject an uppercase digest"
+else
+  ok "session_hash rejects an uppercase digest"
+fi
+assert_eq "$(PATH="$upstub:$PATH" session_hash "/x" 2>/dev/null)" "" "and prints nothing"
+# A short digest must fail too: 12 characters is the contract, not a maximum.
+printf '%s\n' '#!/bin/bash' 'cat >/dev/null 2>&1' 'echo "abc  -"' > "$upstub/shasum"
+if PATH="$upstub:$PATH" session_hash "/x" >/dev/null 2>&1; then
+  no "session_hash must reject a short digest"
+else
+  ok "session_hash rejects a short digest"
+fi
+rm -rf "$upstub"
+
 echo "# lib-project: a shasum that fails at runtime yields no hash, not an empty one"
 stub=$(mktemp -d "${TMPDIR:-/tmp}/hashstub.XXXXXX")
 printf '#!/bin/bash\nexit 3\n' > "$stub/shasum"; chmod +x "$stub/shasum"
