@@ -1201,3 +1201,60 @@ Three further plans follow, each producing working software on its own:
 - **Spec coverage for this plan's slice:** canonical project identity (Task 1), preflight (Task 2), manifest JSON and identity containment (Task 3), the claude adapter and `facts.md` (Task 4), NUL transport and newline rejection (Task 5), source sidecar plus duplicate and collision detection (Task 6), fixture adapter (Task 7), wiring (Task 8). The spec's L2, pin, GC and rename sections are explicitly deferred to Plans 2–4.
 - **Assertion arithmetic:** 283 baseline, +3 (Task 5), +5 (Task 6), +2 (Task 8) = 293 in `run-all.sh`, plus four standalone suites (`lib-project`, `preflight`, `adapters`, `adapter-claude`, `adapter-contract`) run separately.
 - **Known gap carried into Plan 2:** `adapter_run` does not yet pass a per-adapter engine or model; nothing in this plan needs it, because the claude adapter's L1 invocation still goes through the existing `run.sh` path. Plan 2 introduces it when a second engine exists.
+
+---
+
+## As built — deviations from the plan above
+
+Recorded rather than silently absorbed, because the plan is committed and a
+future reader will otherwise trust it over the code.
+
+1. **Tasks 6 and 8 were merged.** The source sidecar can only be built once
+   enumeration knows which adapter found which session, so building it first
+   from a union list would have been work immediately rewritten.
+
+2. **`stats` takes `<in> <out>`, not `<in>` printing to stdout.** The plan
+   invented a signature; `bin/session-stats.sh` already takes two arguments and
+   writes a sidecar file. The contract follows the existing script.
+
+3. **`memory-root` walks up to the `projects` directory** rather than taking a
+   fixed number of `..` hops. A subagent transcript sits two levels deeper at
+   `projects/<bucket>/<session>/subagents/agent-*.jsonl`, and CLAUDE.md is
+   explicit that those are legitimate sessions to triage. The plan's fixed hop
+   count resolved them to the wrong root, silently.
+
+4. **`adapter_roots` must newline-terminate every line.** `while read` drops a
+   final unterminated line, so a `printf '%s'` skipped the only root on a
+   single-root host. Enumeration then found nothing and reported it as a quiet
+   zero — 155 assertions failed at once and the visible symptom was an artifact
+   named `da39a3ee5e6b`, the sha1 of the empty string. Worth naming because the
+   failure mode is a plausible-looking zero rather than an error.
+
+5. **The contract test runs against BOTH adapters**, not just the fixture. Same
+   assertions, two harnesses. A contract exercised only against the adapter it
+   was written beside is a description of that adapter.
+
+6. **`preflight.sh` gained `AUTODREAM_PREFLIGHT_FORCE_MISSING`.** Emptying
+   `PATH` to hide one dependency also hides bash's own helpers, so the suite
+   could not otherwise exercise a single missing tool. Test-only, unset in every
+   real run.
+
+7. **Enumeration falls back to the inline `find` when `adapters/` is absent.**
+   The live install symlinks `~/.claude/autodream/*.sh` straight at the working
+   tree, so a tree mid-upgrade must degrade rather than lose a night.
+
+8. **The suite baseline was 283, not 279 or 297.** Both earlier figures were
+   measured on the wrong branch. Final count after this plan: **294**.
+
+## Verification actually performed
+
+- `tests/run-all.sh`: **294 passed, 0 failed** (283 baseline + 3 + 8).
+- Standalone suites: `lib-project` 8/8, `preflight` 11/11, `adapters` 17/17,
+  `adapter-claude` 19/19, `adapter-contract` 39/39 across two adapters.
+- `shellcheck --severity=warning bin/*.sh adapters/*/*.sh` and
+  `--severity=error tests/*.sh` clean.
+- The newline test was confirmed genuinely red against `HEAD` before the fix:
+  `got [3] want [1]`, one bad path becoming two phantom sessions.
+- Real-corpus enumeration for 2026-08-21 across every configured root: 63
+  sessions through the old inline `find` and 63 through the claude adapter,
+  byte-identical.
