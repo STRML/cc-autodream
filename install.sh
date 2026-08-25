@@ -40,8 +40,23 @@ link() {
     echo "  WARNING: skipping $dst — source missing: $src" >&2
     return 0
   fi
+  # A real DIRECTORY at $dst is the case this guard used to miss, and adapters/
+  # is the first directory this script links. Without it `ln -s` silently creates
+  # $dst/<basename> — a nested adapters/adapters — while printing the same
+  # success line, after which the loader finds an empty directory, rejects the
+  # nested link on containment, and every nightly run fails.
   if [ -L "$dst" ] || [ -f "$dst" ]; then
     rm -f "$dst"
+  elif [ -d "$dst" ]; then
+    if [ -n "$(ls -A "$dst" 2>/dev/null)" ]; then
+      echo "  WARNING: $dst is a non-empty real directory; not replacing it with a symlink" >&2
+      echo "           move it aside and re-run, or the installed tree will be stale" >&2
+      return 0
+    fi
+    rmdir "$dst" 2>/dev/null || {
+      echo "  WARNING: could not remove existing directory $dst; skipping" >&2
+      return 0
+    }
   fi
   ln -s "$src" "$dst"
   echo "  $dst -> $src"
@@ -75,6 +90,11 @@ link "$REPO_DIR/prompts/PROMPT.md"      "$TARGET/PROMPT.md"
 link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 
 chmod +x "$REPO_DIR/bin/"*.sh
+# The adapters too. _adapter_ok requires -x on adapter.sh, and the loader treats a
+# non-executable adapter as a REFUSAL rather than as "adapters absent" — so a
+# distribution path that loses the exec bit (a zip, a restrictive umask) turns
+# into a hard FATAL nightly with no report instead of a degraded run.
+chmod +x "$REPO_DIR/adapters/"*/adapter.sh 2>/dev/null || true
 
 # --------------------------------------------------- session roots --
 # autodream scans every $HOME/.claude*/projects dir that has a session store. At

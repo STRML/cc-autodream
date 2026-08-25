@@ -322,6 +322,7 @@ write_unindexed_flag() {
 NL=$'\n'            # for the newline-in-path check below
 TAB=$'\t'           # ditto; the L1 xargs -I fan-out turns a tab into a space
 REJECTED_PATHS=0    # session paths a line-based sessions.txt cannot represent
+PARTIAL_ROOTS=0     # roots whose enumerator failed but still returned data
 DUPLICATE_PATHS=0   # one path claimed by more than one adapter
 HASH_COLLISIONS=0   # two different paths truncating to one artifact hash
 SESSIONS_BY_SOURCE=none
@@ -425,10 +426,10 @@ scan_one_adapter() { # $1=adapter name
     fi
     # NUL transport for the fan-out, so a path carrying a space, a tab or a glob
     # character survives intact. It does NOT save a path carrying a newline:
-    # sessions.txt is line-delimited and stays that way, because run.sh:468 and
-    # run.sh:540 key each artifact by sha1 of the whole line, oversized-gate.sh
-    # recomputes that same hash from the file, and every archived findings dir
-    # depends on the shape. Such a path is currently written as two lines and
+    # sessions.txt is line-delimited and stays that way, because the hash
+    # assignments in l1_missing_count() and dispatch_l1() key each artifact by
+    # sha1 of the whole line, oversized-gate.sh recomputes that same hash from
+    # the file, and every archived findings dir depends on the shape. Such a path is currently written as two lines and
     # the runner then invents a session that does not exist, so it is rejected
     # here — before either representation is built — rather than transported.
     # Stage enumeration to a file and CHECK its status. Reading the adapter
@@ -440,9 +441,26 @@ scan_one_adapter() { # $1=adapter name
     enumerate_for "$src" "$r" > "$nulfile"
     status=$?
     if [ "$status" -ne 0 ]; then
-      log "FATAL: enumeration failed for adapter '$src' at root $r (exit $status); refusing to report over a corpus that was never read"
-      rm -f "$nulfile"
-      return 1
+      # A nonzero status does NOT mean nothing was read. BSD find exits 1 when a
+      # single subdirectory is unreadable or vanishes mid-walk while still
+      # printing every other match — verified: 3 files, one locked directory,
+      # exit 1, two paths printed. Treating that as fatal threw away a usable
+      # corpus and produced NO report on a night that previously produced a full
+      # one, which is worse than the silent-zero this check exists to catch.
+      #
+      # So the distinction is output, not status. Nothing read AND a failure is a
+      # real enumeration failure and stops the run. Something read with a failure
+      # is a partial walk: carry on with what was returned and say so loudly, so
+      # a shrinking corpus is visible in the log and the counter rather than
+      # being mistaken for a quiet night.
+      if [ -s "$nulfile" ]; then
+        PARTIAL_ROOTS=$((PARTIAL_ROOTS + 1))
+        log "WARNING: enumeration for adapter '$src' at root $r exited $status but returned data; continuing with a possibly INCOMPLETE corpus for this root"
+      else
+        log "FATAL: enumeration failed for adapter '$src' at root $r (exit $status) and returned nothing; refusing to report over a corpus that was never read"
+        rm -f "$nulfile"
+        return 1
+      fi
     fi
     while IFS= read -r -d '' sp; do
       # Reject every character the downstream artifacts cannot carry. Verified on
@@ -503,10 +521,10 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
 }
 
 # Source provenance, keyed by the artifact hash rather than tagged into
-# sessions.txt. That file stays one bare path per line because run.sh:468 and
-# run.sh:540 key each artifact by sha1 of the WHOLE line, oversized-gate.sh
-# recomputes the same hash from it, and every archived findings dir depends on
-# the shape. Adding a field would silently invalidate all of them.
+# sessions.txt. That file stays one bare path per line because the hash
+# assignments in l1_missing_count() and dispatch_l1() key each artifact by sha1
+# of the WHOLE line, oversized-gate.sh recomputes the same hash from it, and
+# every archived findings dir depends on the shape. Adding a field would silently invalidate all of them.
 #
 # The hash formula is deliberately NOT changed to include the source either, for
 # the same reason. Instead the two ways two adapters can land on one artifact are
@@ -562,8 +580,12 @@ build_source_sidecar() {
     grep -vxF -f "$drop" "$SESSIONS_LIST.raw" > "$SESSIONS_LIST.raw.tmp" 2>/dev/null || :
     mv -f "$SESSIONS_LIST.raw.tmp" "$SESSIONS_LIST.raw" 2>/dev/null || :
     RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
-    # Their provenance rows go too, so the sidecar never names a session that was
-    # never triaged.
+    # Their provenance rows go too. Note the narrower claim: this removes rows
+    # for COLLISION drops only. build_source_sidecar runs before the self-prune
+    # and the empty-session filter, so the sidecar still carries rows for worker
+    # transcripts and 0-turn shells that are later excluded. Nothing consumes it
+    # yet; the first consumer that joins it against <hash>.json must expect
+    # hashes with no findings record.
     while IFS= read -r sp; do
       [ -n "$sp" ] || continue
       h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
@@ -1065,7 +1087,11 @@ No sessions were triaged on this date.
 $( if [ "$RAW" -eq 0 ] && [ "$refused" -eq 0 ]; then
      printf 'No session files were modified.'
    else
-     printf '%s session file(s) were modified but none was triaged: %s autodream-own, %s with no substantive turns, %s with an unrepresentable path, and %s hash-collision event(s) each dropping two or more paths. See run-stats.txt — this is not an empty night.' \
+     # Refused paths never reach sessions.txt.raw, so they are NOT part of RAW.
+     # Folding them into "N session file(s) were modified" produced sentences
+     # like "0 session file(s) were modified ... 3 with an unrepresentable path".
+     # The two are counted separately because they are separate facts.
+     printf 'Nothing was triaged. %s session file(s) were enumerated (%s autodream-own, %s with no substantive turns); a further %s path(s) were refused before enumeration, and %s hash-collision event(s) each dropped two or more paths. See run-stats.txt — this is not an empty night.' \
        "$RAW" "$EXCLUDED" "$SKIPPED_EMPTY" "$REJECTED_PATHS" "$HASH_COLLISIONS"
    fi )
 
@@ -1288,6 +1314,10 @@ PY
     # transcript exists that no report will ever mention, which is exactly the
     # kind of silent shortfall this file exists to make visible.
     printf 'sessions_rejected_path: %s\n' "$REJECTED_PATHS"
+    # Roots whose enumerator errored yet still returned paths. Nonzero means this
+    # night's corpus may be short by an unknown amount — not a failure, but not a
+    # clean read either, and the aggregator should not treat the totals as complete.
+    printf 'roots_partially_enumerated: %s\n' "$PARTIAL_ROOTS"
     # Which harnesses produced this night's corpus. A source that drops to zero
     # on a day the user worked in it is the signal that its ingest broke, and
     # that is invisible without a per-source count.

@@ -1848,8 +1848,8 @@ test_rootprobe_empty_home(){
 }
 
 # ---- Enumeration transport: a path a line-based artifact cannot hold ----------
-# sessions.txt is line-delimited and STAYS that way: bin/run.sh:468 and :540 key
-# each artifact by sha1 of the whole line, bin/oversized-gate.sh:73 recomputes
+# sessions.txt is line-delimited and STAYS that way: the hash assignment in l1_missing_count() and :540 key
+# each artifact by sha1 of the whole line, oversized-gate.sh's hash recomputation recomputes
 # that same hash from the file, and every archived findings dir depends on it.
 # So a path containing a newline cannot be represented, and today it is worse
 # than unrepresentable — `find` writes it as two lines and the runner invents a
@@ -1906,7 +1906,7 @@ test_artifact_hash_contract_is_unchanged(){
   h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
   assert_file "$f/$h.json" "the findings record is keyed by sha1 of the bare path"
   # A tab in sessions.txt would mean the line stopped being a bare path, which is
-  # the change that breaks oversized-gate.sh:73 and every archived dir.
+  # the change that breaks oversized-gate.sh's hash recomputation and every archived dir.
   assert_nogrep "$f/sessions.txt" '	' "sessions.txt carries no tab-delimited fields"
   rm -rf "$root"
 }
@@ -1933,7 +1933,7 @@ test_preflight_stops_a_run_missing_a_dependency(){
 # ships broken to the only place that matters and reports success, which is the
 # exact failure shape this repo already has a memory note about.
 test_install_deploys_the_adapter_runtime(){
-  # SIDE EFFECT, deliberate and pre-existing: install.sh:77 runs
+  # SIDE EFFECT, deliberate and pre-existing: install.sh's chmod +x step runs
   # `chmod +x "$REPO_DIR/bin/"*.sh`, so this test makes every bin script
   # executable in the working tree. That is the repo's own convention, but it
   # means a `git stash` taken across a suite run can refuse to pop on a bare

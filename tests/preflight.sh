@@ -34,7 +34,19 @@ out=$(PATH="$empty" "$PF" --l2-bin bash 2>&1); rc=$?
 assert_eq "$rc" "1" "exits 1 when dependencies are missing"
 has "jq"       "$out" "names jq"
 has "shasum"   "$out" "names shasum"
-has "python3"  "$out" "names python3"
+has "python3"  "$out" "mentions python3"
+
+echo "# preflight: python3 alone is a DEGRADED warning, never a hard stop"
+# run.sh:1248 already skips project-field normalisation gracefully without it.
+# Making this fatal would take a host whose python3 is only a pyenv shim from a
+# slightly-worse report to no report at all, every night.
+if AUTODREAM_PREFLIGHT_FORCE_MISSING=python3 "$PF" --l2-bin bash >/dev/null 2>&1; then
+  ok "a missing python3 alone still exits 0"
+else
+  no "a missing python3 alone still exits 0"
+fi
+out3=$(AUTODREAM_PREFLIGHT_FORCE_MISSING=python3 "$PF" --l2-bin bash 2>&1)
+case "$out3" in *MISSING*python3*) no "python3 is not reported as MISSING" ;; *) ok "python3 is not reported as MISSING" ;; esac
 has "realpath" "$out" "names realpath"
 
 echo "# preflight: the reason is carried, not just the name"

@@ -108,6 +108,26 @@ run_contract(){ # $1=adapter name
     assert_eq "$mr" "" "[$name] writes_memory:false, so memory-root is empty"
   fi
 
+  # --- enumerate: the only subcommand production actually calls, and the one
+  #     with the subtlest contract (NUL delimiting, and a status the caller now
+  #     depends on). It was the untested surface while being the riskiest.
+  # Pin the session to a fixed day and ask for exactly that day. A wide range
+  # like 1970..2999 is not portable: BSD find fails to parse -newermt at that
+  # far end, errors out, and the assertions below would have been measuring the
+  # date parser rather than the contract.
+  local root_dir n
+  root_dir=$(dirname "$S")
+  touch -t 202001021200 "$S"
+  n=$("$A" enumerate "$root_dir" 2020-01-02 2020-01-03 2>/dev/null | tr -cd '\0' | wc -c | tr -d ' ')
+  if [ "${n:-0}" -ge 1 ]; then ok "[$name] enumerate emits NUL-delimited output"
+  else no "[$name] enumerate emits NUL-delimited output (got $n NULs)"; fi
+  if "$A" enumerate "$root_dir" 2020-01-02 2020-01-03 >/dev/null 2>&1; then
+    ok "[$name] enumerate exits 0 on a readable root"
+  else no "[$name] enumerate exits 0 on a readable root"; fi
+  if "$A" enumerate "$root_dir" 2020-01-02 2020-01-03 2>/dev/null | tr '\0' '\n' | grep -qxF "$S"; then
+    ok "[$name] enumerate returns the session path verbatim"
+  else no "[$name] enumerate returns the session path verbatim"; fi
+
   # --- unknown subcommand ---
   "$A" not-a-subcommand >/dev/null 2>&1
   assert_eq "$?" "2" "[$name] an unknown subcommand exits 2"

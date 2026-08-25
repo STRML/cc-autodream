@@ -5,8 +5,8 @@
 # None of these are new assumptions — run.sh already depends on all four:
 #
 #   jq        every findings record, sidecar and manifest is parsed with it
-#   shasum    bin/run.sh:468 and bin/run.sh:540 key each artifact by sha1
-#   python3   bin/run.sh:924 normalises project identity
+#   shasum    the hash assignments in l1_missing_count() and dispatch_l1() key each artifact by sha1
+#   python3   the project-field normalisation step normalises project identity
 #   realpath  NEW: adapter containment and cwd canonicalisation
 #
 # The `shasum` case is the one worth stating out loud, because it is the only
@@ -54,7 +54,14 @@ need() { # $1=command $2=what its absence costs
 
 need jq       "every findings record, sidecar and adapter manifest is parsed with it"
 need shasum   "the artifact key is sha1 of the session path; without it the hash is empty and every session collides on one filename, silently"
-need python3  "project normalisation and the stats sidecars"
+# python3 is a WARNING, not a hard stop. the project-field normalisation step already degrades
+# gracefully without it ("skipping project-field normalization (L2 grouping may
+# show dupes)"), and making preflight fatal here contradicted that: on a host
+# where python3 is only a pyenv shim absent from the launchd PATH, the nightly
+# would go from a slightly-worse report to no report at all, every night.
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'DEGRADED: python3 — project-field normalisation will be skipped; L2 grouping may show duplicate projects\n' >&2
+fi
 need realpath "adapter directory containment and cwd canonicalisation; without it containment is weaker, which is the failure this check exists to prevent"
 
 if [ -n "$L2_BIN" ] && ! command -v "$L2_BIN" >/dev/null 2>&1; then
