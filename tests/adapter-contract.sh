@@ -72,7 +72,12 @@ run_contract(){ # $1=adapter name
   # `<out>.tmp` matches nothing that is ever created and passes against an
   # implementation leaking a temp on every call. `set --` then `-e "$1"` is the
   # bash-3.2-safe way to ask whether a glob matched anything.
-  set -- "$tmp"/n.out.tmp.*
+  #
+  # `.tmp*`, NOT `.tmp.*`. The first correction here swapped one blind spot for
+  # another: a glob anchored on `.tmp.` stops seeing an adapter that leaks the
+  # bare `<out>.tmp`, which is the name the contract prose uses and therefore
+  # the likeliest one a new adapter picks.
+  set -- "$tmp"/n.out.tmp*
   if [ -e "$1" ]; then no "[$name] normalize left no temp (found $(basename "$1"))"; else ok "[$name] normalize left no temp"; fi
   if "$A" normalize "$tmp/nope" "$tmp/bad.out" 2>/dev/null; then
     no "[$name] normalize on bad input exits nonzero"
@@ -85,11 +90,16 @@ run_contract(){ # $1=adapter name
   if jq -e '.transcript_bytes | numbers' "$tmp/s.stats.json" >/dev/null 2>&1; then
     ok "[$name] the sidecar carries a numeric transcript_bytes"
   else no "[$name] the sidecar carries a numeric transcript_bytes"; fi
+  # stats writes a temp exactly as normalize and slim do, and was the only one of
+  # the three with no cleanup assertion. A valid sidecar plus a leaked temp on
+  # every session passed the entire contract.
+  set -- "$tmp"/s.stats.json.tmp*
+  if [ -e "$1" ]; then no "[$name] stats left no temp (found $(basename "$1"))"; else ok "[$name] stats left no temp"; fi
 
   # --- slim ---
   if "$A" slim "$S" "$tmp/sl.out" 2>/dev/null; then ok "[$name] slim exits 0"; else no "[$name] slim exits 0"; fi
   if [ -s "$tmp/sl.out" ]; then ok "[$name] slim wrote output"; else no "[$name] slim wrote output"; fi
-  set -- "$tmp"/sl.out.tmp.*
+  set -- "$tmp"/sl.out.tmp*
   if [ -e "$1" ]; then no "[$name] slim left no temp (found $(basename "$1"))"; else ok "[$name] slim left no temp"; fi
 
   # --- a directory destination is refused, not written into ---

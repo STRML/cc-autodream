@@ -52,7 +52,7 @@ if cmp -s "$S" "$out"; then ok "normalize copied the file verbatim"; else no "no
 # implementation. This was the third copy of that same mistake — the two in
 # adapter-contract.sh were fixed a commit earlier and this one was missed,
 # because it was the assertion nobody had reason to re-read.
-set -- "$out".tmp.*
+set -- "$out".tmp*
 if [ -e "$1" ]; then no "no temp left behind (found $(basename "$1"))"; else ok "no temp left behind"; fi
 
 echo "# claude adapter: a failed normalize leaves no partial output"
@@ -78,6 +78,12 @@ if "$A" stats "$S" "$tmp/s1.stats.json" 2>/dev/null; then ok "stats exits 0"; el
 if jq -e '.transcript_bytes | numbers' "$tmp/s1.stats.json" >/dev/null 2>&1; then
   ok "the sidecar has a numeric transcript_bytes"
 else no "the sidecar has a numeric transcript_bytes"; fi
+# stats was the one writing subcommand with no cleanup assertion at all, in
+# either suite. normalize and slim each got one; stats writes a temp exactly the
+# same way and nothing looked for it, so it could produce a valid sidecar and
+# leak its temp on every session with the whole suite green.
+set -- "$tmp"/s1.stats.json.tmp*
+if [ -e "$1" ]; then no "stats left no temp (found $(basename "$1"))"; else ok "stats left no temp"; fi
 
 echo "# claude adapter: slim writes a reduced copy"
 if "$A" slim "$S" "$tmp/slim.jsonl" 2>/dev/null; then ok "slim exits 0"; else no "slim exits 0"; fi
@@ -111,7 +117,7 @@ if [ -p "$fifodir/src.jsonl" ]; then
   # test that never opened the window fails instead of reporting success.
   waited=0; saw_tmp=0
   while [ "$waited" -lt 100 ]; do
-    set -- "$fifodir"/out.jsonl.tmp.*
+    set -- "$fifodir"/out.jsonl.tmp*
     if [ -e "$1" ]; then saw_tmp=1; break; fi
     sleep 0.05
     waited=$((waited + 1))
