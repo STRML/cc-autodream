@@ -565,6 +565,34 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
 # the same reason. Instead the two ways two adapters can land on one artifact are
 # detected: the same path claimed twice (a misconfiguration — keep the first),
 # and two DIFFERENT paths truncating to one hash (no sensible winner — skip both).
+# Rewrite a file by filtering it, atomically, with EVERY failure accounted for.
+#
+# This exists because the same three-line pattern was patched site by site across
+# four review rounds and each patch closed one hole and left another: the grep
+# status was swallowed, then checked but the mv was not, then the mv was guarded
+# but its failure was silent. Three copies meant three chances to get it wrong.
+#
+# Contract: on success the file is replaced. On ANY failure the original is left
+# untouched, a reason is logged, and the caller gets a nonzero status so it can
+# decide whether that is survivable. grep exit 1 means "no lines matched", which
+# for a filter is a legitimate empty result, not an error.
+rewrite_filtered() { # $1=file $2=what (for the log) ; remaining args = grep args
+  local file="$1" what="$2"; shift 2
+  local tmp="$file.rw.$$" grc
+  grep "$@" "$file" > "$tmp" 2>/dev/null; grc=$?
+  if [ "$grc" -gt 1 ]; then
+    rm -f "$tmp"
+    log "  WARNING: could not rewrite $what (grep exit $grc); leaving it unchanged"
+    return 1
+  fi
+  if ! mv -f "$tmp" "$file" 2>/dev/null; then
+    rm -f "$tmp"
+    log "  WARNING: could not replace $what (mv failed); leaving it unchanged"
+    return 1
+  fi
+  return 0
+}
+
 build_source_sidecar() {
   local sidecar="$FINDINGS_DIR/sessions-source.txt"
   local seen="$FINDINGS_DIR/.hash-to-path"
@@ -598,22 +626,7 @@ build_source_sidecar() {
         # Rewrite unconditionally. `grep -v` exits 1 when it removes the only line,
         # so a guarded `&& mv` left the stale mapping behind in exactly the
         # single-entry case.
-        # Check grep's OWN status. Swallowing it and then promoting the temp
-        # could install a truncated file when grep failed mid-write; only the mv
-        # was guarded before. grep -v exits 1 on "no lines left", which is a
-        # legitimate empty result, so 0 and 1 are both fine and anything else is
-        # a real failure that must not be promoted.
-        grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null; grc=$?
-        if [ "$grc" -gt 1 ]; then
-          rm -f "$sidecar.tmp"
-          log "  WARNING: could not rewrite the source sidecar (grep exit $grc); leaving the stale row"
-        else
-        # If the replace fails (a full filesystem between the redirect and the
-        # mv), LEAVE the stale row. Truncating the file was the old fallback and
-        # it traded one wrong row for the loss of every row's provenance. The
-        # colliding paths are dropped from the worklist regardless.
-        mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || rm -f "$sidecar.tmp"
-        fi
+        rewrite_filtered "$sidecar" "the source sidecar" -v "^$h	" || :
       fi
       continue
     fi
@@ -626,27 +639,21 @@ build_source_sidecar() {
   # Actually remove the colliding sessions from the worklist. Without this the
   # detection is decorative.
   if [ -s "$drop" ]; then
-    # Same rule as the sidecar rewrite above: grep exit 0 or 1 is a legitimate
-    # result, anything higher is a real failure whose partial output must not be
-    # promoted over the worklist.
-    grep -vxF -f "$drop" "$SESSIONS_LIST.raw" > "$SESSIONS_LIST.raw.tmp" 2>/dev/null; grc=$?
-    if [ "$grc" -le 1 ]; then
-      mv -f "$SESSIONS_LIST.raw.tmp" "$SESSIONS_LIST.raw" 2>/dev/null || rm -f "$SESSIONS_LIST.raw.tmp"
-      # Confirm the drop actually happened. "Leave it intact" is the wrong
-      # fallback here: intact means BOTH colliding paths are still in the
-      # worklist, so two workers target one <hash>.json and silently overwrite
-      # each other — precisely what this branch exists to prevent. Preserving the
-      # file is right; continuing the run over it is not.
-      if grep -qxF -f "$drop" "$SESSIONS_LIST.raw" 2>/dev/null; then
-        log "FATAL: collided paths could not be removed from the worklist; refusing to dispatch two sessions onto one artifact"
-        rm -f "$drop"
-        return 1
-      fi
-    else
-      rm -f "$SESSIONS_LIST.raw.tmp"
-      log "FATAL: could not rewrite the worklist to drop collided paths (grep exit $grc); refusing to dispatch two sessions onto one artifact"
-      rm -f "$drop"
-      return 1
+    # The worklist is the one that must FAIL CLOSED. Leaving it unchanged means
+    # both colliding paths are still in it, so two workers target one <hash>.json
+    # and overwrite each other — exactly what this branch exists to prevent.
+    if ! rewrite_filtered "$SESSIONS_LIST.raw" "the worklist" -vxF -f "$drop"; then
+      log "FATAL: refusing to dispatch two sessions onto one artifact"
+      rm -f "$drop"; return 1
+    fi
+    # Verify the drop rather than trusting an exit code. grep -q returns 1 for
+    # "not found", which is what we want, but anything ABOVE 1 is an I/O error
+    # and would otherwise take the same success path — failing open on the one
+    # check that exists to fail closed.
+    grep -qxF -f "$drop" "$SESSIONS_LIST.raw" 2>/dev/null; local vrc=$?
+    if [ "$vrc" -ne 1 ]; then
+      log "FATAL: could not confirm the collided paths are gone from the worklist (grep exit $vrc); refusing to dispatch two sessions onto one artifact"
+      rm -f "$drop"; return 1
     fi
     RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
     # Their provenance rows go too. Note the narrower claim: this removes rows
@@ -658,15 +665,10 @@ build_source_sidecar() {
     while IFS= read -r sp; do
       [ -n "$sp" ] || continue
       h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
-      grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null; grc=$?
-      if [ "$grc" -le 1 ]; then
-        mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || rm -f "$sidecar.tmp"
-      else
-        rm -f "$sidecar.tmp"
-        # Say so. A stale row left here is still counted by SESSIONS_BY_SOURCE,
-        # which would overstate the source totals with nothing to explain it.
-        log "  WARNING: could not drop the provenance row for $h (grep exit $grc); source counts may be overstated by one"
-      fi
+      # Survivable: a stale row overstates sessions_by_source by one and the
+      # helper has already said so. The worklist, which is not survivable, was
+      # handled above.
+      rewrite_filtered "$sidecar" "the provenance row for $h" -v "^$h	" || :
     done < "$drop"
   fi
   rm -f "$drop"
