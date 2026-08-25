@@ -2179,9 +2179,18 @@ test_forced_hash_collision_drops_both(){
   local root; root=$(collision_sandbox)
   mk_session "$root" one
   mk_session "$root" two
-  run_dream_collision "$root" || true
+  run_dream_collision "$root"
+  local rc=$?
   local d; d=$(fdir "$root")
+  assert_eq "$rc" "0" "a handled collision is not a run failure"
   assert_grep "$root/run.out" 'COLLISION' "the collision is detected and logged"
+  # The design requires this explicitly: neither session may reach the artifact
+  # they would have shared. Asserting the counters without asserting this would
+  # have let the drop be bookkeeping only.
+  assert_no_file "$d/aaaaaaaaaaaa.json" "the shared artifact is never written"
+  assert_no_file "$d/aaaaaaaaaaaa.stats.json" "nor its stats sidecar"
+  assert_grep "$d/run-stats.txt" 'sessions_found_raw: 2' "RAW still reports what was ENUMERATED"
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_to_collision: 2' "both dropped paths are counted"
   assert_grep "$d/run-stats.txt" 'sessions_hash_collision: 1' "the collision is counted"
   # BOTH paths gone. This is the assertion that would have caught the branch
   # logging "skipping both" while skipping neither.
@@ -2214,6 +2223,29 @@ test_collision_worklist_failure_aborts(){
   rm -rf "$root"
 }
 
+test_collision_membership_probe_failure_aborts(){
+  echo "# collision: a failing membership probe fails closed, it does not skip the row"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # Fail ONLY the -qxF membership probe. The previous fixture failed the -vxF
+  # rewrite instead, so reverting the probe to `|| continue` would have left the
+  # whole suite green — a fail-open on the way IN to the check that fails closed
+  # on the way out.
+  { printf '#!/bin/bash\n'
+    printf 'for a in "$@"; do case "$a" in -qxF) exit 2 ;; esac; done\n'
+    printf 'exec /usr/bin/grep "$@"\n'
+  } > "$root/home/.local/bin/grep"
+  chmod +x "$root/home/.local/bin/grep"
+  run_dream_collision "$root"
+  local rc=$?
+  assert_eq "$rc" "1" "the run fails closed when the membership probe errors"
+  assert_grep "$root/run.out" 'refusing to build provenance over an unreadable list' \
+    "the log names the unreadable worklist"
+  assert_no_file "$root/dreams/$DATE.md" "no report is produced"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2233,6 +2265,7 @@ test_all_roots_unavailable_fails
 test_fresh_host_with_no_store_is_not_a_failure
 test_forced_hash_collision_drops_both
 test_collision_worklist_failure_aborts
+test_collision_membership_probe_failure_aborts
 test_all_excluded_corpus_says_so
 
 echo

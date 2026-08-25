@@ -335,6 +335,8 @@ ROOTS_CONFIGURED=0  # roots we were told to scan
 ROOTS_SCANNED=0     # roots that existed and were walked
 ROOTS_UNAVAILABLE=0 # roots that were configured but are not directories
 SESSION_ROOTS_ARE_FALLBACK=0  # 1 when SESSION_ROOTS is the bare default nobody configured
+COLLIDED_DROPPED=0  # paths removed from the worklist by collision handling
+SIDECAR_STALE_ROWS=0  # provenance rows that could not be rewritten; sessions_by_source is high by this much
 DUPLICATE_PATHS=0   # one path claimed by more than one adapter
 HASH_COLLISIONS=0   # two different paths truncating to one artifact hash
 SESSIONS_BY_SOURCE=none
@@ -637,7 +639,12 @@ build_source_sidecar() {
         # Rewrite unconditionally. `grep -v` exits 1 when it removes the only line,
         # so a guarded `&& mv` left the stale mapping behind in exactly the
         # single-entry case.
-        rewrite_filtered "$sidecar" "the source sidecar" -v "^$h	" || :
+        # DELIBERATELY survivable. A stale provenance row overstates
+        # sessions_by_source by one and the helper has already logged why; the
+        # worklist, which is not survivable, is handled below. Counted so the
+        # degraded artifact is visible rather than merely tolerated.
+        rewrite_filtered "$sidecar" "the source sidecar" -v "^$h	" \
+          || SIDECAR_STALE_ROWS=$((SIDECAR_STALE_ROWS + 1))
       fi
       continue
     fi
@@ -666,7 +673,11 @@ build_source_sidecar() {
       log "FATAL: could not confirm the collided paths are gone from the worklist (grep exit $vrc); refusing to dispatch two sessions onto one artifact"
       rm -f "$drop"; return 1
     fi
-    RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
+    # RAW is the ENUMERATED count and stays that way. Overwriting it with the
+    # post-drop worklist size made a forced two-session collision report
+    # sessions_found_raw: 0 and "0 session file(s) were enumerated" — telling the
+    # reader nothing was there when two things were, and were dropped for cause.
+    COLLIDED_DROPPED=$(( $(wc -l < "$drop" | tr -d ' ') ))
     # Their provenance rows go too. Note the narrower claim: this removes rows
     # for COLLISION drops only. build_source_sidecar runs before the self-prune
     # and the empty-session filter, so the sidecar still carries rows for worker
@@ -679,7 +690,8 @@ build_source_sidecar() {
       # Survivable: a stale row overstates sessions_by_source by one and the
       # helper has already said so. The worklist, which is not survivable, was
       # handled above.
-      rewrite_filtered "$sidecar" "the provenance row for $h" -v "^$h	" || :
+      rewrite_filtered "$sidecar" "the provenance row for $h" -v "^$h	" \
+        || SIDECAR_STALE_ROWS=$((SIDECAR_STALE_ROWS + 1))
     done < "$drop"
   fi
   rm -f "$drop"
@@ -1165,6 +1177,8 @@ run() {
       printf 'sessions_rejected_path: %s\n' "$REJECTED_PATHS"
       printf 'sessions_duplicate_path: %s\n' "$DUPLICATE_PATHS"
       printf 'sessions_hash_collision: %s\n' "$HASH_COLLISIONS"
+      printf 'sessions_dropped_to_collision: %s\n' "$COLLIDED_DROPPED"
+      printf 'sidecar_stale_rows: %s\n' "$SIDECAR_STALE_ROWS"
       # The shortfall counters belong here most of all: this block exists so a
       # zero-triage night does not read as an empty one, and a partial walk or a
       # regression to single-root scanning is exactly what would explain it.

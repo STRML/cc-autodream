@@ -162,9 +162,13 @@ A tab in the line corrupts the hash in all four and makes the size read fail, wh
 
 Source is carried in a sidecar instead: `findings/<date>/sessions-source.txt`, one `<hash>\t<source>` line per session. The hash stays `sha1(bare path)`, so every existing consumer and every archived dir keeps working untouched.
 
-**Transport and the line-based artifact are two different things, and an earlier draft conflated them.** The in-memory fan-out is NUL-delimited (`find -print0`, `xargs -0`, `read -r -d ''`), which fixes the split at `bin/run.sh:348` and `bin/run.sh:538` where a newline in a path currently becomes two sessions. But `sessions.txt` stays line-based, because `oversized-gate.sh` and every archived findings dir depend on that shape. A line-based file cannot represent a path containing a newline, so NUL transport alone does not save it.
+**Transport and the line-based artifact are two different things, and an earlier draft conflated them.** Enumeration hands paths to the runner NUL-delimited (`find -print0`, `read -r -d ''`), which fixes the split where a newline in a path became two sessions. But `sessions.txt` stays line-based, because `oversized-gate.sh` and every archived findings dir depend on that shape, and the L1 fan-out reads it with `xargs -I {}` rather than `xargs -0`. A line-based file cannot represent a path containing a newline, so NUL transport alone does not save it.
 
-**Only the newline is rejected.** A path containing a newline is dropped at enumeration with `sessions_rejected_path`. Tabs are accepted, and an acceptance fixture pins that: an earlier draft rejected them too, on a rationale left over from the discarded `<source>\t<path>` format. Verified against the actual consumers — `IFS= read -r` performs no word splitting, so a tab survives the read intact; `printf '%s' "$s" | shasum` covers it, so the artifact hash stays distinct; and `sessions-source.txt` is `<hash>\t<source>` and never holds a path, so its own tab separator is never ambiguous. Rejecting a valid path on a rationale that does not hold is a silent data loss dressed as safety.
+**Newline, tab, backslash and quote are all rejected.** A path containing any of them is dropped at enumeration with `sessions_rejected_path`.
+
+An earlier draft of this document accepted tabs, on the reasoning that `IFS= read -r` preserves them and the artifact hash covers them. Both of those are true, and both were the wrong consumers to check. The one that matters is the L1 fan-out, which is `xargs -I {}` over a line-based list — measured on this host: a tab becomes a space, a backslash is deleted, and a quote kills `xargs` outright with `unterminated quote`, taking the whole night's dispatch rather than one session.
+
+So this is a refusal, not a fix: a legal filename is declined because the transport cannot carry it. Making the fan-out NUL-safe would let them be accepted again and is tracked as `STRML/cc-autodream#54`. The fan-out is **not** `xargs -0` today; NUL delimiting applies only to the in-memory enumeration hand-off.
 
 The rejected path is logged with control characters escaped. A newline written raw into the log would forge additional log lines, which is a small thing until the forged line is the one someone reads.
 
@@ -196,7 +200,9 @@ Symlink resolution matters on macOS: Claude records the physical path, so a sess
 
 ## Nightly flow
 
-0. **Preflight.** `bin/preflight.sh` verifies the shared dependencies the runner assumes today — `jq` (`bin/run.sh:360`), `shasum` (`bin/run.sh:468`), `python3` (`bin/run.sh:924`) — plus `realpath`, and the configured L2 engine binary. `realpath` is new and it is security-critical rather than convenient: it resolves adapter directories for containment and canonicalizes `cwd` for project identity. A host that reaches adapter loading without it would fall back to weaker containment, which is the failure the check exists to prevent, so its absence is a hard stop and never a degraded path. A missing `shasum` is the dangerous one: the hash assignment silently yields an empty string and every session targets the same findings filename. Each missing dependency is a named hard failure with its own telemetry key, not a degraded run.
+0. **Preflight.** `bin/preflight.sh` verifies the shared dependencies the runner assumes today — `jq` (`bin/run.sh:360`), `shasum` (`bin/run.sh:468`), `python3` (`bin/run.sh:924`) — plus `realpath`, and the configured L2 engine binary. `realpath` is new and it is security-critical rather than convenient: it resolves adapter directories for containment and canonicalizes `cwd` for project identity. A host that reaches adapter loading without it would fall back to weaker containment, which is the failure the check exists to prevent, so its absence is a hard stop and never a degraded path. A missing `shasum` is the dangerous one: the hash assignment silently yields an empty string and every session targets the same findings filename.
+
+`python3` is a **warning, not a hard failure**, because `run.sh` already degrades gracefully without it — it skips project-field normalisation and says so. Making preflight fatal on it contradicted that, and would have been a nightly-killer on this host specifically: `run.sh` hard-overrides `PATH` to a fixed list, so a `python3` that exists only as a pyenv shim is genuinely unreachable from the nightly, and every run would have stopped rather than producing a slightly-worse report.
 1. `run.sh` resolves enabled adapters from `AUTODREAM_ADAPTERS` (default: every `adapters/*/manifest.json` except `_fixture`), then verifies each adapter's `engine_bin`. An adapter whose engine is absent is disabled with a counter; this is not fatal. The L2 engine check at step 0 is separate and *is* fatal, because without it no report is possible.
 2. Per adapter, `enumerate` produces a session list. The union is written to `sessions.txt` (bare paths) plus `sessions-source.txt` (hash to source), with `sessions.txt.raw` kept pre-filter as today.
 3. Per session: `is-self` filter, then `normalize`, then `stats` sidecar, then the noise gate, then `slim`, then the L1 worker on that adapter's engine and model.
@@ -288,7 +294,8 @@ A fixture asserts that a pin for a session enumerated from a secondary root is G
 
 | Failure | Behavior |
 | --- | --- |
-| a shared dependency is missing (`jq`, `shasum`, `python3`) | hard failure at preflight with a named key; never a degraded run |
+| a hard dependency is missing (`jq`, `shasum`, `realpath`) | hard failure at preflight with a named key; never a degraded run |
+| `python3` is missing | a DEGRADED warning; project-field normalisation is skipped and the run continues |
 | the configured L2 engine binary is absent | hard failure at preflight, before L1 runs |
 | adapter manifest missing or unparseable JSON | skip that adapter, log, continue |
 | adapter `engine_bin` absent | disable that adapter, count, report; not fatal |
