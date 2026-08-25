@@ -1,0 +1,67 @@
+#!/bin/bash
+# A synthetic harness whose only purpose is to prove the adapter contract is a
+# contract rather than a description of what the claude adapter happens to do.
+#
+# Its session format is one JSON object per file with `cwd` and `turns`. That
+# resembles neither real harness deliberately: a fixture shaped like a Claude
+# transcript would pass by accident, and would keep passing if the contract
+# quietly grew a Claude-specific assumption.
+#
+# Excluded from the default adapter set by its leading underscore, so a nightly
+# run never sees it. It declares writes_memory:false, which also makes it the
+# fixture for the no-store routing path.
+set -u
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift
+
+case "$cmd" in
+
+  enumerate) # $1=root ($2/$3 date bounds unused: fixtures are not time-filtered)
+    find "$1" -type f -name '*.fixture' -print0 2>/dev/null
+    ;;
+
+  normalize) # $1=in $2=out
+    [ -r "$1" ] || exit 1
+    jq -e . "$1" >/dev/null 2>&1 || exit 1        # fail closed on malformed input
+    cp "$1" "$2.tmp" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+    mv "$2.tmp" "$2" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+    ;;
+
+  project) # $1=session -> resolved cwd
+    [ -r "$1" ] || exit 1
+    cwd=$(jq -re '.cwd // empty' "$1" 2>/dev/null) || exit 1
+    [ -n "$cwd" ] || exit 1
+    realpath "$cwd" 2>/dev/null || exit 1
+    ;;
+
+  memory-root)
+    # Empty output is legal here and ONLY here, because this adapter declares
+    # writes_memory:false. For a memory-writing adapter an empty root must skip
+    # the session instead, or it would authorise a write against no target.
+    exit 0
+    ;;
+
+  stats) # $1=in $2=out
+    [ -r "$1" ] || exit 1
+    bytes=$(wc -c < "$1" | tr -d ' ')
+    turns=$(jq -re '.turns // 0' "$1" 2>/dev/null) || turns=0
+    printf '{"transcript_bytes":%s,"user_message_count":%s,"tool_call_count":0}\n' \
+      "${bytes:-0}" "${turns:-0}" > "$2.tmp" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+    mv "$2.tmp" "$2" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+    ;;
+
+  slim) # $1=in $2=out — a fixture is already small; the contract is what matters
+    [ -r "$1" ] || exit 1
+    cp "$1" "$2.tmp" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+    mv "$2.tmp" "$2" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+    ;;
+
+  is-self) exit 1 ;;                    # the fixture harness never runs autodream
+  skills-inventory) printf 'fixture-skill\n' ;;
+
+  *)
+    printf '_fixture adapter: unknown subcommand: %s\n' "$cmd" >&2
+    exit 2
+    ;;
+esac
