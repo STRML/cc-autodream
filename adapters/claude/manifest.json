@@ -1,0 +1,16 @@
+{
+  "name": "claude",
+  "session_roots_default": ["$HOME/.claude/projects"],
+  "session_glob": "*.jsonl",
+  "engine_bin": "claude",
+  "engine_flags_l1": [
+    "--print",
+    "--permission-mode", "bypassPermissions",
+    "--no-session-persistence",
+    "--tools", "Read", "Write",
+    "--disable-slash-commands",
+    "--strict-mcp-config"
+  ],
+  "l1_model": "claude-haiku-4-5",
+  "writes_memory": true
+}
