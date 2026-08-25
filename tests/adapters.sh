@@ -63,6 +63,7 @@ assert_eq "$(adapters_list)" "" "a dot-prefixed basename is refused"
 has ".evil" "$(adapters_rejected)" "a dot-prefixed dir is RECORDED as refused, not merely skipped"
 root=$(sandbox); mk_adapter "$root" "Bad" "Bad"; use "$root"
 assert_eq "$(adapters_list)" "" "an uppercase basename is refused"
+has "Bad" "$(adapters_rejected)" "an uppercase dir is RECORDED as refused, not merely skipped"
 
 echo "# adapters: a symlink escaping the adapters root is refused"
 root=$(sandbox); outside=$(sandbox); mk_adapter "$outside" evil evil
@@ -71,10 +72,17 @@ assert_eq "$(adapters_list)" "" "a symlinked adapter dir is refused"
 has "evil" "$(adapters_rejected)" "the containment escape is recorded"
 
 echo "# adapters: an adapter missing its manifest or adapter.sh is refused"
+# Each of these pairs an empty list with the refusal record on purpose. An empty
+# list alone cannot tell "the loader saw this and refused it" from "the glob
+# never matched it" — which is exactly how a malformed `.evil` read as `none`
+# refused for as long as it did. Every rejection case below reaches
+# _adapter_reject in bin/adapters.sh, so every one of them can say so.
 root=$(sandbox); mkdir -p "$root/bare"; use "$root"
 assert_eq "$(adapters_list)" "" "a directory with neither file is refused"
+has "bare" "$(adapters_rejected)" "a dir with neither file is RECORDED as refused"
 root=$(sandbox); mk_adapter "$root" half half; rm "$root/half/adapter.sh"; use "$root"
 assert_eq "$(adapters_list)" "" "a manifest with no adapter.sh is refused"
+has "half" "$(adapters_rejected)" "a manifest with no adapter.sh is RECORDED as refused"
 
 echo "# adapters: underscore-prefixed dirs are excluded from the default set"
 root=$(sandbox); mk_adapter "$root" claude claude; mk_adapter "$root" _fixture _fixture; use "$root"
@@ -99,6 +107,33 @@ printf 'this is not json at all\n' > "$root/claude/manifest.json"
 printf '#!/bin/bash\ntrue\n' > "$root/claude/adapter.sh"; chmod +x "$root/claude/adapter.sh"
 use "$root"
 assert_eq "$(adapters_list)" "" "unparseable JSON is refused"
+has "claude" "$(adapters_rejected)" "unparseable JSON is RECORDED as refused"
+
+echo "# adapters: dispatch validates the name it builds a path from"
+# The header of bin/adapters.sh argues that identity is the directory basename
+# precisely BECAUSE dispatch builds a command path out of it. That argument only
+# holds if the dispatching functions check. Every caller today passes a name that
+# came through adapters_list, so this is not reachable now — it is the guarantee
+# the seam is supposed to make to the third-party adapter that arrives later,
+# and a guarantee nothing enforces is a comment.
+root=$(sandbox); mk_adapter "$root" claude claude; use "$root"
+outside=$(sandbox); mkdir -p "$outside/evil"
+printf '#!/bin/bash\nprintf pwned\n' > "$outside/evil/adapter.sh"; chmod +x "$outside/evil/adapter.sh"
+printf '{"name":"evil","engine_bin":"bash"}\n' > "$outside/evil/manifest.json"
+esc="../$(basename "$outside")/evil"
+if adapter_run "$esc" x >/dev/null 2>&1; then
+  no "adapter_run must refuse a traversing name"
+else
+  ok "adapter_run refuses a traversing name"
+fi
+assert_eq "$(adapter_run "$esc" x 2>/dev/null)" "" "and executes nothing"
+if adapter_manifest_get "$esc" .name >/dev/null 2>&1; then
+  no "adapter_manifest_get must refuse a traversing name"
+else
+  ok "adapter_manifest_get refuses a traversing name"
+fi
+# The valid name still works, so the guard is a check and not a blanket refusal.
+assert_eq "$(adapter_run claude hello)" "ran hello" "a valid name still dispatches"
 
 # shellcheck disable=SC2086
 rm -rf $TMPROOTS

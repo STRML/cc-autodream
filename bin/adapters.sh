@@ -60,6 +60,32 @@ _adapter_reject() { # $1=name
   printf '%s\n' "$1" >> "$log" 2>/dev/null || true
 }
 
+# Safe identifier: lowercase start, then lowercase/digit/underscore/dash only.
+# No separators, so the name cannot walk out of the adapters root on its own.
+#
+# The character sets are ENUMERATED, not ranges. `[a-z]` is collation-dependent:
+# under a UTF-8 locale the order is aAbBcC..., so the range matches uppercase
+# too. That made this check pass on macOS (C collation) and silently accept an
+# uppercase basename on Linux — a containment check that was weaker on the
+# platform CI actually runs. Enumeration has no such ambiguity.
+#
+# Separate from _adapter_ok because the DISPATCHERS need it too. The header
+# above argues that identity is the directory basename because dispatch builds a
+# command path from it; that argument is only true if the functions doing the
+# building check. Every caller today hands them a name that came through
+# adapters_list, so this is defence for the third-party adapter that arrives
+# later rather than a live hole — but an unenforced guarantee is a comment.
+_adapter_name_safe() { # $1=name
+  case "$1" in
+    [abcdefghijklmnopqrstuvwxyz]*) : ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*) return 1 ;;
+  esac
+  return 0
+}
+
 # A directory is a usable adapter iff every one of these holds. Ordered cheapest
 # first, but each is load-bearing rather than defensive: see the header.
 _adapter_ok() { # $1=basename
@@ -71,21 +97,7 @@ _adapter_ok() { # $1=basename
   # it is a deliberate exclusion rather than a refusal worth counting.
   case "$1" in _*) return 1 ;; esac
 
-  # Safe identifier: lowercase start, then lowercase/digit/underscore/dash only.
-  # No separators, so the name cannot walk out of the adapters root on its own.
-  #
-  # The character sets are ENUMERATED, not ranges. `[a-z]` is collation-dependent:
-  # under a UTF-8 locale the order is aAbBcC..., so the range matches uppercase
-  # too. That made this check pass on macOS (C collation) and silently accept an
-  # uppercase basename on Linux — a containment check that was weaker on the
-  # platform CI actually runs. Enumeration has no such ambiguity.
-  case "$1" in
-    [abcdefghijklmnopqrstuvwxyz]*) : ;;
-    *) _adapter_reject "$1"; return 1 ;;
-  esac
-  case "$1" in
-    *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*) _adapter_reject "$1"; return 1 ;;
-  esac
+  _adapter_name_safe "$1" || { _adapter_reject "$1"; return 1; }
 
   # Containment. A symlinked adapter dir passes every check above and still
   # points anywhere, so resolve both sides and require the prefix.
@@ -124,6 +136,7 @@ adapters_list() {
 
 adapter_manifest_get() { # $1=name $2=jq path -> value on stdout
   local root v
+  _adapter_name_safe "$1" || return 1
   root=$(adapters_root)
   v=$(jq -re "${2} // empty" "$root/$1/manifest.json" 2>/dev/null) || return 1
   # $HOME by substitution, never evaluation.
@@ -132,6 +145,8 @@ adapter_manifest_get() { # $1=name $2=jq path -> value on stdout
 
 adapter_run() { # $1=name $2=subcommand [args...]
   local root name
-  root=$(adapters_root); name="$1"; shift
+  name="$1"
+  _adapter_name_safe "$name" || return 1
+  root=$(adapters_root); shift
   "$root/$name/adapter.sh" "$@"
 }

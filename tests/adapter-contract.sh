@@ -84,6 +84,41 @@ run_contract(){ # $1=adapter name
   # --- slim ---
   if "$A" slim "$S" "$tmp/sl.out" 2>/dev/null; then ok "[$name] slim exits 0"; else no "[$name] slim exits 0"; fi
   if [ -s "$tmp/sl.out" ]; then ok "[$name] slim wrote output"; else no "[$name] slim wrote output"; fi
+  if [ -e "$tmp/sl.out.tmp" ]; then no "[$name] slim left no .tmp"; else ok "[$name] slim left no .tmp"; fi
+
+  # --- slim and stats write through a temp, like normalize ---
+  # The design doc requires this of EVERY subcommand that writes a file
+  # (docs/design/unify-harness-adapters-2026-08-23.md:131), and the earlier
+  # contract asserted it only for `normalize`. The claude adapter then handed
+  # `slim` and `stats` straight to scripts that write the destination directly,
+  # so an interrupted slim left a non-empty footer-less transcript that the
+  # caller's `-s` check accepts and sends to L1 as a whole session.
+  #
+  # The interrupt window itself cannot be opened from a unit test. What CAN be
+  # tested is the property that closes it: the write goes to a temp in the
+  # destination directory and renames. A read-only destination directory
+  # separates the two implementations exactly — truncating an existing file in
+  # place needs no directory write, so a direct writer clobbers it, while a
+  # temp-and-rename writer cannot create its temp and must fail with the old
+  # file intact.
+  local rodir
+  rodir="$tmp/ro"; mkdir -p "$rodir"
+  if [ "$(id -u)" = "0" ]; then
+    ok "[$name] running as root, so a read-only dir proves nothing; skipped"
+  else
+    local sub
+    for sub in slim stats; do
+      printf 'SENTINEL\n' > "$rodir/$sub.out"
+      chmod 500 "$rodir"
+      "$A" "$sub" "$S" "$rodir/$sub.out" >/dev/null 2>&1
+      chmod 700 "$rodir"
+      if [ "$(cat "$rodir/$sub.out" 2>/dev/null)" = "SENTINEL" ]; then
+        ok "[$name] $sub could not write its temp, so it left the old output intact"
+      else
+        no "[$name] $sub wrote the destination directly instead of through a temp"
+      fi
+    done
+  fi
 
   # --- is-self: must answer, and must not claim an ordinary session ---
   "$A" is-self "$S" >/dev/null 2>&1

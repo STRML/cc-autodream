@@ -69,8 +69,26 @@ case "$cmd" in
     exit 1
     ;;
 
-  stats) exec "$BIN/session-stats.sh" "$1" "$2" ;;
-  slim)  exec "$BIN/slim-transcript.sh" "$1" "$2" ;;
+  # stats and slim delegate like everything else, but they cannot `exec`. Both
+  # delegated scripts write the destination directly — slim-transcript.sh in two
+  # steps, a `>` for the body and a `>>` for the footer — so an interruption
+  # leaves a non-empty file with no footer, and the caller's `-s` check accepts
+  # it and sends a truncated session to L1 as if it were whole.
+  #
+  # The atomicity belongs here rather than in those scripts: the contract is the
+  # adapter's (docs/design/unify-harness-adapters-2026-08-23.md:131 requires it
+  # of every subcommand that writes a file), and both scripts have callers
+  # outside this seam. Same shape as normalize above — a unique temp in the
+  # DESTINATION directory, renamed on success, removed on failure.
+  stats|slim)
+    case "$cmd" in
+      stats) delegate="$BIN/session-stats.sh" ;;
+      slim)  delegate="$BIN/slim-transcript.sh" ;;
+    esac
+    t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
+    "$delegate" "$1" "$t" || { rm -f "$t"; exit 1; }
+    mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }
+    ;;
 
   is-self) # $1=session -> exit 0 if this is one of autodream's own transcripts
     # Delegated, never reimplemented: prune-self-sessions.sh is the single
