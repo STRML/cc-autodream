@@ -695,7 +695,12 @@ test_no_sessions(){
   local root; root=$(setup_env)   # no mk_session
   run_dream "$root"
   assert_file "$root/dreams/$DATE.md" "stub report written"
-  assert_grep "$root/dreams/$DATE.md" 'No Claude Code sessions' "stub report has the no-sessions notice"
+  assert_grep "$root/dreams/$DATE.md" 'No sessions were triaged' "stub report has the no-sessions notice"
+  # The stub is harness-neutral now, and it distinguishes "nothing was there"
+  # from "everything was refused" — a night where every path was unrepresentable
+  # used to read identically to a quiet one.
+  assert_grep "$root/dreams/$DATE.md" 'No session files were modified' "a genuinely empty night says so"
+  assert_file "$(fdir "$root")/run-stats.txt" "run-stats is written even with zero sessions"
   rm -rf "$root"
 }
 
@@ -1950,6 +1955,19 @@ test_install_deploys_the_adapter_runtime(){
   local got
   got=$(cd "$target" && bash -c '. ./adapters.sh; adapters_list' 2>/dev/null)
   assert_eq "$got" "claude" "the installed runner resolves the claude adapter"
+  # Resolving the adapter is not the same as being able to RUN it. The installed
+  # adapter finds its helper scripts through a relative path, so exercise a
+  # subcommand that actually shells out to one rather than stopping at discovery.
+  local sess="$T/s.jsonl" out="$T/s.stats.json"
+  mkdir -p "$T/proj"
+  printf '%s\n' "{\"type\":\"user\",\"cwd\":\"$T/proj\",\"message\":{\"content\":\"x\"}}" > "$sess"
+  if "$target/adapters/claude/adapter.sh" stats "$sess" "$out" 2>/dev/null && [ -s "$out" ]; then
+    ok "an installed adapter subcommand reaches its helper scripts"
+  else
+    no "an installed adapter subcommand reaches its helper scripts"
+  fi
+  assert_eq "$("$target/adapters/claude/adapter.sh" project "$sess" 2>/dev/null)" \
+            "$(cd "$T/proj" && pwd -P)" "the installed adapter resolves a project cwd"
   rm -rf "$T"
 }
 

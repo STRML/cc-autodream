@@ -381,7 +381,11 @@ enabled_adapters() {
   local one keep=""
   for one in $a; do
     if [ "$one" = "claude" ]; then keep="claude"; else
-      log "  adapter '$one' is enabled but per-session dispatch is not adapter-aware yet; not enumerating it"
+      # stderr, NOT stdout: this function's stdout is its return channel, and
+      # log() is a bare echo. Writing a diagnostic here put the log text into the
+      # captured adapter list, where it was word-split into bogus adapter names
+      # and also masked the empty-list abort.
+      log "  adapter '$one' is enabled but per-session dispatch is not adapter-aware yet; not enumerating it" >&2
     fi
   done
   printf '%s' "$keep"
@@ -399,7 +403,7 @@ scan_roots() {
     return 1
   fi
   for src in $adapters; do
-    scan_one_adapter "$src"
+    scan_one_adapter "$src" || return 1
   done
   # A transcript reachable from two roots (one dir a symlink of another) must be
   # triaged exactly once; the first source to claim a path keeps it.
@@ -427,6 +431,19 @@ scan_one_adapter() { # $1=adapter name
     # depends on the shape. Such a path is currently written as two lines and
     # the runner then invents a session that does not exist, so it is rejected
     # here — before either representation is built — rather than transported.
+    # Stage enumeration to a file and CHECK its status. Reading the adapter
+    # through process substitution hid the producer's exit code, so a root that
+    # failed on permissions or I/O emitted nothing and the run carried on to
+    # finalise a cheerful "no sessions" report over a corpus it never saw.
+    local nulfile status
+    nulfile=$(mktemp "$FINDINGS_DIR/.enum.XXXXXX") || { log "FATAL: cannot stage enumeration"; return 1; }
+    enumerate_for "$src" "$r" > "$nulfile"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+      log "FATAL: enumeration failed for adapter '$src' at root $r (exit $status); refusing to report over a corpus that was never read"
+      rm -f "$nulfile"
+      return 1
+    fi
     while IFS= read -r -d '' sp; do
       # Reject every character the downstream artifacts cannot carry. Verified on
       # this host against the real consumers rather than assumed:
@@ -455,8 +472,10 @@ scan_one_adapter() { # $1=adapter name
       # so `read -r src sp` lets sp absorb the whole remainder. The reverse order
       # truncated any path holding a tab and silently lost its provenance.
       printf '%s\t%s\n' "$src" "$sp" >> "$SESSIONS_LIST.src"
-    done < <(enumerate_for "$src" "$r")
+    done < "$nulfile"
+    rm -f "$nulfile"
   done < <(adapter_roots "$src")
+  return 0
 }
 
 # Enumeration for one adapter and one root. Delegates to the adapter when one is
@@ -549,7 +568,10 @@ build_source_sidecar() {
   fi
   rm -f "$drop"
 
-  SESSIONS_BY_SOURCE=$(printf '%s' "$counts" | sort | uniq -c \
+  # Counted from the FINAL sidecar rather than from the loop, because collision
+  # resolution removes rows after the fact and a count taken during the walk
+  # reported sessions that no longer exist in the worklist.
+  SESSIONS_BY_SOURCE=$(awk -F'\t' 'NF>1 {print $2}' "$sidecar" 2>/dev/null | sort | uniq -c \
     | awk 'NF {printf "%s%s=%s", (NR>1?",":""), $2, $1}')
   [ -n "$SESSIONS_BY_SOURCE" ] || SESSIONS_BY_SOURCE="none"
 }
@@ -1004,10 +1026,30 @@ run() {
 
   if [ "$COUNT" -eq 0 ]; then
     log "no sessions to triage; writing stub report and exiting"
+    # A zero-session night is not always an empty night. Every session can be
+    # rejected for an unrepresentable path or dropped by collision handling, and
+    # this path used to return before run-stats.txt was written — so the report
+    # said "no sessions were modified" while the counters that would have
+    # contradicted it were never recorded anywhere. Say what was refused.
+    local refused=$(( REJECTED_PATHS + HASH_COLLISIONS ))
+    {
+      printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
+      printf 'runner_commit: %s\n' "$RUNNER_COMMIT"
+      printf 'runner_dirty: %s\n' "$RUNNER_DIRTY"
+      printf 'sessions_found_raw: %s\n' "$RAW"
+      printf 'sessions_triaged: 0\n'
+      printf 'sessions_rejected_path: %s\n' "$REJECTED_PATHS"
+      printf 'sessions_duplicate_path: %s\n' "$DUPLICATE_PATHS"
+      printf 'sessions_hash_collision: %s\n' "$HASH_COLLISIONS"
+      printf 'adapters_enabled: %s\n' "$(enabled_adapters 2>/dev/null | tr ' ' ',' | sed 's/,$//')"
+      printf 'sessions_by_source: %s\n' "${SESSIONS_BY_SOURCE:-none}"
+    } > "$FINDINGS_DIR/run-stats.txt" 2>/dev/null || true
     cat > "$REPORT_PATH" <<EOF
 # Autodream — $TARGET_DATE
 
-No Claude Code sessions were modified on this date.
+No sessions were triaged on this date.
+
+$( [ "$refused" -gt 0 ] && printf '%s session path(s) were REFUSED rather than absent: %s unrepresentable, %s lost to a hash collision. See run-stats.txt — this is not an empty night.' "$refused" "$REJECTED_PATHS" "$HASH_COLLISIONS" || printf 'No session files were modified.' )
 
 (Generated $(date -u +%Y-%m-%dT%H:%M:%SZ))
 
