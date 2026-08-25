@@ -33,8 +33,19 @@ done
 MISSING_KEYS=""
 missing=0
 
+# Test-only injection. Emptying PATH to hide one dependency also hides bash's
+# own helpers, so the suite could not otherwise exercise a single missing tool
+# without breaking everything around it. Comma-separated list of names to treat
+# as absent; unset in every real run.
+_forced_missing() { # $1=command
+  case ",${AUTODREAM_PREFLIGHT_FORCE_MISSING:-}," in
+    *",$1,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 need() { # $1=command $2=what its absence costs
-  if ! command -v "$1" >/dev/null 2>&1; then
+  if _forced_missing "$1" || ! command -v "$1" >/dev/null 2>&1; then
     printf 'MISSING: %s — %s\n' "$1" "$2" >&2
     MISSING_KEYS="${MISSING_KEYS:+$MISSING_KEYS,}$1"
     missing=$((missing + 1))

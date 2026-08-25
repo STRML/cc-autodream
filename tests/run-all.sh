@@ -1869,6 +1869,57 @@ test_newline_path_is_rejected_not_split(){
   rm -rf "$root"
 }
 
+# ---- Adapter-aware enumeration: source provenance and the artifact contract ----
+# Source is carried in a sidecar keyed by the artifact hash, NOT tagged into
+# sessions.txt. Four consumers derive the artifact key or a filesystem path from
+# a whole line of that file, so adding a field to it would silently invalidate
+# every archived findings dir along with bin/oversized-gate.sh.
+test_source_sidecar_is_written(){
+  echo "# union: every enumerated session gets a source sidecar line keyed by hash"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  run_dream "$root"
+  local f; f=$(fdir "$root")
+  assert_file "$f/sessions-source.txt" "the sidecar exists"
+  local sp h
+  sp=$(head -1 "$f/sessions.txt")
+  h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
+  assert_grep "$f/sessions-source.txt" "^$h	claude$" "the hash maps to its source"
+  assert_grep "$f/run-stats.txt" 'sessions_by_source: claude=' "per-source counts are recorded"
+  assert_grep "$f/run-stats.txt" 'adapters_enabled: claude' "the enabled adapter set is recorded"
+  rm -rf "$root"
+}
+
+test_artifact_hash_contract_is_unchanged(){
+  echo "# union: the artifact key is still sha1 of the bare path, so archived dirs keep working"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  run_dream "$root"
+  local f; f=$(fdir "$root")
+  local sp h
+  sp=$(head -1 "$f/sessions.txt")
+  h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
+  assert_file "$f/$h.json" "the findings record is keyed by sha1 of the bare path"
+  # A tab in sessions.txt would mean the line stopped being a bare path, which is
+  # the change that breaks oversized-gate.sh:73 and every archived dir.
+  assert_nogrep "$f/sessions.txt" '	' "sessions.txt carries no tab-delimited fields"
+  rm -rf "$root"
+}
+
+test_preflight_stops_a_run_missing_a_dependency(){
+  echo "# preflight: a missing shared dependency stops the run before anything is enumerated"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  # An empty PATH dir hides shasum, whose absence silently empties the artifact
+  # hash so every session in the night targets one findings filename.
+  local empty; empty=$(mktemp -d "${TMPDIR:-/tmp}/nopath.XXXXXX")
+  PATH="$empty:/usr/bin:/bin" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK"     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE"     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1     AUTODREAM_PREFLIGHT_FORCE_MISSING=shasum     PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams"     bash "$RUN" "$DATE" > "$root/run.out" 2>&1 || true
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  assert_no_file "$(fdir "$root")/sessions.txt" "nothing was enumerated"
+  assert_grep "$root/run.out" 'preflight' "the log says preflight stopped it"
+  rm -rf "$root" "$empty"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -1877,6 +1928,9 @@ test_rootprobe_remembers_choice
 test_rootprobe_no_write_mode_flags_but_does_not_write
 test_rootprobe_empty_home
 test_newline_path_is_rejected_not_split
+test_source_sidecar_is_written
+test_artifact_hash_contract_is_unchanged
+test_preflight_stops_a_run_missing_a_dependency
 
 echo
 echo "----------------------------------------"

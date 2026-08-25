@@ -138,6 +138,16 @@ SESSIONS_LIST="$FINDINGS_DIR/sessions.txt"
 # transcript?". Resolve it next to this script first (works for the repo copy and the
 # ~/.claude/autodream symlink), then fall back to the install dir.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# Harness adapters. run.sh no longer knows which harness it is talking to: it
+# asks the adapter to enumerate, normalise, parse and identify. lib-project.sh
+# holds the one project encoding every adapter must agree on.
+# shellcheck source=/dev/null
+[ -r "$SCRIPT_DIR/lib-project.sh" ] && . "$SCRIPT_DIR/lib-project.sh"
+# shellcheck source=/dev/null
+[ -r "$SCRIPT_DIR/adapters.sh" ] && . "$SCRIPT_DIR/adapters.sh"
+PREFLIGHT="$SCRIPT_DIR/preflight.sh"
+
 PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
 [ -x "$PRUNE" ] || PRUNE="$AUTODREAM_DIR/prune-self-sessions.sh"
 # Root prober — decides which $HOME/.claude*/projects dirs to scan (see root-probe.sh).
@@ -311,14 +321,56 @@ write_unindexed_flag() {
 # Find sessions modified during the target day across every session root.
 NL=$'\n'            # for the newline-in-path check below
 REJECTED_PATHS=0    # session paths a line-based sessions.txt cannot represent
+DUPLICATE_PATHS=0   # one path claimed by more than one adapter
+HASH_COLLISIONS=0   # two different paths truncating to one artifact hash
+SESSIONS_BY_SOURCE=none
+
+# Which roots an adapter scans. The claude adapter uses the roots root-probe
+# resolved, because that prober is what decides which $HOME/.claude*/projects
+# dirs are indexed and the user's per-folder choices live there. Any other
+# adapter uses its own manifest defaults, since root-probe knows nothing about
+# a second harness's store.
+adapter_roots() { # $1=adapter name -> one root per line
+  # Every line MUST be newline-terminated. `while read` drops a final
+  # unterminated line, so a printf '%s' here silently skipped the only root on a
+  # single-root host — enumeration found nothing and reported it as a quiet zero.
+  if [ "$1" = "claude" ]; then
+    printf '%s\n' "$SESSION_ROOTS" | tr ':' '\n'
+    return 0
+  fi
+  local roots
+  roots=$(adapter_manifest_get "$1" '.session_roots_default[]' 2>/dev/null) || return 0
+  [ -n "$roots" ] || return 0
+  printf '%s\n' "$roots"
+}
+
+# The adapters actually enumerated this run. Empty when the adapters/ directory
+# is absent — an install symlinked at an older tree — in which case enumeration
+# falls back to the pre-adapter path so a partial upgrade cannot lose a night.
+enabled_adapters() {
+  local a
+  a=$(adapters_list 2>/dev/null | tr '\n' ' ')
+  [ -n "${a// /}" ] || a="claude"
+  printf '%s' "$a"
+}
 
 scan_roots() {
   : > "$SESSIONS_LIST.raw"
+  : > "$SESSIONS_LIST.src"     # internal <path>\t<source>, deduped into the sidecar below
   REJECTED_PATHS=0
-  local -a roots
-  IFS=: read -ra roots <<< "$SESSION_ROOTS"
-  local r
-  for r in "${roots[@]}"; do
+  local src
+  for src in $(enabled_adapters); do
+    scan_one_adapter "$src"
+  done
+  # A transcript reachable from two roots (one dir a symlink of another) must be
+  # triaged exactly once; the first source to claim a path keeps it.
+  sort -u "$SESSIONS_LIST.raw" -o "$SESSIONS_LIST.raw"
+  RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
+}
+
+scan_one_adapter() { # $1=adapter name
+  local src="$1" r
+  while IFS= read -r r; do
     [ -n "$r" ] || continue
     # SESSION_ROOTS is colon-separated, so a root path containing ':' is unrepresentable:
     # the split above already fragmented it. Catch the symptom — a fragment that is not
@@ -345,15 +397,65 @@ scan_roots() {
           ;;
       esac
       printf '%s\n' "$sp" >> "$SESSIONS_LIST.raw"
-    done < <(find "$r" -type f -name '*.jsonl' \
-                  -newermt "$TARGET_DATE 00:00:00" \
-                  ! -newermt "$NEXT_DATE 00:00:00" \
-                  -print0 2>/dev/null)
-  done
-  # A transcript reachable from two roots (e.g. one dir is a symlink of another) must
-  # be triaged exactly once.
-  sort -u "$SESSIONS_LIST.raw" -o "$SESSIONS_LIST.raw"
-  RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
+      printf '%s\t%s\n' "$sp" "$src" >> "$SESSIONS_LIST.src"
+    done < <(enumerate_for "$src" "$r")
+  done < <(adapter_roots "$src")
+}
+
+# Enumeration for one adapter and one root. Delegates to the adapter when one is
+# installed; the inline find is the fallback for an install whose tree predates
+# adapters/, so a partial upgrade degrades rather than losing the night.
+enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
+  if declare -F adapter_run >/dev/null 2>&1 && [ -x "$(adapters_root 2>/dev/null)/$1/adapter.sh" ]; then
+    adapter_run "$1" enumerate "$2" "$TARGET_DATE" "$NEXT_DATE"
+    return 0
+  fi
+  find "$2" -type f -name '*.jsonl' \
+       -newermt "$TARGET_DATE 00:00:00" \
+       ! -newermt "$NEXT_DATE 00:00:00" \
+       -print0 2>/dev/null
+}
+
+# Source provenance, keyed by the artifact hash rather than tagged into
+# sessions.txt. That file stays one bare path per line because run.sh:468 and
+# run.sh:540 key each artifact by sha1 of the WHOLE line, oversized-gate.sh
+# recomputes the same hash from it, and every archived findings dir depends on
+# the shape. Adding a field would silently invalidate all of them.
+#
+# The hash formula is deliberately NOT changed to include the source either, for
+# the same reason. Instead the two ways two adapters can land on one artifact are
+# detected: the same path claimed twice (a misconfiguration — keep the first),
+# and two DIFFERENT paths truncating to one hash (no sensible winner — skip both).
+build_source_sidecar() {
+  local sidecar="$FINDINGS_DIR/sessions-source.txt"
+  local seen="$FINDINGS_DIR/.hash-to-path"
+  : > "$sidecar"; : > "$seen"
+  DUPLICATE_PATHS=0; HASH_COLLISIONS=0; SESSIONS_BY_SOURCE=""
+  local sp src h prev counts=""
+  while IFS=$'\t' read -r sp src; do
+    [ -n "$sp" ] || continue
+    grep -qxF "$sp" "$SESSIONS_LIST.raw" 2>/dev/null || continue   # dropped by the newline check
+    h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
+    prev=$(awk -F'\t' -v k="$h" '$1==k {print $2; exit}' "$seen" 2>/dev/null)
+    if [ -n "$prev" ]; then
+      if [ "$prev" = "$sp" ]; then
+        DUPLICATE_PATHS=$((DUPLICATE_PATHS + 1))
+        log "  duplicate: $sp was claimed by more than one adapter; keeping the first"
+      else
+        HASH_COLLISIONS=$((HASH_COLLISIONS + 1))
+        log "  COLLISION: $h maps to two different sessions; skipping both: $prev / $sp"
+        grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null && mv "$sidecar.tmp" "$sidecar"
+      fi
+      continue
+    fi
+    printf '%s\t%s\n' "$h" "$sp"  >> "$seen"
+    printf '%s\t%s\n' "$h" "$src" >> "$sidecar"
+    counts="$counts$src"$'\n'
+  done < "$SESSIONS_LIST.src"
+  rm -f "$seen"
+  SESSIONS_BY_SOURCE=$(printf '%s' "$counts" | grep -c . >/dev/null 2>&1 && \
+    printf '%s' "$counts" | sort | uniq -c | awk '{printf "%s%s=%s", (NR>1?",":""), $2, $1}')
+  [ -n "$SESSIONS_BY_SOURCE" ] || SESSIONS_BY_SOURCE="none"
 }
 
 # ---- Empty-session filter: drop 0-turn shells before fanout ----
@@ -722,6 +824,19 @@ run() {
 
   [ -x "$CLAUDE_BIN" ] || { log "FATAL: claude not at $CLAUDE_BIN"; exit 1; }
 
+  # ---- Preflight: the shared dependencies this script already assumes ----
+  # Before anything is enumerated, because the dangerous one fails silently: with
+  # shasum absent the artifact hash assignment yields an empty string and every
+  # session in the night writes to the same findings filename. A run that got
+  # that far would produce one record where it should have produced a hundred
+  # and report success. Stopping here costs a night; continuing corrupts one.
+  if [ -x "$PREFLIGHT" ]; then
+    if ! "$PREFLIGHT" 2>>"$RUN_LOG"; then
+      log "FATAL: preflight failed; see the MISSING lines in this log. Nothing was enumerated."
+      return 1
+    fi
+  fi
+
   # ---- Session roots (which $HOME/.claude*/projects dirs we scan) ----
   probe_roots
 
@@ -760,6 +875,7 @@ run() {
   # ---- Enumerate sessions modified during the target day ----
   log "scanning for sessions modified between $TARGET_DATE and $NEXT_DATE..."
   scan_roots
+  build_source_sidecar
 
   # Exclude autodream's OWN headless worker/aggregator transcripts. New runs leave none
   # (--no-session-persistence), but runs predating that fix littered ~/.claude/projects/
@@ -1011,6 +1127,13 @@ PY
     # transcript exists that no report will ever mention, which is exactly the
     # kind of silent shortfall this file exists to make visible.
     printf 'sessions_rejected_path: %s\n' "$REJECTED_PATHS"
+    # Which harnesses produced this night's corpus. A source that drops to zero
+    # on a day the user worked in it is the signal that its ingest broke, and
+    # that is invisible without a per-source count.
+    printf 'adapters_enabled: %s\n' "$(enabled_adapters | tr ' ' ',' | sed 's/,$//')"
+    printf 'sessions_by_source: %s\n' "$SESSIONS_BY_SOURCE"
+    printf 'sessions_duplicate_path: %s\n' "$DUPLICATE_PATHS"
+    printf 'sessions_hash_collision: %s\n' "$HASH_COLLISIONS"
     printf 'self_sessions_excluded: %s\n' "$EXCLUDED"
     printf 'sessions_skipped_empty: %s\n' "$SKIPPED_EMPTY"
     printf 'sessions_triaged: %s\n' "$COUNT"
