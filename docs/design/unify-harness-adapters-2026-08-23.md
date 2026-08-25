@@ -172,7 +172,7 @@ So this is a refusal, not a fix: a legal filename is declined because the transp
 
 The rejected path is logged with control characters escaped. A newline written raw into the log would forge additional log lines, which is a small thing until the forged line is the one someone reads.
 
-NUL transport still earns its place — it removes the whole class of word-splitting bugs on the paths that *are* accepted, including spaces, tabs and glob characters.
+NUL transport still earns its place — it removes the whole class of word-splitting bugs on the paths that *are* accepted, spaces and glob characters among them.
 
 **Cross-adapter collision.** Two adapters enumerating the same absolute path produce the same `<hash>.json`, and the second worker overwrites the first source's findings. Changing the hash formula to include the source would fix it and break every archived dir, so instead the union step detects a path claimed by more than one adapter, logs both adapter names, keeps the first, and counts `sessions_duplicate_path`. In practice this means two adapters are pointed at one store, which is a misconfiguration worth seeing rather than resolving silently.
 
@@ -302,7 +302,7 @@ A fixture asserts that a pin for a session enumerated from a secondary root is G
 | every adapter disabled | hard failure; there is nothing to triage |
 | `normalize`, `project`, `stats`, or `slim` exits nonzero | skip the session with that subcommand's own counter; partial output removed |
 | `memory-root` returns empty, relative, non-canonical or absent for a `writes_memory: true` adapter | skip the session, count `memory_root_invalid`, write no findings record |
-| a session path contains a newline | rejected at enumeration with `sessions_rejected_path`, logged with control characters escaped; a line-based `sessions.txt` cannot represent it |
+| a session path contains a newline, tab, backslash or quote | rejected at enumeration with `sessions_rejected_path`, logged with control characters escaped. The newline because a line-based `sessions.txt` cannot represent it; the other three because the `xargs -I` fan-out corrupts them, and a quote aborts the whole dispatch (issue #54) |
 | one path enumerated by two adapters | keep the first, log both, count `sessions_duplicate_path` |
 | two distinct paths truncate to one hash | skip both, log both, count `sessions_hash_collision` |
 | adapter directory basename is unsafe, disagrees with manifest `name`, or resolves outside the adapters root | refuse to load that adapter, count `adapters_rejected_identity` |

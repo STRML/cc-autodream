@@ -657,6 +657,12 @@ build_source_sidecar() {
   # Actually remove the colliding sessions from the worklist. Without this the
   # detection is decorative.
   if [ -s "$drop" ]; then
+    # Deduplicate first. The earlier path is appended again for every later
+    # collision on the same hash, so three paths sharing one hash produce
+    # A,B,A,C — four lines describing three drops. Everything below counts and
+    # filters from this file, so the duplicate propagated into the telemetry.
+    sort -u "$drop" -o "$drop" 2>/dev/null || :
+
     # The worklist is the one that must FAIL CLOSED. Leaving it unchanged means
     # both colliding paths are still in it, so two workers target one <hash>.json
     # and overwrite each other — exactly what this branch exists to prevent.
@@ -690,8 +696,19 @@ build_source_sidecar() {
       # Survivable: a stale row overstates sessions_by_source by one and the
       # helper has already said so. The worklist, which is not survivable, was
       # handled above.
-      rewrite_filtered "$sidecar" "the provenance row for $h" -v "^$h	" \
-        || SIDECAR_STALE_ROWS=$((SIDECAR_STALE_ROWS + 1))
+      rewrite_filtered "$sidecar" "the provenance row for $h" -v "^$h	" || :
+    done < "$drop"
+
+    # Count stale rows from the FINAL sidecar rather than from failed attempts.
+    # The same hash is rewritten once during detection and again per drop line,
+    # so counting attempts reported 3 for a single stale row on a persistent
+    # failure — and 1 on a transient one that a later attempt had already fixed.
+    # What the reader needs is how many rows are stale NOW.
+    while IFS= read -r sp; do
+      [ -n "$sp" ] || continue
+      h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
+      grep -q "^$h	" "$sidecar" 2>/dev/null \
+        && SIDECAR_STALE_ROWS=$((SIDECAR_STALE_ROWS + 1))
     done < "$drop"
   fi
   rm -f "$drop"
@@ -1138,7 +1155,12 @@ run() {
     cp "$SESSIONS_LIST.raw" "$SESSIONS_LIST"
   fi
   COUNT_AFTER_PRUNE=$(wc -l < "$SESSIONS_LIST" | tr -d ' ')
-  EXCLUDED=$(( RAW - COUNT_AFTER_PRUNE ))
+  # Subtract the collision drops first. They left the worklist BEFORE the
+  # self-prune ran, so charging them to EXCLUDED made a forced two-session
+  # collision report self_sessions_excluded: 2 — the report calling files
+  # "autodream-own" that were nothing of the kind.
+  EXCLUDED=$(( RAW - COLLIDED_DROPPED - COUNT_AFTER_PRUNE ))
+  [ "$EXCLUDED" -lt 0 ] && EXCLUDED=0
 
   # Drop 0-turn shells (auto-opened/aborted sessions with no user input) before fanout.
   # Independent of the self-prune above, so the two telemetry counts don't overlap.
@@ -1397,7 +1419,8 @@ PY
   # computing against RAW and subtracting the legitimate prunes, any session
   # lost to a filter mis-classification or silent worker death surfaces here.
   # Bounded at 0 in case of a counting bug in the prunes.
-  DROPPED_AFTER_FAILURES=$(( RAW - L1_OK - EXCLUDED - SKIPPED_EMPTY ))
+  # Collision drops are deliberate, not failures, and have their own key.
+  DROPPED_AFTER_FAILURES=$(( RAW - COLLIDED_DROPPED - L1_OK - EXCLUDED - SKIPPED_EMPTY ))
   [ "$DROPPED_AFTER_FAILURES" -lt 0 ] && DROPPED_AFTER_FAILURES=0
   L1_FRESHLY_PROCESSED=$(( L1_OK - L1_PRECACHED ))
   [ "$L1_FRESHLY_PROCESSED" -lt 0 ] && L1_FRESHLY_PROCESSED=0
@@ -1453,6 +1476,8 @@ PY
     # vs.-raw denominator: a session lost to ANY path (prune mis-classification,
     # silent worker death, slim leftovers) shows up here. Always >= 0; if
     # nonzero, the aggregator should investigate even when l1_missing=0.
+    printf 'sessions_dropped_to_collision: %s\n' "$COLLIDED_DROPPED"
+    printf 'sidecar_stale_rows: %s\n' "$SIDECAR_STALE_ROWS"
     printf 'sessions_dropped_after_failures: %s\n' "$DROPPED_AFTER_FAILURES"
     printf 'l1_rounds_used: %s\n' "$round"
     printf 'l1_rounds_max: %s\n' "$L1_ROUNDS"

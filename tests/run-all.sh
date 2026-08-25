@@ -2191,6 +2191,7 @@ test_forced_hash_collision_drops_both(){
   assert_no_file "$d/aaaaaaaaaaaa.stats.json" "nor its stats sidecar"
   assert_grep "$d/run-stats.txt" 'sessions_found_raw: 2' "RAW still reports what was ENUMERATED"
   assert_grep "$d/run-stats.txt" 'sessions_dropped_to_collision: 2' "both dropped paths are counted"
+  assert_grep "$d/run-stats.txt" 'self_sessions_excluded: 0' "collided files are NOT called autodream-own"
   assert_grep "$d/run-stats.txt" 'sessions_hash_collision: 1' "the collision is counted"
   # BOTH paths gone. This is the assertion that would have caught the branch
   # logging "skipping both" while skipping neither.
@@ -2246,6 +2247,60 @@ test_collision_membership_probe_failure_aborts(){
   rm -rf "$root"
 }
 
+test_three_way_collision_counts_paths_not_lines(){
+  echo "# collision: three paths on one hash count as three drops, not four"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  mk_session "$root" three
+  run_dream_collision "$root"
+  local d; d=$(fdir "$root")
+  # The earlier path is re-appended for every LATER collision, so the drop file
+  # reads A,B,A,C for three paths. Counting lines reported four drops for three.
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_to_collision: 3' "three paths count as three"
+  assert_grep "$d/run-stats.txt" 'sessions_found_raw: 3' "and all three were enumerated"
+  # Deliberate drops are not failures and are not autodream-own.
+  assert_grep "$d/run-stats.txt" 'self_sessions_excluded: 0' "collision drops are not charged to self-exclusion"
+  rm -rf "$root"
+}
+
+# A MIXED run — some collide, one survives — is the case that reaches the normal
+# run-stats writer. The all-collide fixtures above take the zero-session path,
+# which emits a reduced key set, so neither of them can prove that the normal
+# writer carries the collision keys or that deliberate drops stay out of the
+# failure denominator.
+test_mixed_collision_run_attributes_correctly(){
+  echo "# collision: a mixed run keeps drops out of the failure count"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  mk_session "$root" solo
+  # Collide everything EXCEPT the path containing "solo", which keeps its real
+  # hash and survives to be triaged normally.
+  { printf '#!/bin/bash\n'
+    printf 'in=$(cat)\n'
+    printf 'case "$in" in\n'
+    printf '  *solo*) printf "%%s  -\\n" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ;;\n'
+    printf '  *) printf "%%s  -\\n" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ;;\n'
+    printf 'esac\n'
+  } > "$root/home/.local/bin/shasum"
+  chmod +x "$root/home/.local/bin/shasum"
+  run_dream_collision "$root"
+  local rc=$?
+  local d; d=$(fdir "$root")
+  assert_eq "$rc" "0" "the run completes with one surviving session"
+  assert_grep "$d/run-stats.txt" 'sessions_found_raw: 3' "all three were enumerated"
+  assert_grep "$d/run-stats.txt" 'sessions_triaged: 1' "one survived to triage"
+  # The keys that existed only in the zero-session writer until now.
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_to_collision: 2' "the normal writer carries the collision count"
+  assert_grep "$d/run-stats.txt" 'sidecar_stale_rows: 0' "and the stale-row count"
+  # The attribution that was wrong: deliberate drops are neither self-sessions
+  # nor failures.
+  assert_grep "$d/run-stats.txt" 'self_sessions_excluded: 0' "drops are not autodream-own"
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_after_failures: 0' "drops are not failures"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2266,6 +2321,8 @@ test_fresh_host_with_no_store_is_not_a_failure
 test_forced_hash_collision_drops_both
 test_collision_worklist_failure_aborts
 test_collision_membership_probe_failure_aborts
+test_three_way_collision_counts_paths_not_lines
+test_mixed_collision_run_attributes_correctly
 test_all_excluded_corpus_says_so
 
 echo
