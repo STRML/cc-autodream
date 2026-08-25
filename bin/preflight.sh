@@ -25,8 +25,15 @@ set -u
 L2_BIN=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --l2-bin) L2_BIN="${2:-}"; shift 2 ;;
-    *)        shift ;;
+    --l2-bin)
+      # `shift 2` with only one argument left FAILS and shifts nothing, so $#
+      # never decreases and this loop spins forever. Preflight runs before the
+      # idempotency guard, so a wedged one would also block every launchd
+      # catch-up trigger behind the "label already running" rule.
+      [ "$#" -ge 2 ] || { printf 'preflight: --l2-bin requires a value\n' >&2; exit 2; }
+      L2_BIN="$2"; shift 2
+      ;;
+    *) shift ;;
   esac
 done
 

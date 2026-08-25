@@ -53,6 +53,13 @@ echo "# preflight: the reason is carried, not just the name"
 has "one filename" "$out" "says what a missing shasum actually costs"
 has "containment"  "$out" "says why realpath is security-critical"
 
+echo "# preflight: a flag with no value is a usage error, never a hang"
+# `shift 2` with one argument left fails and shifts nothing, so the arg loop
+# spun forever. Preflight runs before the idempotency guard, so a wedged one
+# would also block every launchd catch-up trigger behind "label already running".
+timeout 5 "$PF" --l2-bin >/dev/null 2>&1; rc4=$?
+assert_eq "$rc4" "2" "--l2-bin with no value exits 2 rather than hanging"
+
 echo "# preflight: the failure is machine-readable for run-stats"
 has "preflight_missing:" "$out" "emits a preflight_missing key"
 

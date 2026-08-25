@@ -394,12 +394,21 @@ enabled_adapters() {
 
 scan_roots() {
   : > "$SESSIONS_LIST.raw"
-  : > "$SESSIONS_LIST.src"     # internal <path>\t<source>, deduped into the sidecar below
+  : > "$SESSIONS_LIST.src"     # internal <source>\t<path> — source FIRST, see the writer
   REJECTED_PATHS=0
   local src adapters
   adapters=$(enabled_adapters)
   if [ -z "${adapters// /}" ]; then
-    log "FATAL: the adapter loader ran and accepted no adapters (rejected: $(adapters_rejected 2>/dev/null)). Refusing to scan."
+    # Two distinct causes reach here and they need different messages: the
+    # loader accepted nothing at all, or it accepted adapters but none of them
+    # is claude. Printing the first for the second sends the reader hunting a
+    # containment or manifest failure that never happened.
+    local accepted; accepted=$(adapters_list 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+    if [ -n "$accepted" ]; then
+      log "FATAL: no usable adapter — accepted [$accepted] but per-session dispatch is claude-only, and claude is not among them. Refusing to scan."
+    else
+      log "FATAL: the adapter loader ran and accepted no adapters (rejected: $(adapters_rejected 2>/dev/null || printf none)). Refusing to scan."
+    fi
     RAW=0
     return 1
   fi
@@ -564,7 +573,11 @@ build_source_sidecar() {
         # so a guarded `&& mv` left the stale mapping behind in exactly the
         # single-entry case.
         grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null || :
-        mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || : > "$sidecar"
+        # If the replace fails (a full filesystem between the redirect and the
+        # mv), LEAVE the stale row. Truncating the file was the old fallback and
+        # it traded one wrong row for the loss of every row's provenance. The
+        # colliding paths are dropped from the worklist regardless.
+        mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || rm -f "$sidecar.tmp"
       fi
       continue
     fi
@@ -590,7 +603,7 @@ build_source_sidecar() {
       [ -n "$sp" ] || continue
       h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
       grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null || :
-      mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || : > "$sidecar"
+      mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || rm -f "$sidecar.tmp"
     done < "$drop"
   fi
   rm -f "$drop"
@@ -1076,6 +1089,13 @@ run() {
       printf 'sessions_rejected_path: %s\n' "$REJECTED_PATHS"
       printf 'sessions_duplicate_path: %s\n' "$DUPLICATE_PATHS"
       printf 'sessions_hash_collision: %s\n' "$HASH_COLLISIONS"
+      # The shortfall counters belong here most of all: this block exists so a
+      # zero-triage night does not read as an empty one, and a partial walk or a
+      # regression to single-root scanning is exactly what would explain it.
+      printf 'roots_partially_enumerated: %s\n' "$PARTIAL_ROOTS"
+      printf 'session_roots: %s\n' "$(( $(printf '%s' "$SESSION_ROOTS" | tr -cd ':' | wc -c) + 1 ))"
+      printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
+      printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null || printf none)"
       printf 'adapters_enabled: %s\n' "$(enabled_adapters 2>/dev/null | tr ' ' ',' | sed 's/,$//')"
       printf 'sessions_by_source: %s\n' "${SESSIONS_BY_SOURCE:-none}"
     } > "$FINDINGS_DIR/run-stats.txt" 2>/dev/null || true
@@ -1322,6 +1342,11 @@ PY
     # on a day the user worked in it is the signal that its ingest broke, and
     # that is invisible without a per-source count.
     printf 'adapters_enabled: %s\n' "$(enabled_adapters | tr ' ' ',' | sed 's/,$//')"
+    # Refusals that still left claude accepted are otherwise completely silent —
+    # a third-party adapter failing containment, a mismatched manifest name, a
+    # lost exec bit. Same silent-shortfall class as overlap_measured and
+    # stats_sidecars_unparseable: the value is that a zero here means something.
+    printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null || printf none)"
     printf 'sessions_by_source: %s\n' "$SESSIONS_BY_SOURCE"
     printf 'sessions_duplicate_path: %s\n' "$DUPLICATE_PATHS"
     printf 'sessions_hash_collision: %s\n' "$HASH_COLLISIONS"
