@@ -139,14 +139,52 @@ SESSIONS_LIST="$FINDINGS_DIR/sessions.txt"
 # ~/.claude/autodream symlink), then fall back to the install dir.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+RUNNER_SRC="${BASH_SOURCE[0]}"
+runner_hops=0
+# A symlink can point at another symlink, and a target can be relative to the link's own
+# directory rather than to $PWD. The hop cap keeps a cycle from hanging the run.
+# 8 rather than a bigger round number so the cap is reachable in a test: macOS refuses to
+# execute anything behind 16+ links (ELOOP), so a cap at or above that could never fire on
+# a script that got far enough to run this code, and an untestable guard is a guess. Linux
+# allows 40, where it can genuinely fire. A real install is one hop.
+while [ -L "$RUNNER_SRC" ] && [ "$runner_hops" -lt 8 ]; do
+  runner_link_dir=$(cd "$(dirname "$RUNNER_SRC")" && pwd) || break
+  RUNNER_SRC=$(readlink "$RUNNER_SRC") || break
+  case $RUNNER_SRC in /*) ;; *) RUNNER_SRC="$runner_link_dir/$RUNNER_SRC" ;; esac
+  runner_hops=$((runner_hops + 1))
+done
+
+# Where to look for the libraries below, and it is NOT just SCRIPT_DIR. install.sh
+# symlinks each script into ~/.claude/autodream individually, so a merge swaps the
+# run.sh those links point at instantly while lib-project.sh, adapters.sh,
+# preflight.sh and adapters/ stay missing until install.sh is re-run. Sourcing only
+# from SCRIPT_DIR then skips them in silence and the run dies later on
+# `session_hash: command not found`, with no report and nothing saying why.
+#
+# The walk above already resolved this script to its real location, so the repo's
+# own bin/ is the fallback. Installed dir first, because that is the layout the
+# nightly is supposed to have and the one whose files are meant to win.
+RUNNER_BIN_DIR=""
+if [ ! -L "$RUNNER_SRC" ]; then
+  RUNNER_BIN_DIR=$(cd "$(dirname "$RUNNER_SRC")" 2>/dev/null && pwd) || RUNNER_BIN_DIR=""
+fi
+# $1=basename -> prints the first readable copy, or nothing.
+find_lib() {
+  if [ -r "$SCRIPT_DIR/$1" ]; then printf '%s' "$SCRIPT_DIR/$1"; return 0; fi
+  if [ -n "$RUNNER_BIN_DIR" ] && [ -r "$RUNNER_BIN_DIR/$1" ]; then
+    printf '%s' "$RUNNER_BIN_DIR/$1"; return 0
+  fi
+  return 1
+}
+
 # Harness adapters. run.sh no longer knows which harness it is talking to: it
 # asks the adapter to enumerate, normalise, parse and identify. lib-project.sh
 # holds the one project encoding every adapter must agree on.
-# shellcheck source=/dev/null
-[ -r "$SCRIPT_DIR/lib-project.sh" ] && . "$SCRIPT_DIR/lib-project.sh"
-# shellcheck source=/dev/null
-[ -r "$SCRIPT_DIR/adapters.sh" ] && . "$SCRIPT_DIR/adapters.sh"
-PREFLIGHT="$SCRIPT_DIR/preflight.sh"
+_lib=$(find_lib lib-project.sh) && { # shellcheck source=/dev/null
+  . "$_lib"; }
+_lib=$(find_lib adapters.sh) && { # shellcheck source=/dev/null
+  . "$_lib"; }
+PREFLIGHT=$(find_lib preflight.sh) || PREFLIGHT="$SCRIPT_DIR/preflight.sh"
 
 PRUNE="$SCRIPT_DIR/prune-self-sessions.sh"
 [ -x "$PRUNE" ] || PRUNE="$AUTODREAM_DIR/prune-self-sessions.sh"
@@ -218,20 +256,6 @@ fi
 # that exists in nobody's history, which only tracked modifications can cause. Counting
 # untracked files made the first production run report runner_dirty: yes over a stray
 # scratch directory, which is exactly the kind of false alarm that gets a signal ignored.
-RUNNER_SRC="${BASH_SOURCE[0]}"
-runner_hops=0
-# A symlink can point at another symlink, and a target can be relative to the link's own
-# directory rather than to $PWD. The hop cap keeps a cycle from hanging the run.
-# 8 rather than a bigger round number so the cap is reachable in a test: macOS refuses to
-# execute anything behind 16+ links (ELOOP), so a cap at or above that could never fire on
-# a script that got far enough to run this code, and an untestable guard is a guess. Linux
-# allows 40, where it can genuinely fire. A real install is one hop.
-while [ -L "$RUNNER_SRC" ] && [ "$runner_hops" -lt 8 ]; do
-  runner_link_dir=$(cd "$(dirname "$RUNNER_SRC")" && pwd) || break
-  RUNNER_SRC=$(readlink "$RUNNER_SRC") || break
-  case $RUNNER_SRC in /*) ;; *) RUNNER_SRC="$runner_link_dir/$RUNNER_SRC" ;; esac
-  runner_hops=$((runner_hops + 1))
-done
 # Still a symlink means the walk gave up (a cycle, or a chain past the cap) rather than
 # arriving anywhere. Resolving the truncated path would stamp whatever checkout it happens
 # to sit in, and a confidently wrong sha is worse than no sha at all — the whole point of
@@ -337,7 +361,7 @@ ROOTS_UNAVAILABLE=0 # roots that were configured but are not directories
 SESSION_ROOTS_ARE_FALLBACK=0  # 1 when SESSION_ROOTS is the bare default nobody configured
 COLLIDED_DROPPED=0  # paths removed from the worklist by collision handling
 SIDECAR_STALE_ROWS=0  # provenance rows that could not be rewritten; sessions_by_source is high by this much
-DUPLICATE_PATHS=0   # one path claimed by more than one adapter
+DUPLICATE_PATHS=0   # one path reached twice: overlapping roots, or two adapters
 HASH_COLLISIONS=0   # two different paths truncating to one artifact hash
 SESSIONS_BY_SOURCE=none
 
@@ -428,7 +452,7 @@ scan_roots() {
     if [ -n "$accepted" ]; then
       log "FATAL: no usable adapter — accepted [$accepted] but per-session dispatch is claude-only, and claude is not among them. Refusing to scan."
     else
-      log "FATAL: the adapter loader ran and accepted no adapters (rejected: $(adapters_rejected 2>/dev/null || printf none)). Refusing to scan."
+      log "FATAL: the adapter loader ran and accepted no adapters (rejected: $(adapters_rejected 2>/dev/null)). Refusing to scan."
     fi
     RAW=0
     return 1
@@ -538,6 +562,10 @@ scan_one_adapter() { # $1=adapter name
       if ! printf '%s\n' "$sp" >> "$SESSIONS_LIST.raw" 2>/dev/null \
          || ! printf '%s\t%s\n' "$src" "$sp" >> "$SESSIONS_LIST.src" 2>/dev/null; then
         log "FATAL: could not record $sp in the session lists"
+        # Remove the staging file on THIS exit too. Under AUTODREAM_FORCE=1 the
+        # findings dir is reused across reruns, so repeated failures would pile up
+        # .enum.* files in the directory the aggregator globs.
+        rm -f "$nulfile"
         return 1
       fi
     done < "$nulfile"
@@ -677,7 +705,13 @@ build_source_sidecar() {
     if [ -n "$prev" ]; then
       if [ "$prev" = "$sp" ]; then
         DUPLICATE_PATHS=$((DUPLICATE_PATHS + 1))
-        log "  duplicate: $sp was claimed by more than one adapter; keeping the first"
+        # NOT "claimed by more than one adapter". Only `claude` is ever enabled, and
+        # sessions.txt.src is not deduplicated while .raw is sort -u'd, so every
+        # duplicate today is one transcript reached through two entries of
+        # SESSION_ROOTS — ordinary on a host where root-probe autodetects each
+        # $HOME/.claude*/projects and one is a symlink of another. Naming adapters
+        # sends the reader after a misconfiguration that does not exist.
+        log "  duplicate: $sp was reached more than once (two session roots, or two adapters); keeping the first"
       else
         # Two DIFFERENT paths on one truncated hash. There is no sensible winner,
         # so BOTH are dropped from the worklist. An earlier version logged
@@ -710,7 +744,15 @@ build_source_sidecar() {
       log "FATAL: could not record $sp in the collision index; refusing to detect collisions blind"
       return 1
     fi
-    printf '%s\t%s\n' "$h" "$src" >> "$sidecar" 2>/dev/null || :
+    # Fail closed, like every sibling write in this function. A silent `|| :` here
+    # drops rows on a full disk, SESSIONS_BY_SOURCE is then computed from the short
+    # sidecar below and reported as fact, with no counter and no line saying it is
+    # short. This function's own header argues that a silently unwritable file is
+    # how you arrive at the failure it exists to prevent.
+    if ! printf '%s\t%s\n' "$h" "$src" >> "$sidecar" 2>/dev/null; then
+      log "FATAL: could not record provenance for $h in $sidecar"
+      return 1
+    fi
     counts="$counts$src"$'\n'
   done < "$SESSIONS_LIST.src" || {
     log "FATAL: could not read the session source list; refusing to detect collisions over an unreadable input"
@@ -1318,7 +1360,7 @@ run() {
       printf 'roots_unavailable: %s\n' "$ROOTS_UNAVAILABLE"
       printf 'session_roots: %s\n' "$(( $(printf '%s' "$SESSION_ROOTS" | tr -cd ':' | wc -c) + 1 ))"
       printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
-      printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null || printf none)"
+      printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null)"
       printf 'adapters_enabled: %s\n' "$(enabled_adapters 2>/dev/null | tr ' ' ',' | sed 's/,$//')"
       printf 'sessions_by_source: %s\n' "${SESSIONS_BY_SOURCE:-none}"
     } > "$FINDINGS_DIR/run-stats.txt" 2>/dev/null || true
@@ -1571,7 +1613,7 @@ PY
     # a third-party adapter failing containment, a mismatched manifest name, a
     # lost exec bit. Same silent-shortfall class as overlap_measured and
     # stats_sidecars_unparseable: the value is that a zero here means something.
-    printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null || printf none)"
+    printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null)"
     printf 'sessions_by_source: %s\n' "$SESSIONS_BY_SOURCE"
     printf 'sessions_duplicate_path: %s\n' "$DUPLICATE_PATHS"
     printf 'sessions_hash_collision: %s\n' "$HASH_COLLISIONS"

@@ -50,9 +50,20 @@ adapters_root() {
 # Comma-separated list of refused directory names, readable after a
 # $(adapters_list) call because it is backed by a file.
 adapters_rejected() {
-  local log; log=$(adapters_reject_log)
-  [ -f "$log" ] || return 0
-  sort -u "$log" | tr '\n' ',' | sed 's/,$//'
+  local log out; log=$(adapters_reject_log)
+  # `none`, never an empty string. run.sh writes this straight into run-stats.txt,
+  # and `adapters_rejected: ` with nothing after it cannot be told apart from a key
+  # that was never measured — the exact ambiguity overlap_measured and
+  # stats_sidecars_unparseable exist here to refuse. A caller-side
+  # `|| printf none` cannot save it either, because returning 0 with no output is
+  # success.
+  if [ -f "$log" ]; then
+    out=$(sort -u "$log" | tr '\n' ',' | sed 's/,$//')
+  else
+    out=""
+  fi
+  [ -n "$out" ] || out=none
+  printf '%s' "$out"
 }
 
 _adapter_reject() { # $1=name

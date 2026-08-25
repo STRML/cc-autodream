@@ -87,7 +87,11 @@ has "half" "$(adapters_rejected)" "a manifest with no adapter.sh is RECORDED as 
 echo "# adapters: underscore-prefixed dirs are excluded from the default set"
 root=$(sandbox); mk_adapter "$root" claude claude; mk_adapter "$root" _fixture _fixture; use "$root"
 assert_eq "$(adapters_list)" "claude" "_fixture is not in the default set"
-assert_eq "$(adapters_rejected)" "" "excluding a test adapter is not a rejection"
+# `none`, not the empty string. run.sh writes this value straight into
+# run-stats.txt, where a blank cannot be told apart from a key that was never
+# measured — and a caller-side `|| printf none` cannot rescue it, because
+# returning 0 with no output is success.
+assert_eq "$(adapters_rejected)" "none" "excluding a test adapter is not a rejection"
 
 echo "# adapters: the manifest is data — \$HOME substitutes, nothing evaluates"
 root=$(sandbox); mkdir -p "$root/claude"

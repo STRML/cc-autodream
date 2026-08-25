@@ -2145,6 +2145,42 @@ test_fresh_host_with_no_store_is_not_a_failure(){
   rm -rf "$T"
 }
 
+# ---- Upgrade lag: run.sh is a symlink, the libraries are not there yet -------
+# The live install symlinks each script individually into ~/.claude/autodream, so
+# merging a branch changes run.sh the instant it lands while lib-project.sh,
+# adapters.sh, preflight.sh and adapters/ only appear when install.sh is re-run.
+# Every other test invokes $REPO/bin/run.sh directly, where the libraries sit
+# right beside it, so 358 green assertions all ran with them present and none of
+# them exercised the shape the nightly actually has.
+test_upgrade_lag_install_still_produces_a_report(){
+  echo "# upgrade lag: run.sh symlinked into an install dir with no libraries still reports"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home/.claude/projects/proj-a" "$T/autodream" "$T/dreams"
+  cp "$REPO/prompts/SESSION_TRIAGE.md" "$T/autodream/SESSION_TRIAGE.md"
+  cp "$REPO/prompts/PROMPT.md"         "$T/autodream/PROMPT.md"
+  # Exactly what a pre-adapter install left behind: the helper scripts, and
+  # run.sh as a symlink into the repo. Deliberately NOT lib-project.sh,
+  # adapters.sh, preflight.sh or adapters/.
+  local h
+  for h in prune-self-sessions.sh root-probe.sh slim-transcript.sh session-stats.sh \
+           overlap-stats.sh vault-notes.sh x-bookmarks.sh notify.sh; do
+    [ -f "$REPO/bin/$h" ] && ln -s "$REPO/bin/$h" "$T/autodream/$h"
+  done
+  ln -s "$REPO/bin/run.sh" "$T/autodream/run.sh"
+  mk_session_in "$T/home/.claude/projects/proj-a" s1
+  HOME="$T/home" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$T/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    AUTODREAM_DIR="$T/autodream" DREAMS_DIR="$T/dreams" \
+    bash "$T/autodream/run.sh" "$DATE" > "$T/run.out" 2>&1
+  local rc=$?
+  cat "$T/autodream/logs/run-$DATE.log" >> "$T/run.out" 2>/dev/null || true
+  assert_eq "$rc" "0" "a symlinked runner with no installed libraries exits 0"
+  assert_nogrep "$T/run.out" 'session_hash: command not found' "session_hash resolved"
+  assert_nonempty "$T/dreams/$DATE.md" "the upgrade-lag install still produced a report"
+  rm -rf "$T"
+}
+
 # ---- Forced hash collision: the branch four review rounds kept touching -----
 # A natural 48-bit collision cannot be produced in a test, so the hash is stubbed:
 # a fake `shasum` returning a constant makes every session collide. Without this,
@@ -2388,6 +2424,7 @@ test_failing_enumerator_aborts_the_run
 test_partial_enumeration_keeps_what_it_read
 test_all_roots_unavailable_fails
 test_fresh_host_with_no_store_is_not_a_failure
+test_upgrade_lag_install_still_produces_a_report
 test_forced_hash_collision_drops_both
 test_collision_worklist_failure_aborts
 test_collision_membership_probe_failure_aborts
