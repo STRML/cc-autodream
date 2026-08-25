@@ -19,10 +19,14 @@ cmd="${1:-}"
 case "$cmd" in
 
   enumerate) # $1=root $2=target-date $3=next-date -> NUL-delimited session paths
+    # stderr is NOT discarded. find exits 1 for any unreadable directory in the
+    # walk, and the runner has to decide between a partial corpus and a failed
+    # root on that status alone. Swallowing the reason left it reporting bare
+    # `(exit 1)` with nothing to act on. Only stdout is the contract.
     find "$1" -type f -name '*.jsonl' \
          -newermt "$2 00:00:00" \
          ! -newermt "$3 00:00:00" \
-         -print0 2>/dev/null
+         -print0
     ;;
 
   normalize) # $1=in $2=out

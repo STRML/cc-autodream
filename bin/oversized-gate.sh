@@ -21,9 +21,29 @@
 set -u
 
 HERE=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# The install dir is not the only place to look, for the same reason run.sh has a
+# fallback: install.sh symlinks each script into ~/.claude/autodream individually,
+# so merging a branch swaps the script those links point at instantly while a NEW
+# library link does not exist until install.sh is re-run. `cd -P` resolves a
+# symlinked DIRECTORY but not a symlinked FILE, so $HERE is the install dir every
+# time and this script stopped working entirely during that window — on the one
+# tool whose whole purpose is recomputing the #12 gate from artifacts after a
+# runner problem. Walk this script's own symlink chain to find the repo's bin/.
+_og_src="${BASH_SOURCE[0]}"; _og_hops=0
+while [ -L "$_og_src" ] && [ "$_og_hops" -lt 8 ]; do
+  _og_dir=$(cd "$(dirname "$_og_src")" && pwd) || break
+  _og_src=$(readlink "$_og_src") || break
+  case $_og_src in /*) ;; *) _og_src="$_og_dir/$_og_src" ;; esac
+  _og_hops=$((_og_hops + 1))
+done
+_og_real=""
+[ -L "$_og_src" ] || _og_real=$(cd "$(dirname "$_og_src")" 2>/dev/null && pwd) || _og_real=""
 # shellcheck source=/dev/null
-if [ -r "$HERE/lib-project.sh" ]; then . "$HERE/lib-project.sh"; else
-  echo "oversized-gate: lib-project.sh not found next to this script" >&2; exit 2
+if [ -r "$HERE/lib-project.sh" ]; then . "$HERE/lib-project.sh"
+elif [ -n "$_og_real" ] && [ -r "$_og_real/lib-project.sh" ]; then . "$_og_real/lib-project.sh"
+else
+  echo "oversized-gate: lib-project.sh not found beside this script or its real location" >&2; exit 2
 fi
 
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"

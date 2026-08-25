@@ -2031,6 +2031,39 @@ test_failing_enumerator_aborts_the_run(){
   rm -rf "$root"
 }
 
+# ---- One bad root must not take the night with it --------------------------
+# find exits 1 for ANY unreadable directory in the walk, match or no match —
+# verified on this host: an unreadable sibling makes it exit 1 both with and
+# without matches, and exit 0 without one. A secondary root legitimately matches
+# nothing on a given date, so treating "nonzero exit, no output" as fatal for the
+# whole run meant one permission-denied directory under a quiet secondary root
+# killed a night on which the primary had a full corpus — and killed it
+# invisibly, because run() returned before notify.sh and no findings JSONs
+# existed for unassembled_dates() to see.
+test_one_failed_root_does_not_kill_the_night(){
+  echo "# roots: one root that fails to enumerate does not discard the roots that worked"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  # A second root that exists, holds no matching file, and contains a directory
+  # find cannot read. That combination is exit 1 with empty output.
+  local bad="$root/badroot"; mkdir -p "$bad/locked"
+  chmod 000 "$bad/locked"
+  SESSION_ROOTS="$root/projects:$bad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  chmod 755 "$bad/locked"
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  assert_eq "$rc" "0" "the run survives one failed root"
+  assert_nonempty "$root/dreams/$DATE.md" "the healthy root's corpus still produced a report"
+  assert_grep "$root/run.out" 'contributes NO sessions' "the failed root is named in the log"
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^roots_failed: 1$' \
+    "roots_failed counts it, so a shrinking corpus is visible rather than silent"
+  rm -rf "$root"
+}
+
 # ---- A corpus that exists but yields nothing is not an empty night ----------
 # COUNT=0 has three distinct causes and they used to read identically: no files
 # at all, every file an autodream worker transcript, or every file an empty
@@ -2421,6 +2454,7 @@ test_preflight_stops_a_run_missing_a_dependency
 test_install_deploys_the_adapter_runtime
 test_unrepresentable_characters_are_refused
 test_failing_enumerator_aborts_the_run
+test_one_failed_root_does_not_kill_the_night
 test_partial_enumeration_keeps_what_it_read
 test_all_roots_unavailable_fails
 test_fresh_host_with_no_store_is_not_a_failure

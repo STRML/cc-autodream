@@ -358,6 +358,7 @@ PARTIAL_ROOTS=0     # roots whose enumerator failed but still returned data
 ROOTS_CONFIGURED=0  # roots we were told to scan
 ROOTS_SCANNED=0     # roots that existed and were walked
 ROOTS_UNAVAILABLE=0 # roots that were configured but are not directories
+ROOTS_FAILED=0      # roots reached but whose enumeration failed and returned nothing
 SESSION_ROOTS_ARE_FALLBACK=0  # 1 when SESSION_ROOTS is the bare default nobody configured
 COLLIDED_DROPPED=0  # paths removed from the worklist by collision handling
 SIDECAR_STALE_ROWS=0  # provenance rows that could not be rewritten; sessions_by_source is high by this much
@@ -465,9 +466,14 @@ scan_roots() {
   # RAW would be 0, every shortfall counter would be 0, and the stub would say
   # no files were modified. A fresh host with NO roots configured is a different
   # thing and stays legitimate.
+  # ROOTS_SCANNED counts roots ENTERED; a root whose enumeration failed with no
+  # output was entered and read nothing, so it must not vouch for the night.
+  # Subtracting ROOTS_FAILED is what keeps "every root failed" fatal now that a
+  # single failed root only warns.
+  local roots_usable=$((ROOTS_SCANNED - ROOTS_FAILED))
   if [ "${SESSION_ROOTS_ARE_FALLBACK:-0}" != "1" ] \
-     && [ "$ROOTS_CONFIGURED" -gt 0 ] && [ "$ROOTS_SCANNED" -eq 0 ]; then
-    log "FATAL: all $ROOTS_CONFIGURED configured session root(s) are unavailable; refusing to report an empty night over a store that was never reached"
+     && [ "$ROOTS_CONFIGURED" -gt 0 ] && [ "$roots_usable" -le 0 ]; then
+    log "FATAL: all $ROOTS_CONFIGURED configured session root(s) are unavailable or failed to enumerate; refusing to report an empty night over a store that was never reached"
     return 1
   fi
 
@@ -525,9 +531,24 @@ scan_one_adapter() { # $1=adapter name
         PARTIAL_ROOTS=$((PARTIAL_ROOTS + 1))
         log "WARNING: enumeration for adapter '$src' at root $r exited $status but returned data; continuing with a possibly INCOMPLETE corpus for this root"
       else
-        log "FATAL: enumeration failed for adapter '$src' at root $r (exit $status) and returned nothing; refusing to report over a corpus that was never read"
+        # Nothing read from THIS root. That is not a reason to throw away the
+        # roots that worked. Multi-root scanning is this tool's premise, and a
+        # secondary root (~/.claude-nous/projects, ~/.claude-sigint/projects)
+        # legitimately matches nothing on a given date — while BSD find exits 1
+        # for ANY unreadable subdirectory anywhere in the walk, match or no
+        # match. Verified on this host: an unreadable sibling directory makes
+        # `find` exit 1 both with and without matches; without it, exit 0. So one
+        # permission-denied directory under a quiet secondary root used to kill a
+        # night on which the primary root had a full corpus — and kill it
+        # invisibly, because run() returned 1 before notify.sh ran and no
+        # findings JSONs were written for unassembled_dates() to notice.
+        #
+        # Count it, say it loudly, carry on. The all-roots-failed case below is
+        # what still refuses to report over a store nothing was read from.
+        ROOTS_FAILED=$((ROOTS_FAILED + 1))
+        log "WARNING: enumeration failed for adapter '$src' at root $r (exit $status) and returned nothing; this root contributes NO sessions to tonight's corpus"
         rm -f "$nulfile"
-        return 1
+        continue
       fi
     fi
     while IFS= read -r -d '' sp; do
@@ -669,7 +690,7 @@ build_source_sidecar() {
     return 1
   fi
   DUPLICATE_PATHS=0; HASH_COLLISIONS=0; SESSIONS_BY_SOURCE=""
-  local src sp h prev counts=""
+  local src sp h prev
   # source FIRST, so a path holding any remaining oddity is absorbed whole by the
   # last variable rather than truncated into it.
   while IFS=$'\t' read -r src sp; do
@@ -753,7 +774,6 @@ build_source_sidecar() {
       log "FATAL: could not record provenance for $h in $sidecar"
       return 1
     fi
-    counts="$counts$src"$'\n'
   done < "$SESSIONS_LIST.src" || {
     log "FATAL: could not read the session source list; refusing to detect collisions over an unreadable input"
     return 1
@@ -1239,19 +1259,6 @@ run() {
 
   [ -x "$CLAUDE_BIN" ] || { log "FATAL: claude not at $CLAUDE_BIN"; exit 1; }
 
-  # ---- Preflight: the shared dependencies this script already assumes ----
-  # Before anything is enumerated, because the dangerous one fails silently: with
-  # shasum absent the artifact hash assignment yields an empty string and every
-  # session in the night writes to the same findings filename. A run that got
-  # that far would produce one record where it should have produced a hundred
-  # and report success. Stopping here costs a night; continuing corrupts one.
-  if [ -x "$PREFLIGHT" ]; then
-    if ! "$PREFLIGHT" 2>>"$RUN_LOG"; then
-      log "FATAL: preflight failed; see the MISSING lines in this log. Nothing was enumerated."
-      return 1
-    fi
-  fi
-
   # ---- Session roots (which $HOME/.claude*/projects dirs we scan) ----
   probe_roots
 
@@ -1285,6 +1292,31 @@ run() {
   if [ -s "$REPORT_PATH" ] && [ "${AUTODREAM_FORCE:-0}" != "1" ]; then
     log "report already exists for $TARGET_DATE ($REPORT_PATH); nothing to do (AUTODREAM_FORCE=1 to rebuild)"
     return 0
+  fi
+
+  # ---- Preflight: the shared dependencies this script already assumes ----
+  # Before anything is ENUMERATED, because the dangerous one fails silently: with
+  # shasum absent the artifact hash assignment yields an empty string and every
+  # session in the night writes to the same findings filename. A run that got
+  # that far would produce one record where it should have produced a hundred
+  # and report success. Stopping here costs a night; continuing corrupts one.
+  #
+  # But BELOW the idempotency guard, which is not enumeration. Above it, a host
+  # missing one dependency turned an already-complete date from a one-second
+  # no-op into a failed run and an exit 1 on each of the four morning triggers.
+  #
+  # Gated on -r and invoked through bash, not gated on -x. install.sh's own
+  # comment worries about a distribution path that loses the exec bit — a zip, a
+  # restrictive umask — and an `[ -x ]` gate answers that by SKIPPING the check
+  # silently, which lands you back in exactly the empty-hash corruption preflight
+  # exists to stop. A present-but-unreadable preflight says so instead.
+  if [ -r "$PREFLIGHT" ]; then
+    if ! bash "$PREFLIGHT" 2>>"$RUN_LOG"; then
+      log "FATAL: preflight failed; see the MISSING lines in this log. Nothing was enumerated."
+      return 1
+    fi
+  else
+    log "WARNING: preflight not readable at $PREFLIGHT; the shared-dependency check did NOT run"
   fi
 
   # ---- Enumerate sessions modified during the target day ----
@@ -1358,11 +1390,43 @@ run() {
       # regression to single-root scanning is exactly what would explain it.
       printf 'roots_partially_enumerated: %s\n' "$PARTIAL_ROOTS"
       printf 'roots_unavailable: %s\n' "$ROOTS_UNAVAILABLE"
+      printf 'roots_failed: %s\n' "$ROOTS_FAILED"
       printf 'session_roots: %s\n' "$(( $(printf '%s' "$SESSION_ROOTS" | tr -cd ':' | wc -c) + 1 ))"
       printf 'session_roots_list: %s\n' "$SESSION_ROOTS"
       printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null)"
       printf 'adapters_enabled: %s\n' "$(enabled_adapters 2>/dev/null | tr ' ' ',' | sed 's/,$//')"
       printf 'sessions_by_source: %s\n' "${SESSIONS_BY_SOURCE:-none}"
+      # The rest of the key set, emitted as real zeroes rather than omitted.
+      # PROMPT.md tells L2 that keys missing from run-stats.txt mean the runner
+      # predated the stat, so a zero-session night on CURRENT code produced a
+      # morning report blaming a stale checkout for the gap. A night with nothing
+      # to triage genuinely did zero L1 rounds and measured no overlap; saying so
+      # is different from not saying it.
+      # Key names copied from the full-run block below, not invented. The first
+      # draft of this emitted l1_missing, oversized_slimmed, overlap_pairs and
+      # elapsed — none of which that block writes — which would have left the real
+      # keys still missing while adding four L2 has never seen.
+      printf 'sessions_dropped_after_failures: 0\n'
+      printf 'gated: 0\n'
+      printf 'l1_rounds_max: %s\n' "${AUTODREAM_L1_ROUNDS:-5}"
+      printf 'l1_rounds_used: 0\n'
+      printf 'l1_findings_written: 0\n'
+      printf 'l1_missing_after_retries: 0\n'
+      printf 'l1_err_files: 0\n'
+      printf 'l1_findings_with_error: 0\n'
+      printf 'l1_sessions_already_done_at_start: 0\n'
+      printf 'l1_sessions_freshly_processed: 0\n'
+      printf 'l1_elapsed_seconds: 0\n'
+      printf 'oversized_total: 0\n'
+      printf 'oversized_errored: 0\n'
+      printf 'stats_sidecars_unparseable: 0\n'
+      # A night with nothing to triage genuinely measured no overlap. That is not
+      # the same as the overlap pass having failed, and the zero counts below are
+      # the honest pair that goes with it.
+      printf 'overlap_measured: no\n'
+      printf 'overlap_events: 0\n'
+      printf 'sessions_with_overlap: 0\n'
+      printf 'unassembled_dates: %s\n' "${UNASSEMBLED:-none}"
     } > "$FINDINGS_DIR/run-stats.txt" 2>/dev/null || true
     cat > "$REPORT_PATH" <<EOF
 # Autodream — $TARGET_DATE
@@ -1605,6 +1669,7 @@ PY
     # clean read either, and the aggregator should not treat the totals as complete.
     printf 'roots_partially_enumerated: %s\n' "$PARTIAL_ROOTS"
     printf 'roots_unavailable: %s\n' "$ROOTS_UNAVAILABLE"
+    printf 'roots_failed: %s\n' "$ROOTS_FAILED"
     # Which harnesses produced this night's corpus. A source that drops to zero
     # on a day the user worked in it is the signal that its ingest broke, and
     # that is invisible without a per-source count.
