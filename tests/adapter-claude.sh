@@ -47,7 +47,13 @@ echo "# claude adapter: normalize is a verbatim copy for this harness"
 out="$tmp/norm.jsonl"
 if "$A" normalize "$S" "$out"; then ok "normalize exits 0"; else no "normalize exits 0"; fi
 if cmp -s "$S" "$out"; then ok "normalize copied the file verbatim"; else no "normalize copied the file verbatim"; fi
-if [ -e "$out.tmp" ]; then no "no .tmp left behind"; else ok "no .tmp left behind"; fi
+# Glob, not a literal. mktemp creates `<out>.tmp.XXXXXX`, so `<out>.tmp` names a
+# path nothing ever creates and the assertion passed against a leaking
+# implementation. This was the third copy of that same mistake — the two in
+# adapter-contract.sh were fixed a commit earlier and this one was missed,
+# because it was the assertion nobody had reason to re-read.
+set -- "$out".tmp.*
+if [ -e "$1" ]; then no "no temp left behind (found $(basename "$1"))"; else ok "no temp left behind"; fi
 
 echo "# claude adapter: a failed normalize leaves no partial output"
 if "$A" normalize "$tmp/missing.jsonl" "$tmp/partial.jsonl" 2>/dev/null; then

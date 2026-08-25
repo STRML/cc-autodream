@@ -43,6 +43,16 @@ case "$cmd" in
     t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
     cp "$1" "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
     mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }
+    # Post-condition, because the guard above is a check-then-act. Something can
+    # create a directory at $2 between the two, and `mv` then moves the temp
+    # INSIDE it and returns 0 — success reported with no output written, which
+    # is the exact failure the guard exists to stop. macOS has no `mv -T`, so
+    # the destination is verified to be a regular file afterwards and the stray
+    # removed. Verified by deleting the guard above: this alone still satisfies
+    # the directory-destination contract test, so it is a real backstop and not
+    # decoration. The guard stays anyway — it fails before any work, and it is
+    # what stops a file appearing inside the caller's directory even briefly.
+    [ -f "$2" ] || { rm -f "$2/$(basename "$t")" 2>/dev/null; exit 1; }
     ;;
 
   project) # $1=session -> the session's real working directory
@@ -109,6 +119,7 @@ case "$cmd" in
     t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
     "$delegate" "$1" "$t" || { rm -f "$t"; exit 1; }
     mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }
+    [ -f "$2" ] || { rm -f "$2/$(basename "$t")" 2>/dev/null; exit 1; }   # see the note above
     ;;
 
   is-self) # $1=session -> exit 0 if this is one of autodream's own transcripts
