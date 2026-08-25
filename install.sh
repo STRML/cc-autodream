@@ -63,6 +63,14 @@ link "$REPO_DIR/bin/cookie-cadence.sh"       "$TARGET/cookie-cadence.sh"
 link "$REPO_DIR/bin/vault-notes.sh"          "$TARGET/vault-notes.sh"
 link "$REPO_DIR/bin/x-bookmarks.sh"          "$TARGET/x-bookmarks.sh"
 link "$REPO_DIR/bin/root-probe.sh"           "$TARGET/root-probe.sh"
+link "$REPO_DIR/bin/lib-project.sh"           "$TARGET/lib-project.sh"
+link "$REPO_DIR/bin/adapters.sh"              "$TARGET/adapters.sh"
+link "$REPO_DIR/bin/preflight.sh"             "$TARGET/preflight.sh"
+# The adapters TREE, not individual files: run.sh resolves adapters/<name>/adapter.sh
+# relative to the script dir, so the whole directory has to be reachable from the
+# install target. Without this the installed runner silently takes the legacy inline
+# enumeration path and gets no preflight, while still reporting adapters_enabled.
+link "$REPO_DIR/adapters"                     "$TARGET/adapters"
 link "$REPO_DIR/prompts/PROMPT.md"      "$TARGET/PROMPT.md"
 link "$REPO_DIR/prompts/SESSION_TRIAGE.md" "$TARGET/SESSION_TRIAGE.md"
 

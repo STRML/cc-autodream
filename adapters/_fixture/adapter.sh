@@ -24,8 +24,9 @@ case "$cmd" in
   normalize) # $1=in $2=out
     [ -r "$1" ] || exit 1
     jq -e . "$1" >/dev/null 2>&1 || exit 1        # fail closed on malformed input
-    cp "$1" "$2.tmp" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
-    mv "$2.tmp" "$2" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+    t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
+    cp "$1" "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
+    mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }
     ;;
 
   project) # $1=session -> resolved cwd
@@ -46,15 +47,17 @@ case "$cmd" in
     [ -r "$1" ] || exit 1
     bytes=$(wc -c < "$1" | tr -d ' ')
     turns=$(jq -re '.turns // 0' "$1" 2>/dev/null) || turns=0
+    t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
     printf '{"transcript_bytes":%s,"user_message_count":%s,"tool_call_count":0}\n' \
-      "${bytes:-0}" "${turns:-0}" > "$2.tmp" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
-    mv "$2.tmp" "$2" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+      "${bytes:-0}" "${turns:-0}" > "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
+    mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }
     ;;
 
   slim) # $1=in $2=out — a fixture is already small; the contract is what matters
     [ -r "$1" ] || exit 1
-    cp "$1" "$2.tmp" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
-    mv "$2.tmp" "$2" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+    t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
+    cp "$1" "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
+    mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }
     ;;
 
   is-self) exit 1 ;;                    # the fixture harness never runs autodream

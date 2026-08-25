@@ -33,11 +33,18 @@ adapters_reject_log() {
   printf '%s' "$(adapters_root)/.rejected"
 }
 
+# Two layouts have to work, and assuming only one is how the first version of
+# this change shipped a silently broken install. In the REPO, bin/ and adapters/
+# are siblings. Under the INSTALL, install.sh symlinks everything flat into
+# ~/.claude/autodream, so adapters/ sits beside adapters.sh rather than one level
+# up. Check the flat layout first: the nightly runs from the installed copy, so
+# that is the expensive one to get wrong.
 adapters_root() {
   if [ -n "${ADAPTERS_ROOT:-}" ]; then printf '%s' "$ADAPTERS_ROOT"; return 0; fi
   local here
-  here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-  printf '%s' "$here/adapters"
+  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  if [ -d "$here/adapters" ]; then printf '%s' "$here/adapters"; return 0; fi
+  printf '%s' "$(cd "$here/.." && pwd)/adapters"
 }
 
 # Comma-separated list of refused directory names, readable after a

@@ -320,6 +320,7 @@ write_unindexed_flag() {
 
 # Find sessions modified during the target day across every session root.
 NL=$'\n'            # for the newline-in-path check below
+TAB=$'\t'           # ditto; the L1 xargs -I fan-out turns a tab into a space
 REJECTED_PATHS=0    # session paths a line-based sessions.txt cannot represent
 DUPLICATE_PATHS=0   # one path claimed by more than one adapter
 HASH_COLLISIONS=0   # two different paths truncating to one artifact hash
@@ -344,22 +345,60 @@ adapter_roots() { # $1=adapter name -> one root per line
   printf '%s\n' "$roots"
 }
 
-# The adapters actually enumerated this run. Empty when the adapters/ directory
-# is absent — an install symlinked at an older tree — in which case enumeration
-# falls back to the pre-adapter path so a partial upgrade cannot lose a night.
+# The adapters actually enumerated this run.
+#
+# The fallback fires ONLY when the adapter machinery is genuinely absent — an
+# install symlinked at a tree predating adapters/ — so a partial upgrade degrades
+# instead of losing a night. It must NOT fire when the loader ran and accepted
+# zero adapters, because that is a refusal: a claude directory rejected for
+# failing containment or carrying a mismatched manifest would otherwise be
+# manufactured back into the list and executed anyway, which turns every check in
+# adapters.sh into decoration.
+#
+# Until per-session dispatch is adapter-aware, only `claude` may be enabled. The
+# rest of the pipeline — the substantive filter, the stats sidecar, the slimmer
+# and the L1 engine — is still Claude-specific, so enumerating a second harness
+# here would hand its sessions to a Claude parser that reads them as empty and
+# drops them silently. Refusing out loud is the honest version of not supporting
+# it yet.
 enabled_adapters() {
+  # "Genuinely absent" means the loader is not sourced OR the adapters tree does
+  # not exist — a tarball or partial install. That is a legacy install and it
+  # falls back. It is NOT the same as a present tree from which the loader
+  # accepted nothing, which is a refusal and must stop the run. Conflating the
+  # two is how the first version of this both broke a non-git install test and
+  # would have let a rejected adapter run anyway.
+  if ! declare -F adapters_list >/dev/null 2>&1 || [ ! -d "$(adapters_root 2>/dev/null)" ]; then
+    printf 'claude'; return 0
+  fi
   local a
   a=$(adapters_list 2>/dev/null | tr '\n' ' ')
-  [ -n "${a// /}" ] || a="claude"
-  printf '%s' "$a"
+  a="${a% }"
+  if [ -z "${a// /}" ]; then
+    printf ''                        # tree present, nothing accepted: a refusal
+    return 0
+  fi
+  local one keep=""
+  for one in $a; do
+    if [ "$one" = "claude" ]; then keep="claude"; else
+      log "  adapter '$one' is enabled but per-session dispatch is not adapter-aware yet; not enumerating it"
+    fi
+  done
+  printf '%s' "$keep"
 }
 
 scan_roots() {
   : > "$SESSIONS_LIST.raw"
   : > "$SESSIONS_LIST.src"     # internal <path>\t<source>, deduped into the sidecar below
   REJECTED_PATHS=0
-  local src
-  for src in $(enabled_adapters); do
+  local src adapters
+  adapters=$(enabled_adapters)
+  if [ -z "${adapters// /}" ]; then
+    log "FATAL: the adapter loader ran and accepted no adapters (rejected: $(adapters_rejected 2>/dev/null)). Refusing to scan."
+    RAW=0
+    return 1
+  fi
+  for src in $adapters; do
     scan_one_adapter "$src"
   done
   # A transcript reachable from two roots (one dir a symlink of another) must be
@@ -389,15 +428,33 @@ scan_one_adapter() { # $1=adapter name
     # the runner then invents a session that does not exist, so it is rejected
     # here — before either representation is built — rather than transported.
     while IFS= read -r -d '' sp; do
+      # Reject every character the downstream artifacts cannot carry. Verified on
+      # this host against the real consumers rather than assumed:
+      #   newline    sessions.txt is line-delimited; find writes it as two lines
+      #              and the runner then triages a session that does not exist
+      #   tab        `xargs -I {}` at the L1 fan-out turns it into a space, so the
+      #              worker hashes and opens a path that is not the one enumerated
+      #   backslash  the same fan-out deletes it outright
+      #   quote      the same fan-out dies with "unterminated quote" and takes the
+      #              WHOLE night's dispatch with it, not just this session
+      # The last three are a pre-existing limitation of the xargs -I transport, not
+      # of this change; an earlier draft accepted tabs because the hash and
+      # sessions.txt tolerate them, having checked those two consumers and not the
+      # fan-out. Accepting a path the dispatcher then corrupts is worse than
+      # refusing it out loud, so these are counted refusals until that transport is
+      # NUL-safe.
       case "$sp" in
-        *"$NL"*)
+        *"$NL"*|*"$TAB"*|*\\*|*\"*|*\'*)
           REJECTED_PATHS=$((REJECTED_PATHS + 1))
-          log "  skip: session path contains a newline, which a line-based sessions.txt cannot represent: $(printf '%q' "$sp")"
+          log "  skip: session path holds a character the artifact list or the L1 fan-out cannot carry: $(printf '%q' "$sp")"
           continue
           ;;
       esac
       printf '%s\n' "$sp" >> "$SESSIONS_LIST.raw"
-      printf '%s\t%s\n' "$sp" "$src" >> "$SESSIONS_LIST.src"
+      # source FIRST: the adapter name is a validated safe identifier with no tab,
+      # so `read -r src sp` lets sp absorb the whole remainder. The reverse order
+      # truncated any path holding a tab and silently lost its provenance.
+      printf '%s\t%s\n' "$src" "$sp" >> "$SESSIONS_LIST.src"
     done < <(enumerate_for "$src" "$r")
   done < <(adapter_roots "$src")
 }
@@ -406,7 +463,12 @@ scan_one_adapter() { # $1=adapter name
 # installed; the inline find is the fallback for an install whose tree predates
 # adapters/, so a partial upgrade degrades rather than losing the night.
 enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
-  if declare -F adapter_run >/dev/null 2>&1 && [ -x "$(adapters_root 2>/dev/null)/$1/adapter.sh" ]; then
+  # Gated on the adapter having been ACCEPTED, not merely on adapter.sh being
+  # executable: an executable check alone would run a directory that failed
+  # containment.
+  if declare -F adapter_run >/dev/null 2>&1 \
+     && adapters_list 2>/dev/null | grep -qxF "$1" \
+     && [ -x "$(adapters_root 2>/dev/null)/$1/adapter.sh" ]; then
     adapter_run "$1" enumerate "$2" "$TARGET_DATE" "$NEXT_DATE"
     return 0
   fi
@@ -429,22 +491,38 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
 build_source_sidecar() {
   local sidecar="$FINDINGS_DIR/sessions-source.txt"
   local seen="$FINDINGS_DIR/.hash-to-path"
-  : > "$sidecar"; : > "$seen"
+  local drop="$FINDINGS_DIR/.collided"
+  : > "$sidecar"; : > "$seen"; : > "$drop"
   DUPLICATE_PATHS=0; HASH_COLLISIONS=0; SESSIONS_BY_SOURCE=""
-  local sp src h prev counts=""
-  while IFS=$'\t' read -r sp src; do
+  local src sp h prev counts=""
+  # source FIRST, so a path holding any remaining oddity is absorbed whole by the
+  # last variable rather than truncated into it.
+  while IFS=$'\t' read -r src sp; do
     [ -n "$sp" ] || continue
-    grep -qxF "$sp" "$SESSIONS_LIST.raw" 2>/dev/null || continue   # dropped by the newline check
+    grep -qxF "$sp" "$SESSIONS_LIST.raw" 2>/dev/null || continue   # dropped at enumeration
     h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
-    prev=$(awk -F'\t' -v k="$h" '$1==k {print $2; exit}' "$seen" 2>/dev/null)
+    # The stored path is everything after the 12-char hash and its tab, taken by
+    # offset rather than by field split, so no delimiter inside the path matters.
+    prev=$(awk -v k="$h" 'substr($0,1,12)==k {print substr($0,14); exit}' "$seen" 2>/dev/null)
     if [ -n "$prev" ]; then
       if [ "$prev" = "$sp" ]; then
         DUPLICATE_PATHS=$((DUPLICATE_PATHS + 1))
         log "  duplicate: $sp was claimed by more than one adapter; keeping the first"
       else
+        # Two DIFFERENT paths on one truncated hash. There is no sensible winner,
+        # so BOTH are dropped from the worklist. An earlier version logged
+        # "skipping both" while skipping neither: it removed the sidecar row and
+        # left both paths in sessions.txt.raw, so two workers still raced for one
+        # <hash>.json and silently overwrote each other. The log said one thing and
+        # the code did another, which is worse than not checking at all.
         HASH_COLLISIONS=$((HASH_COLLISIONS + 1))
-        log "  COLLISION: $h maps to two different sessions; skipping both: $prev / $sp"
-        grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null && mv "$sidecar.tmp" "$sidecar"
+        log "  COLLISION: $h maps to two different sessions; dropping both: $prev / $sp"
+        printf '%s\n%s\n' "$prev" "$sp" >> "$drop"
+        # Rewrite unconditionally. `grep -v` exits 1 when it removes the only line,
+        # so a guarded `&& mv` left the stale mapping behind in exactly the
+        # single-entry case.
+        grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null || :
+        mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || : > "$sidecar"
       fi
       continue
     fi
@@ -453,8 +531,26 @@ build_source_sidecar() {
     counts="$counts$src"$'\n'
   done < "$SESSIONS_LIST.src"
   rm -f "$seen"
-  SESSIONS_BY_SOURCE=$(printf '%s' "$counts" | grep -c . >/dev/null 2>&1 && \
-    printf '%s' "$counts" | sort | uniq -c | awk '{printf "%s%s=%s", (NR>1?",":""), $2, $1}')
+
+  # Actually remove the colliding sessions from the worklist. Without this the
+  # detection is decorative.
+  if [ -s "$drop" ]; then
+    grep -vxF -f "$drop" "$SESSIONS_LIST.raw" > "$SESSIONS_LIST.raw.tmp" 2>/dev/null || :
+    mv -f "$SESSIONS_LIST.raw.tmp" "$SESSIONS_LIST.raw" 2>/dev/null || :
+    RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
+    # Their provenance rows go too, so the sidecar never names a session that was
+    # never triaged.
+    while IFS= read -r sp; do
+      [ -n "$sp" ] || continue
+      h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
+      grep -v "^$h	" "$sidecar" > "$sidecar.tmp" 2>/dev/null || :
+      mv -f "$sidecar.tmp" "$sidecar" 2>/dev/null || : > "$sidecar"
+    done < "$drop"
+  fi
+  rm -f "$drop"
+
+  SESSIONS_BY_SOURCE=$(printf '%s' "$counts" | sort | uniq -c \
+    | awk 'NF {printf "%s%s=%s", (NR>1?",":""), $2, $1}')
   [ -n "$SESSIONS_BY_SOURCE" ] || SESSIONS_BY_SOURCE="none"
 }
 
@@ -874,7 +970,12 @@ run() {
 
   # ---- Enumerate sessions modified during the target day ----
   log "scanning for sessions modified between $TARGET_DATE and $NEXT_DATE..."
-  scan_roots
+  # Adapter refusals belong with this run's artifacts, not written back into the
+  # installed source tree where they persist across runs and vanish entirely on a
+  # read-only install.
+  export ADAPTERS_REJECT_LOG="$FINDINGS_DIR/.adapters-rejected"
+  : > "$ADAPTERS_REJECT_LOG" 2>/dev/null || true
+  scan_roots || return 1
   build_source_sidecar
 
   # Exclude autodream's OWN headless worker/aggregator transcripts. New runs leave none

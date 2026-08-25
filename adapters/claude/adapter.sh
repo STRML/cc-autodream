@@ -27,13 +27,20 @@ case "$cmd" in
     # subcommand leaves NO output, and a half-written file that a later step
     # reads as a whole session is worse than no session at all.
     [ -r "$1" ] || exit 1
-    cp "$1" "$2.tmp" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
-    mv "$2.tmp" "$2" 2>/dev/null || { rm -f "$2.tmp"; exit 1; }
+    # A unique temp in the DESTINATION directory. A fixed "$2.tmp" is a shared
+    # name: two invocations writing the same output would clobber or remove each
+    # other's temp file and leave the result from the wrong one, or none.
+    t=$(mktemp "$2.tmp.XXXXXX" 2>/dev/null) || exit 1
+    cp "$1" "$t" 2>/dev/null || { rm -f "$t"; exit 1; }
+    mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; exit 1; }
     ;;
 
   project) # $1=session -> the session's real working directory
     [ -r "$1" ] || exit 1
-    cwd=$(grep -om1 '"cwd":"[^"]*"' "$1" 2>/dev/null | head -1 | sed 's/^"cwd":"//;s/"$//')
+    # jq, not grep: a cwd containing a quote or a backslash is JSON-escaped, and
+    # a regex over the raw line either truncates at the escaped quote or hands
+    # realpath a doubled backslash.
+    cwd=$(jq -re 'select(.cwd != null) | .cwd' "$1" 2>/dev/null | head -1)
     [ -n "$cwd" ] || exit 1
     realpath "$cwd" 2>/dev/null || exit 1
     ;;

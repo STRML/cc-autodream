@@ -1865,7 +1865,7 @@ test_newline_path_is_rejected_not_split(){
   local f; f=$(fdir "$root")
   assert_eq "$(grep -c . "$f/sessions.txt.raw")" "1" "only the representable session is enumerated"
   assert_grep "$f/run-stats.txt" 'sessions_rejected_path: 1' "the rejection is counted in run-stats"
-  assert_grep "$root/run.out" 'newline' "the log names the offending character"
+  assert_grep "$root/run.out" 'cannot carry' "the log says why the path was refused"
   rm -rf "$root"
 }
 
@@ -1920,6 +1920,70 @@ test_preflight_stops_a_run_missing_a_dependency(){
   rm -rf "$root" "$empty"
 }
 
+# ---- The installed tree must actually contain the adapter runtime ----------
+# install.sh has an EXPLICIT link list. The first version of the adapter change
+# added four new runtime files and none of them to that list, so every
+# documented nightly install would have silently taken the legacy enumeration
+# path with no preflight — while still printing adapters_enabled: claude. It
+# ships broken to the only place that matters and reports success, which is the
+# exact failure shape this repo already has a memory note about.
+test_install_deploys_the_adapter_runtime(){
+  # SIDE EFFECT, deliberate and pre-existing: install.sh:77 runs
+  # `chmod +x "$REPO_DIR/bin/"*.sh`, so this test makes every bin script
+  # executable in the working tree. That is the repo's own convention, but it
+  # means a `git stash` taken across a suite run can refuse to pop on a bare
+  # mode change. Restore with `git checkout -- bin/` if that happens.
+  echo "# install: the adapter runtime is installed, not just committed"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home"
+  HOME="$T/home" AUTODREAM_DIR="$T/home/.claude/autodream" \
+    bash "$REPO/install.sh" --no-schedule > "$T/install.out" 2>&1 || true
+  local target="$T/home/.claude/autodream"
+  assert_file "$target/lib-project.sh" "lib-project.sh is installed"
+  assert_file "$target/adapters.sh"    "adapters.sh is installed"
+  assert_file "$target/preflight.sh"   "preflight.sh is installed"
+  [ -e "$target/adapters/claude/adapter.sh" ] \
+    && ok "the adapters tree is reachable from the install target" \
+    || no "the adapters tree is reachable from the install target"
+  # And the installed runner must resolve its adapters through the FLAT layout,
+  # where adapters/ sits beside adapters.sh rather than one level up.
+  local got
+  got=$(cd "$target" && bash -c '. ./adapters.sh; adapters_list' 2>/dev/null)
+  assert_eq "$got" "claude" "the installed runner resolves the claude adapter"
+  rm -rf "$T"
+}
+
+# ---- Characters the artifact list or the L1 fan-out cannot carry -----------
+# Verified on this host against the real consumer rather than assumed: with
+# `xargs -I {}` a tab becomes a space, a backslash is deleted, and a quote kills
+# the whole dispatch with "unterminated quote". An earlier draft accepted tabs
+# because sessions.txt and the hash tolerate them — those two consumers were
+# checked and the fan-out was not.
+test_unrepresentable_characters_are_refused(){
+  echo "# enumeration: characters the fan-out would corrupt are refused, not accepted"
+  local root; root=$(setup_env)
+  mk_session "$root" good
+  local n=0 p
+  local -a bads
+  bads=( "$(printf 'ta\tb')" 'back\slash' 'quo"te' )
+  local bad
+  for bad in "${bads[@]}"; do
+    p="$root/projects/proj-a/$bad.jsonl"
+    printf '%s\n' '{"type":"user","cwd":"/tmp/proj-a","message":{"content":"x"}}' > "$p" 2>/dev/null || continue
+    touch -t "$STAMP" "$p" 2>/dev/null || continue
+    n=$((n + 1))
+  done
+  if [ "$n" -eq 0 ]; then ok "the filesystem refuses these names; nothing to test"; rm -rf "$root"; return 0; fi
+  run_dream "$root"
+  local f; f=$(fdir "$root")
+  assert_eq "$(grep -c . "$f/sessions.txt.raw")" "1" "only the representable session survives enumeration"
+  assert_grep "$f/run-stats.txt" "sessions_rejected_path: $n" "every refusal is counted"
+  # The whole point: the run still completes. A quoted path used to abort the
+  # entire xargs fan-out rather than skipping one session.
+  assert_nonempty "$root/dreams/$DATE.md" "the run still produced a report"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -1931,6 +1995,8 @@ test_newline_path_is_rejected_not_split
 test_source_sidecar_is_written
 test_artifact_hash_contract_is_unchanged
 test_preflight_stops_a_run_missing_a_dependency
+test_install_deploys_the_adapter_runtime
+test_unrepresentable_characters_are_refused
 
 echo
 echo "----------------------------------------"
