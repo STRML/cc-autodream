@@ -73,11 +73,19 @@ _adapter_ok() { # $1=basename
 
   # Safe identifier: lowercase start, then lowercase/digit/underscore/dash only.
   # No separators, so the name cannot walk out of the adapters root on its own.
+  #
+  # The character sets are ENUMERATED, not ranges. `[a-z]` is collation-dependent:
+  # under a UTF-8 locale the order is aAbBcC..., so the range matches uppercase
+  # too. That made this check pass on macOS (C collation) and silently accept an
+  # uppercase basename on Linux — a containment check that was weaker on the
+  # platform CI actually runs. Enumeration has no such ambiguity.
   case "$1" in
-    [a-z]*) : ;;
+    [abcdefghijklmnopqrstuvwxyz]*) : ;;
     *) _adapter_reject "$1"; return 1 ;;
   esac
-  case "$1" in *[!a-z0-9_-]*) _adapter_reject "$1"; return 1 ;; esac
+  case "$1" in
+    *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*) _adapter_reject "$1"; return 1 ;;
+  esac
 
   # Containment. A symlinked adapter dir passes every check above and still
   # points anywhere, so resolve both sides and require the prefix.
