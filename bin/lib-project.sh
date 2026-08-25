@@ -35,3 +35,27 @@ canonical_project() { # $1=path -> encoded name on stdout, or exit 1 with nothin
   [ -n "$real" ] || return 1
   encode_project "$real"
 }
+
+# The artifact key, validated. Nothing may derive a hash any other way.
+#
+# `h=$(printf %s "$p" | shasum -a 1 | cut -c1-12)` has two silent failure modes
+# that end in the same place. `cut` masks shasum's exit status, so a shasum that
+# EXISTS — satisfying preflight — but fails at runtime yields an empty hash, and
+# every session then targets the same artifact. A short or non-hex result does
+# the same.
+#
+# The character set is ENUMERATED, not a range. Verified on this host: under
+# bash 3.2 with an en_US.UTF-8 collation, `A` matches [0-9a-f]; under bash 5.3 it
+# does not. The nightly runs #!/bin/bash, which is 3.2, so the range form was
+# accepting uppercase exactly where it matters. This is the same collation
+# behaviour that made an uppercase adapter basename pass on CI and not locally.
+session_hash() { # $1=session path -> 12 lowercase hex chars, or exit 1
+  local out h
+  out=$(printf '%s' "$1" | shasum -a 1 2>/dev/null) || return 1
+  [ -n "$out" ] || return 1
+  h=${out:0:12}
+  case "$h" in
+    [0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) printf '%s' "$h" ;;
+    *) return 1 ;;
+  esac
+}

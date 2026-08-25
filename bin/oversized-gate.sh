@@ -20,6 +20,12 @@
 
 set -u
 
+HERE=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=/dev/null
+if [ -r "$HERE/lib-project.sh" ]; then . "$HERE/lib-project.sh"; else
+  echo "oversized-gate: lib-project.sh not found next to this script" >&2; exit 2
+fi
+
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 THRESHOLD="${AUTODREAM_SLIM_BYTES:-262144}"
 DAYS=7
@@ -70,7 +76,13 @@ for d in "${DIRS[@]}"; do
   while IFS= read -r session; do
     [ -n "$session" ] || continue
     sessions=$((sessions + 1))
-    hash=$(printf '%s' "$session" | shasum -a 1 | cut -c1-12)
+    # Same validated contract as the runner. Deriving a hash here with
+    # `shasum | cut` meant a runtime-failing shasum yielded an empty key, so the
+    # gate consulted ".stats.json" and ".json" for every session and could
+    # undercount errored oversized sessions — reporting GATE CLOSED off a
+    # measurement that never happened. That is precisely the false-clean reading
+    # this script was written to refuse.
+    hash=$(session_hash "$session") || { unmeasurable=$((unmeasurable + 1)); continue; }
     sidecar="$d/$hash.stats.json"
     size=""
     [ -s "$sidecar" ] && size=$(jq -r '.transcript_bytes | numbers | floor' "$sidecar" 2>/dev/null)

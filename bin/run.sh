@@ -580,29 +580,6 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
 # the same reason. Instead the two ways two adapters can land on one artifact are
 # detected: the same path claimed twice (a misconfiguration — keep the first),
 # and two DIFFERENT paths truncating to one hash (no sensible winner — skip both).
-# The artifact key, validated. Nothing may derive a hash any other way.
-#
-# `h=$(printf %s "$p" | shasum -a 1 | cut -c1-12)` has two silent failure modes
-# and both end in the same place. `cut` masks shasum's exit status, so a shasum
-# that exists (preflight is satisfied) but fails at runtime yields an EMPTY
-# hash — and every session in the night then targets the same artifact, which is
-# precisely the silent overwrite the collision machinery exists to prevent,
-# arrived at from the other direction. A short or non-hex result does the same.
-#
-# So the contract is exact: 12 lowercase hex characters, or a nonzero status and
-# no output. Callers decide whether that is survivable; none of them may guess.
-session_hash() { # $1=session path -> 12 hex chars on stdout, or exit 1
-  local out h
-  out=$(printf '%s' "$1" | shasum -a 1 2>/dev/null) || return 1
-  [ -n "$out" ] || return 1
-  h=${out:0:12}
-  case "$h" in
-    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
-      printf '%s' "$h" ;;
-    *) return 1 ;;
-  esac
-}
-
 # Sort a file unique, in place, atomically, and report failure.
 #
 # `sort -u FILE -o FILE` can leave FILE empty or partial when it fails, and every
@@ -798,14 +775,22 @@ build_source_sidecar() {
     # same hash found twice — and a transient failure a later rewrite had already
     # repaired reported 1 when the honest answer was 0. What the reader needs is
     # how many rows are stale now, so that is what is measured.
-    local stale_hashes
-    if stale_hashes=$(
-         while IFS= read -r sp; do
-           [ -n "$sp" ] || continue
-           session_hash "$sp" || exit 1
-           printf '\n'
-         done < "$drop" | sort -u
-       ); then
+    # Stage, THEN sort. `producer || exit 1 | sort -u` is masked: without
+    # pipefail sort exits 0 on empty input, so a failing producer produced an
+    # empty successful assignment and the metric read 0 — the exact false zero
+    # this branch exists to avoid.
+    local stale_hashes hstage ok_stage=1
+    hstage="$FINDINGS_DIR/.stale-hashes.$$"
+    : > "$hstage" 2>/dev/null || ok_stage=0
+    if [ "$ok_stage" = "1" ]; then
+      while IFS= read -r sp; do
+        [ -n "$sp" ] || continue
+        if ! session_hash "$sp" >> "$hstage" 2>/dev/null; then ok_stage=0; break; fi
+        printf '\n' >> "$hstage" 2>/dev/null || { ok_stage=0; break; }
+      done < "$drop"
+    fi
+    if [ "$ok_stage" = "1" ] && stale_hashes=$(sort -u "$hstage" 2>/dev/null); then
+      rm -f "$hstage"
       SIDECAR_STALE_ROWS=0
       local sh grc2
       for sh in $stale_hashes; do
@@ -820,6 +805,7 @@ build_source_sidecar() {
         esac
       done
     else
+      rm -f "$hstage"
       SIDECAR_STALE_ROWS=unknown
       log "  WARNING: could not compute the stale-row count; reporting it as unknown rather than zero"
     fi
@@ -1045,7 +1031,7 @@ dispatch_l1() { # one parallel pass; idempotent worker → only the still-missin
     hashout=$(printf "%s" "$session" | shasum -a 1 2>/dev/null) || exit 0
     hash=${hashout:0:12}
     case "$hash" in
-      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+      [0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) : ;;
       *) exit 0 ;;
     esac
     output="$FINDINGS_DIR/$hash.json"
