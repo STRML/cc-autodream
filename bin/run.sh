@@ -604,7 +604,18 @@ build_source_sidecar() {
   # last variable rather than truncated into it.
   while IFS=$'\t' read -r src sp; do
     [ -n "$sp" ] || continue
-    grep -qxF "$sp" "$SESSIONS_LIST.raw" 2>/dev/null || continue   # dropped at enumeration
+    # `|| continue` treated "legitimately absent" (exit 1, dropped at enumeration)
+    # and "grep failed" (exit >1) as the same thing. On an I/O error that skips
+    # the row silently, so a collision may never be DETECTED at all and the
+    # unchanged worklist is dispatched with both paths on one artifact — failing
+    # open on the way in to the check that fails closed on the way out.
+    grep -qxF "$sp" "$SESSIONS_LIST.raw" 2>/dev/null; local prc=$?
+    case "$prc" in
+      0) : ;;                # present, carry on
+      1) continue ;;         # dropped at enumeration, expected
+      *) log "FATAL: could not check the worklist for $sp (grep exit $prc); refusing to build provenance over an unreadable list"
+         return 1 ;;
+    esac
     h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
     # The stored path is everything after the 12-char hash and its tab, taken by
     # offset rather than by field split, so no delimiter inside the path matters.

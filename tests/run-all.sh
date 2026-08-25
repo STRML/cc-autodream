@@ -2145,6 +2145,75 @@ test_fresh_host_with_no_store_is_not_a_failure(){
   rm -rf "$T"
 }
 
+# ---- Forced hash collision: the branch four review rounds kept touching -----
+# A natural 48-bit collision cannot be produced in a test, so the hash is stubbed:
+# a fake `shasum` returning a constant makes every session collide. Without this,
+# every assertion passes whether the collision handling works or not — which is
+# exactly what happened while this branch was patched across four review rounds.
+#
+# The stub goes in $HOME/.local/bin because run.sh hard-overrides PATH to a fixed
+# list ("$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:...").
+# A stub anywhere else is simply not seen — the first version of this test put it
+# in a temp dir on PATH and silently measured nothing.
+collision_sandbox(){ # -> a root whose HOME holds a constant-hash shasum stub
+  local root; root=$(setup_env)
+  mkdir -p "$root/home/.local/bin"
+  printf '#!/bin/bash\ncat >/dev/null 2>&1\nprintf "%%s  -\\n" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n' \
+    > "$root/home/.local/bin/shasum"
+  chmod +x "$root/home/.local/bin/shasum"
+  printf '%s' "$root"
+}
+run_dream_collision(){ # $1=root
+  HOME="$1/home" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$1/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
+    bash "$RUN" "$DATE" > "$1/run.out" 2>&1
+  local rc=$?
+  cat "$1/autodream/logs/run-$DATE.log" >> "$1/run.out" 2>/dev/null || true
+  return $rc
+}
+
+test_forced_hash_collision_drops_both(){
+  echo "# collision: two paths on one hash drop BOTH and never reach dispatch"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  run_dream_collision "$root" || true
+  local d; d=$(fdir "$root")
+  assert_grep "$root/run.out" 'COLLISION' "the collision is detected and logged"
+  assert_grep "$d/run-stats.txt" 'sessions_hash_collision: 1' "the collision is counted"
+  # BOTH paths gone. This is the assertion that would have caught the branch
+  # logging "skipping both" while skipping neither.
+  assert_eq "$(grep -c . "$d/sessions.txt.raw" 2>/dev/null || true)" "0" \
+    "both colliding paths are removed from the worklist"
+  assert_eq "$(grep -c . "$d/sessions-source.txt" 2>/dev/null || true)" "0" \
+    "no provenance row survives for a dropped session"
+  rm -rf "$root"
+}
+
+test_collision_worklist_failure_aborts(){
+  echo "# collision: a worklist rewrite that cannot happen fails closed"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # A grep that answers the membership probe normally so detection still runs,
+  # then fails hard on the -vxF worklist rewrite — the path that must abort
+  # rather than dispatch two sessions onto one artifact.
+  { printf '#!/bin/bash\n'
+    printf 'for a in "$@"; do case "$a" in -vxF) exit 2 ;; esac; done\n'
+    printf 'exec /usr/bin/grep "$@"\n'
+  } > "$root/home/.local/bin/grep"
+  chmod +x "$root/home/.local/bin/grep"
+  run_dream_collision "$root"
+  local rc=$?
+  assert_eq "$rc" "1" "the run fails closed when the worklist cannot be rewritten"
+  assert_grep "$root/run.out" 'refusing to dispatch two sessions onto one artifact' \
+    "the log says why it refused"
+  assert_no_file "$root/dreams/$DATE.md" "no report is produced over a corrupted worklist"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2162,6 +2231,8 @@ test_failing_enumerator_aborts_the_run
 test_partial_enumeration_keeps_what_it_read
 test_all_roots_unavailable_fails
 test_fresh_host_with_no_store_is_not_a_failure
+test_forced_hash_collision_drops_both
+test_collision_worklist_failure_aborts
 test_all_excluded_corpus_says_so
 
 echo
