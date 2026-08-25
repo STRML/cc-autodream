@@ -42,6 +42,17 @@ case "$cmd" in
     # the directory-destination contract test, so it is a real backstop and not
     # decoration. The guard stays anyway — it fails before any work, and it is
     # what stops a file appearing inside the caller's directory even briefly.
+    #
+    # This NARROWS the race rather than closing it. A sequence that creates a
+    # directory at $2 after the guard, lets mv move the temp inside it, then
+    # replaces $2 with a regular file before this check, still reports success
+    # with the output somewhere else. Closing that needs an atomic
+    # rename-if-not-a-directory, which is renameat2 on Linux and does not exist
+    # on macOS, where this runs. Winning any of these needs write access to the
+    # findings dir, at which point the dir is already the attacker's; these
+    # checks exist because silent wrong success is the failure this repo keeps
+    # getting caught by, not because there is a threat model. Named here rather
+    # than papered over with a fourth layer that would not close it either.
     [ -f "$2" ] || { rm -f "$2/$(basename "$t")" 2>/dev/null; exit 1; }
     ;;
 

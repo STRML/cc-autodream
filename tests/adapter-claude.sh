@@ -122,9 +122,16 @@ if [ -p "$fifodir/src.jsonl" ]; then
   # Poll for the adapter to actually go away rather than blocking in `wait`. A
   # bare `wait` on a process that ignores the signal hangs the suite instead of
   # failing it, which is how the trapped version presented.
+  # Read the process STATE, not `kill -0`. A background child that has exited
+  # stays a zombie until the shell reaps it, and `kill -0` succeeds on a zombie —
+  # so a `kill -0` poll here reports "did not terminate" for a process that
+  # already did, depending entirely on when bash got round to reaping. That is a
+  # test that fails on a busy CI machine and passes locally. An empty state means
+  # gone; Z means exited and not yet reaped. Both are termination.
   died=0; waited=0
   while [ "$waited" -lt 60 ]; do
-    kill -0 "$slim_pid" 2>/dev/null || { died=1; break; }
+    st=$(ps -o state= -p "$slim_pid" 2>/dev/null | tr -d ' ')
+    case "$st" in ""|Z*) died=1; break ;; esac
     sleep 0.05
     waited=$((waited + 1))
   done
