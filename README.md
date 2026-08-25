@@ -71,7 +71,7 @@ cd ~/git/cc-autodream
 ./install.sh
 ```
 
-This symlinks `bin/*.sh` and `prompts/*.md` into `~/.claude/autodream/`, creates
+This symlinks `bin/*.sh`, `prompts/*.md` and the `adapters/` tree into `~/.claude/autodream/`, creates
 `~/.claude/dreams/`, and on macOS installs and bootstraps the nightly launchd
 schedule for you (auto-detecting your username, paths, and `claude`/`git` location —
 no plist editing). Because the scripts are symlinks, editing the repo copy takes
@@ -214,9 +214,22 @@ Everything lives on disk (findings JSON, the report, run logs, stats) and every 
 is idempotent, so you can rerun any date. Configuration knobs are documented in
 `bin/run.sh`'s header.
 
+Reading sessions is done through a **harness adapter**, so the runner does not know
+which agent produced a transcript. Today there is one; the seam is what lets a second
+arrive without forking the pipeline.
+
+- `adapters/<name>/` — one directory per harness: `manifest.json` (data, read with
+  `jq`, never sourced), `adapter.sh` (enumerate, normalize, project, stats, slim,
+  is-self, memory-root), and `facts.md` (the remedy vocabulary for that harness, so
+  a fix is phrased in terms the harness actually has) → `adapters/claude/facts.md`
+- `bin/adapters.sh` — adapter discovery, identity validation and containment
+- `bin/lib-project.sh` — the canonical project encoding and artifact hash every
+  adapter must agree on
+- `bin/preflight.sh` — the shared-dependency gate, run before anything is enumerated
+
 For the internals — data flow, file map, state layout, environment overrides, the
-lean-query pattern, and the "don't eat your own tail" self-pollution defenses — see
-**`codemaps/architecture.md`** and **`CLAUDE.md`**.
+lean-query pattern, the adapter contract, and the "don't eat your own tail"
+self-pollution defenses — see **`codemaps/architecture.md`** and **`CLAUDE.md`**.
 
 ## Caveats
 

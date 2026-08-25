@@ -138,6 +138,13 @@ case "$cmd" in
     ;;
 
   is-self) # $1=session -> exit 0 if this is one of autodream's own transcripts
+    # The readability guard every sibling subcommand has. Without it a vanished
+    # or unreadable transcript answers "not one of ours" — prune-self-sessions.sh
+    # greps with 2>/dev/null and returns 1 either way — which is indistinguishable
+    # from a real user session, and the contract has no channel to say "I could
+    # not read it". Exit 2 is the unknown-subcommand code and would be wrong here;
+    # this is a readable-input failure, so the caller sees a nonzero that is not 1.
+    [ -r "$1" ] || exit 3
     # Delegated, never reimplemented: prune-self-sessions.sh is the single
     # source of truth for this predicate, and a marker added there must not
     # have to be remembered here too.

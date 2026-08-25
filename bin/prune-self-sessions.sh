@@ -18,6 +18,7 @@
 #   prune-self-sessions.sh --quiet         # just the summary line, no per-file paths
 #   prune-self-sessions.sh /path/projects  # scan a specific projects dir
 #   prune-self-sessions.sh --filter        # stdin: session paths; stdout: only NON-self ones
+#   prune-self-sessions.sh --is-self F     # exit 0 if F is one of ours, 1 if not
 #
 # Env:
 #   PROJECTS_DIR   default $HOME/.claude/projects

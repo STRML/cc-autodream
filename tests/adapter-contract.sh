@@ -181,6 +181,18 @@ run_contract(){ # $1=adapter name
   if "$A" is-self "$S" >/dev/null 2>&1; then
     no "[$name] an ordinary session is not claimed as ours"
   else ok "[$name] an ordinary session is not claimed as ours"; fi
+  # A session that cannot be READ must not answer "not ours". The predicate greps
+  # with stderr discarded and returns 1 for a missing file, which is the same
+  # answer a genuine user session gives — so a vanished transcript silently
+  # became someone else's problem. Every sibling subcommand has this guard; this
+  # one did not, and the contract had no way to say "I could not read it".
+  "$A" is-self "$tmp/definitely-not-here.jsonl" >/dev/null 2>&1
+  local selfrc=$?
+  if [ "$selfrc" -eq 0 ] || [ "$selfrc" -eq 1 ]; then
+    no "[$name] an unreadable session must not answer 0 or 1 (got $selfrc)"
+  else
+    ok "[$name] an unreadable session is distinguishable from a real answer"
+  fi
 
   # --- memory-root: empty is legal ONLY for a non-writing adapter ---
   local writes mr

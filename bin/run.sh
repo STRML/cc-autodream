@@ -401,7 +401,21 @@ adapter_roots() { # $1=adapter name -> one root per line
 # here would hand its sessions to a Claude parser that reads them as empty and
 # drops them silently. Refusing out loud is the honest version of not supporting
 # it yet.
+# Memoised. Three callers (scan_roots and both run-stats writers) each re-ran the
+# whole loader, which re-emitted the "installed but not enumerating it" warning
+# once per caller for a single installed adapter.
+ENABLED_ADAPTERS_CACHE=""
+ENABLED_ADAPTERS_RESOLVED=0
 enabled_adapters() {
+  if [ "$ENABLED_ADAPTERS_RESOLVED" = "1" ]; then
+    printf '%s' "$ENABLED_ADAPTERS_CACHE"
+    return 0
+  fi
+  ENABLED_ADAPTERS_CACHE=$(_enabled_adapters_uncached)
+  ENABLED_ADAPTERS_RESOLVED=1
+  printf '%s' "$ENABLED_ADAPTERS_CACHE"
+}
+_enabled_adapters_uncached() {
   # "Genuinely absent" means the loader is not sourced OR the adapters tree does
   # not exist — a tarball or partial install. That is a legacy install and it
   # falls back. It is NOT the same as a present tree from which the loader
@@ -444,6 +458,8 @@ scan_roots() {
   REJECTED_PATHS=0
   local src adapters
   adapters=$(enabled_adapters)
+  # The accepted set, resolved once for enumerate_for's per-root gate.
+  ACCEPTED_ADAPTERS=$(adapters_list 2>/dev/null)
   if [ -z "${adapters// /}" ]; then
     # Two distinct causes reach here and they need different messages: the
     # loader accepted nothing at all, or it accepted adapters but none of them
@@ -466,14 +482,22 @@ scan_roots() {
   # RAW would be 0, every shortfall counter would be 0, and the stub would say
   # no files were modified. A fresh host with NO roots configured is a different
   # thing and stays legitimate.
-  # ROOTS_SCANNED counts roots ENTERED; a root whose enumeration failed with no
-  # output was entered and read nothing, so it must not vouch for the night.
-  # Subtracting ROOTS_FAILED is what keeps "every root failed" fatal now that a
-  # single failed root only warns.
-  local roots_usable=$((ROOTS_SCANNED - ROOTS_FAILED))
+  # The fatal is about roots that were never REACHED, and it stays that way.
+  # Subtracting ROOTS_FAILED here looked symmetric and was a regression: on a
+  # single-root host — the default install — "enumerator exited nonzero and
+  # returned nothing" is the exact shape of a quiet date plus any transient find
+  # error, a bucket vanishing mid-walk or one unreadable directory (see the note
+  # at the enumeration branch). That host would then get no report at all on a
+  # night whose honest answer is the empty-night stub.
+  #
+  # A failed root is not silent without this: it warns in the log, increments
+  # roots_failed, reaches run-stats.txt on both the zero-session and full paths,
+  # and PROMPT.md's Corpus integrity bullet names it in the morning report. That
+  # is the right weight for "we read less than we meant to" — a caveat on the
+  # night, not the loss of it.
   if [ "${SESSION_ROOTS_ARE_FALLBACK:-0}" != "1" ] \
-     && [ "$ROOTS_CONFIGURED" -gt 0 ] && [ "$roots_usable" -le 0 ]; then
-    log "FATAL: all $ROOTS_CONFIGURED configured session root(s) are unavailable or failed to enumerate; refusing to report an empty night over a store that was never reached"
+     && [ "$ROOTS_CONFIGURED" -gt 0 ] && [ "$ROOTS_SCANNED" -eq 0 ]; then
+    log "FATAL: all $ROOTS_CONFIGURED configured session root(s) are unavailable; refusing to report an empty night over a store that was never reached"
     return 1
   fi
 
@@ -602,8 +626,12 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
   # Gated on the adapter having been ACCEPTED, not merely on adapter.sh being
   # executable: an executable check alone would run a directory that failed
   # containment.
+  # ACCEPTED_ADAPTERS is resolved once by enabled_adapters. This used to call
+  # adapters_list per root, and that walk does two realpaths plus a jq for every
+  # adapter directory — repeated work whose answer cannot change mid-run, since
+  # nothing writes to adapters/ while the scan is in flight.
   if declare -F adapter_run >/dev/null 2>&1 \
-     && adapters_list 2>/dev/null | grep -qxF "$1" \
+     && printf '%s\n' ${ACCEPTED_ADAPTERS:-} | grep -qxF "$1" \
      && [ -x "$(adapters_root 2>/dev/null)/$1/adapter.sh" ]; then
     # Return the ADAPTER's status, not a literal 0. A `return 0` here silently
     # defeated the caller's status check: enumeration was staged to a file and
@@ -1029,7 +1057,17 @@ compute_session_stats() {
   local session hash stats
   while IFS= read -r session; do
     [ -n "$session" ] || continue
-    hash=$(session_hash "$session") || continue
+    # A hash failure means no sidecar is written for this session. It is NOT
+    # counted here: stats_sidecars_unparseable is initialised to 0 in the
+    # oversized-gate loop, which runs after this function, so an increment here
+    # would be wiped — and referencing it before that assignment trips `set -u`
+    # outright. That loop walks the same sessions.txt and counts this session
+    # there, which is why the #27 fix reads the list rather than the sidecar
+    # glob. Say it out loud here so the log names the session.
+    hash=$(session_hash "$session") || {
+      log "  WARNING: could not derive an artifact hash for $session; no stats sidecar will exist for it"
+      continue
+    }
     stats="$FINDINGS_DIR/$hash.stats.json"
     rm -f "$stats"
     if [ -x "$STATS" ] && "$STATS" "$session" "$stats" >/dev/null 2>&1 \
@@ -1311,7 +1349,10 @@ run() {
   # silently, which lands you back in exactly the empty-hash corruption preflight
   # exists to stop. A present-but-unreadable preflight says so instead.
   if [ -r "$PREFLIGHT" ]; then
-    if ! bash "$PREFLIGHT" 2>>"$RUN_LOG"; then
+    # Pass the L2 engine. Without it L2_BIN was always empty, so preflight's
+    # l2_engine check could only ever fire from its own test suite — a dependency
+    # gate with a branch production never reached.
+    if ! bash "$PREFLIGHT" --l2-bin "$CLAUDE_BIN" 2>>"$RUN_LOG"; then
       log "FATAL: preflight failed; see the MISSING lines in this log. Nothing was enumerated."
       return 1
     fi
@@ -1433,7 +1474,16 @@ run() {
 
 No sessions were triaged on this date.
 
-$( if [ "$RAW" -eq 0 ] && [ "$refused" -eq 0 ]; then
+$( if [ "${ROOTS_FAILED:-0}" -gt 0 ]; then
+     # A failed root makes "no session files were modified" a claim this run
+     # cannot support: it did not read one of the stores it was meant to. The
+     # fatal for a single failed root was removed because on a single-root host
+     # that shape is a quiet date plus a transient find error, and losing the
+     # night is the wrong trade. That is only defensible while the stub refuses
+     # to state an empty night as fact.
+     printf '%s of %s session root(s) could not be enumerated, so this run did not read the whole store. Nothing was triaged from what it did read. See roots_failed in run-stats.txt — whether this was an empty night is unknown.' \
+       "$ROOTS_FAILED" "$ROOTS_SCANNED"
+   elif [ "$RAW" -eq 0 ] && [ "$refused" -eq 0 ]; then
      printf 'No session files were modified.'
    else
      # Refused paths never reach sessions.txt.raw, so they are NOT part of RAW.
@@ -1558,7 +1608,17 @@ EOF
   STATS_SIDECARS_UNPARSEABLE=0
   while IFS= read -r session; do
     [ -n "$session" ] || continue
-    hash=$(session_hash "$session") || continue
+    # Same reasoning as compute_session_stats above: no hash means no sidecar to
+    # read, which is an unparseable sidecar by any honest definition. Dropping the
+    # session instead removed it from stats_sidecars_unparseable AND from
+    # oversized_total, biasing the #12 gate toward staying closed on the one
+    # failure mode that would most deserve a look.
+    hash=$(session_hash "$session") || {
+      STATS_SIDECARS_UNPARSEABLE=$((STATS_SIDECARS_UNPARSEABLE + 1))
+      OVERSIZED_TOTAL=$((OVERSIZED_TOTAL + 1))
+      log "  WARNING: could not derive an artifact hash for $session; counted as an unreadable sidecar"
+      continue
+    }
     statsfile="$FINDINGS_DIR/$hash.stats.json"
     sz=""
     [ -s "$statsfile" ] && sz=$(jq -r '.transcript_bytes | numbers | floor' "$statsfile" 2>/dev/null)

@@ -2010,7 +2010,7 @@ test_unrepresentable_characters_are_refused(){
 # nothing noticed. A run that cannot read its corpus must fail loudly rather
 # than finalise a cheerful "no sessions" report.
 test_failing_enumerator_aborts_the_run(){
-  echo "# enumeration: an adapter whose enumerate fails aborts the run"
+  echo "# enumeration: an adapter whose enumerate fails costs its root, not the night"
   local root; root=$(setup_env)
   mk_session "$root" a
   # A private adapters tree holding one adapter that always fails to enumerate.
@@ -2025,9 +2025,21 @@ test_failing_enumerator_aborts_the_run(){
     bash "$RUN" "$DATE" > "$root/run.out" 2>&1
   local rc=$?
   cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
-  assert_eq "$rc" "1" "the run exits nonzero when enumeration fails"
-  assert_grep "$root/run.out" 'enumeration failed' "the log names the enumeration failure"
-  assert_no_file "$root/dreams/$DATE.md" "no report is written over a corpus that was never read"
+  # This used to assert the run ABORTS. It no longer does, and the change was
+  # deliberate: on a single-root host — the default install — "enumerator exited
+  # nonzero and returned nothing" is also the shape of a quiet date plus a
+  # transient find error, so aborting cost a night whose honest answer was the
+  # empty-night stub. What replaced the abort is a refusal to LIE: the run
+  # completes, roots_failed counts it, and the stub says the store was not fully
+  # read rather than claiming no files were modified.
+  assert_eq "$rc" "0" "the run completes rather than losing the night"
+  assert_grep "$root/run.out" 'contributes NO sessions' "the log names the enumeration failure"
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^roots_failed: 1$' \
+    "roots_failed records it"
+  assert_grep "$root/dreams/$DATE.md" 'did not read the whole store' \
+    "the report refuses to call this an empty night"
+  assert_nogrep "$root/dreams/$DATE.md" 'No session files were modified' \
+    "and does not state the claim it cannot support"
   rm -rf "$root"
 }
 

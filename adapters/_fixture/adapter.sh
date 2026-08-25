@@ -91,7 +91,15 @@ case "$cmd" in
     [ -f "$2" ] || { rm -f "$2/$(basename "$t")" 2>/dev/null; exit 1; }   # see the note above
     ;;
 
-  is-self) exit 1 ;;                    # the fixture harness never runs autodream
+  # The fixture harness never runs autodream, so the answer is always "not ours"
+  # — but only for a session that can be READ. Answering 1 for a file that is not
+  # there makes a vanished transcript indistinguishable from a real user session,
+  # and this adapter exists to make a contract gap fail here rather than in
+  # production. 3, not 2: 2 means unknown subcommand.
+  is-self)
+    [ -r "$1" ] || exit 3
+    exit 1
+    ;;
   skills-inventory) printf 'fixture-skill\n' ;;
 
   *)

@@ -30,7 +30,13 @@ set -u
 # count reaches run-stats.txt; it defaults beside the adapters root.
 adapters_reject_log() {
   if [ -n "${ADAPTERS_REJECT_LOG:-}" ]; then printf '%s' "$ADAPTERS_REJECT_LOG"; return 0; fi
-  printf '%s' "$(adapters_root)/.rejected"
+  # Default into TMPDIR, not the adapters root. _adapter_reject only ever appends
+  # and only run.sh truncates, so a repo-tree default meant any other caller — an
+  # interactive `. bin/adapters.sh; adapters_list`, or a future tool —
+  # accumulated refusals across invocations and adapters_rejected then reported
+  # stale names as this run's. It also left untracked cruft in a checkout that
+  # .gitignore does not cover. Per-PID so two callers cannot cross-contaminate.
+  printf '%s' "${TMPDIR:-/tmp}/autodream-adapters-rejected.$$"
 }
 
 # Two layouts have to work, and assuming only one is how the first version of
