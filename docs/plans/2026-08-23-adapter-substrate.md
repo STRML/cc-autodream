@@ -1204,6 +1204,19 @@ Three further plans follow, each producing working software on its own:
 
 ---
 
+## Superseded by review
+
+**The tab policy in the task bodies above is HISTORICAL and no longer what the code does.**
+Those snippets reject the newline alone and accept tabs. The changeset review overturned
+that: the L1 fan-out is `xargs -I` over a line-based list, which turns a tab into a space,
+deletes a backslash, and dies outright on a quote — taking the whole night's dispatch
+rather than one session. Enumeration now refuses all four. The design doc carries the
+current rule and the reasoning; `STRML/cc-autodream#54` tracks making the fan-out NUL-safe
+so the three non-newline characters can be accepted again.
+
+The task snippets are left as written because they record what was planned, and the
+deviations section below is where the plan and the code are reconciled.
+
 ## As built — deviations from the plan above
 
 Recorded rather than silently absorbed, because the plan is committed and a

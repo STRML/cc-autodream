@@ -641,10 +641,13 @@ build_source_sidecar() {
         # single-entry case.
         # DELIBERATELY survivable. A stale provenance row overstates
         # sessions_by_source by one and the helper has already logged why; the
-        # worklist, which is not survivable, is handled below. Counted so the
-        # degraded artifact is visible rather than merely tolerated.
-        rewrite_filtered "$sidecar" "the source sidecar" -v "^$h	" \
-          || SIDECAR_STALE_ROWS=$((SIDECAR_STALE_ROWS + 1))
+        # worklist, which is not survivable, is handled below.
+        #
+        # NOT counted here. Incrementing on a failed ATTEMPT is what kept this
+        # counter attempt-based: a later rewrite may well remove the row, and a
+        # single row may be attempted several times. The count is taken from the
+        # final sidecar once, below.
+        rewrite_filtered "$sidecar" "the source sidecar" -v "^$h	" || :
       fi
       continue
     fi
@@ -661,7 +664,18 @@ build_source_sidecar() {
     # collision on the same hash, so three paths sharing one hash produce
     # A,B,A,C — four lines describing three drops. Everything below counts and
     # filters from this file, so the duplicate propagated into the telemetry.
-    sort -u "$drop" -o "$drop" 2>/dev/null || :
+    # Through a temp file, and fatal on failure. An in-place `sort -u -o` that
+    # fails can leave the pattern file empty or partial, and BOTH the worklist
+    # filter and the post-filter verification read it — so a damaged drop file
+    # lets a collided path through to dispatch while everything downstream
+    # reports success. `|| :` on this line was the whole hazard.
+    if sort -u "$drop" > "$drop.uniq" 2>/dev/null && mv -f "$drop.uniq" "$drop" 2>/dev/null; then
+      :
+    else
+      rm -f "$drop.uniq"
+      log "FATAL: could not deduplicate the collision drop set; refusing to filter the worklist against a damaged pattern file"
+      rm -f "$drop"; return 1
+    fi
 
     # The worklist is the one that must FAIL CLOSED. Leaving it unchanged means
     # both colliding paths are still in it, so two workers target one <hash>.json
@@ -699,17 +713,24 @@ build_source_sidecar() {
       rewrite_filtered "$sidecar" "the provenance row for $h" -v "^$h	" || :
     done < "$drop"
 
-    # Count stale rows from the FINAL sidecar rather than from failed attempts.
-    # The same hash is rewritten once during detection and again per drop line,
-    # so counting attempts reported 3 for a single stale row on a persistent
-    # failure — and 1 on a transient one that a later attempt had already fixed.
-    # What the reader needs is how many rows are stale NOW.
-    while IFS= read -r sp; do
-      [ -n "$sp" ] || continue
-      h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
-      grep -q "^$h	" "$sidecar" 2>/dev/null \
-        && SIDECAR_STALE_ROWS=$((SIDECAR_STALE_ROWS + 1))
-    done < "$drop"
+    # Count stale rows from the FINAL sidecar, over UNIQUE hashes. Two things
+    # made the earlier version wrong in both directions: it added a count when a
+    # rewrite ATTEMPT failed, and it then iterated dropped PATHS. A two-path
+    # collision with one persistent stale row reported 3 — one attempt plus the
+    # same hash found twice — and a transient failure a later rewrite had already
+    # repaired reported 1 when the honest answer was 0. What the reader needs is
+    # how many rows are stale now, so that is what is measured.
+    local stale_hashes; stale_hashes=$(
+      while IFS= read -r sp; do
+        [ -n "$sp" ] || continue
+        printf '%s' "$sp" | shasum -a 1 | cut -c1-12
+      done < "$drop" | sort -u
+    )
+    SIDECAR_STALE_ROWS=0
+    local sh
+    for sh in $stale_hashes; do
+      grep -q "^$sh	" "$sidecar" 2>/dev/null && SIDECAR_STALE_ROWS=$((SIDECAR_STALE_ROWS + 1))
+    done
   fi
   rm -f "$drop"
 

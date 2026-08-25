@@ -2301,6 +2301,31 @@ test_mixed_collision_run_attributes_correctly(){
   rm -rf "$root"
 }
 
+test_persistent_sidecar_failure_counts_rows_not_attempts(){
+  echo "# collision: a persistently unwritable sidecar counts ROWS, not attempts"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # Fail only the sidecar rewrite (-v "^<hash>\t"), leaving the worklist filter
+  # (-vxF) and the membership probe (-qxF) working. One provenance row is then
+  # permanently stale. Counting ATTEMPTS reported 3 for it: one at detection plus
+  # the same hash seen once per dropped path.
+  { printf '#!/bin/bash\n'
+    printf 'prev=""\n'
+    printf 'for a in "$@"; do\n'
+    printf '  if [ "$prev" = "-v" ]; then case "$a" in ^*) exit 2 ;; esac; fi\n'
+    printf '  prev="$a"\n'
+    printf 'done\n'
+    printf 'exec /usr/bin/grep "$@"\n'
+  } > "$root/home/.local/bin/grep"
+  chmod +x "$root/home/.local/bin/grep"
+  run_dream_collision "$root" || true
+  local d; d=$(fdir "$root")
+  assert_grep "$d/run-stats.txt" 'sidecar_stale_rows: 1' "one stale ROW is reported, not three attempts"
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_to_collision: 2' "the drop count is unaffected"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2323,6 +2348,7 @@ test_collision_worklist_failure_aborts
 test_collision_membership_probe_failure_aborts
 test_three_way_collision_counts_paths_not_lines
 test_mixed_collision_run_attributes_correctly
+test_persistent_sidecar_failure_counts_rows_not_attempts
 test_all_excluded_corpus_says_so
 
 echo
