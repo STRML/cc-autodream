@@ -7,7 +7,11 @@
 # Claude ingest changes.
 set -u
 
-BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../bin" && pwd)
+# cd -P, not plain cd. Logical resolution would succeed against a
+# coincidental $TARGET/bin in the installed layout and silently land in the
+# wrong directory; -P follows the adapters symlink physically first, so this
+# resolves to the real bin/ regardless of what else exists alongside.
+BIN=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../../bin" && pwd)
 
 cmd="${1:-}"
 [ "$#" -gt 0 ] && shift

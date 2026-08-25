@@ -2002,6 +2002,35 @@ test_unrepresentable_characters_are_refused(){
   rm -rf "$root"
 }
 
+# ---- A failing enumerator must abort, not report over an unread corpus -------
+# This is the test whose ABSENCE let 306 assertions pass over a broken fix. The
+# runner staged enumeration to a file and checked its exit status, but the
+# enumerate_for wrapper ended in a literal `return 0`, so the check received
+# success every time. Nothing exercised an adapter whose enumerate fails, so
+# nothing noticed. A run that cannot read its corpus must fail loudly rather
+# than finalise a cheerful "no sessions" report.
+test_failing_enumerator_aborts_the_run(){
+  echo "# enumeration: an adapter whose enumerate fails aborts the run"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  # A private adapters tree holding one adapter that always fails to enumerate.
+  local ad="$root/adapters"; mkdir -p "$ad/claude"
+  printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
+  printf '#!/bin/bash\ncase "${1:-}" in enumerate) exit 3 ;; *) exit 2 ;; esac\n' > "$ad/claude/adapter.sh"
+  chmod +x "$ad/claude/adapter.sh"
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  assert_eq "$rc" "1" "the run exits nonzero when enumeration fails"
+  assert_grep "$root/run.out" 'enumeration failed' "the log names the enumeration failure"
+  assert_no_file "$root/dreams/$DATE.md" "no report is written over a corpus that was never read"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2015,6 +2044,7 @@ test_artifact_hash_contract_is_unchanged
 test_preflight_stops_a_run_missing_a_dependency
 test_install_deploys_the_adapter_runtime
 test_unrepresentable_characters_are_refused
+test_failing_enumerator_aborts_the_run
 
 echo
 echo "----------------------------------------"

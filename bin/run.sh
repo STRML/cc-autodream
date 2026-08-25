@@ -488,8 +488,13 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
   if declare -F adapter_run >/dev/null 2>&1 \
      && adapters_list 2>/dev/null | grep -qxF "$1" \
      && [ -x "$(adapters_root 2>/dev/null)/$1/adapter.sh" ]; then
+    # Return the ADAPTER's status, not a literal 0. A `return 0` here silently
+    # defeated the caller's status check: enumeration was staged to a file and
+    # the exit code examined, and this wrapper handed it a success every time.
+    # The suite passed 306 assertions over that, because none of them ran an
+    # adapter whose enumerate fails. tests/run-all.sh now has one.
     adapter_run "$1" enumerate "$2" "$TARGET_DATE" "$NEXT_DATE"
-    return 0
+    return $?
   fi
   find "$2" -type f -name '*.jsonl' \
        -newermt "$TARGET_DATE 00:00:00" \
@@ -1031,6 +1036,9 @@ run() {
     # this path used to return before run-stats.txt was written — so the report
     # said "no sessions were modified" while the counters that would have
     # contradicted it were never recorded anywhere. Say what was refused.
+    # HASH_COLLISIONS counts collision EVENTS and each drops at least two paths,
+    # so adding it to a path total understates the loss. Report the two
+    # separately rather than inventing a combined figure that is wrong.
     local refused=$(( REJECTED_PATHS + HASH_COLLISIONS ))
     {
       printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
@@ -1049,7 +1057,7 @@ run() {
 
 No sessions were triaged on this date.
 
-$( [ "$refused" -gt 0 ] && printf '%s session path(s) were REFUSED rather than absent: %s unrepresentable, %s lost to a hash collision. See run-stats.txt — this is not an empty night.' "$refused" "$REJECTED_PATHS" "$HASH_COLLISIONS" || printf 'No session files were modified.' )
+$( [ "$refused" -gt 0 ] && printf 'Sessions were REFUSED rather than absent: %s path(s) unrepresentable, and %s hash-collision event(s) each dropping two or more paths. See run-stats.txt — this is not an empty night.' "$REJECTED_PATHS" "$HASH_COLLISIONS" || printf 'No session files were modified.' )
 
 (Generated $(date -u +%Y-%m-%dT%H:%M:%SZ))
 
