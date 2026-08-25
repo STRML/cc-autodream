@@ -2326,6 +2326,32 @@ test_persistent_sidecar_failure_counts_rows_not_attempts(){
   rm -rf "$root"
 }
 
+test_unwritable_collision_index_fails_closed(){
+  echo "# collision: an unwritable bookkeeping file stops the run, it does not detect blind"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # The findings dir exists but cannot be written into. The invariant under test
+  # is that this stops the run rather than proceeding blind: if the collision
+  # index cannot be written, every path looks unseen, no collision is ever
+  # DETECTED, and both sessions reach dispatch onto one artifact.
+  #
+  # In practice an unwritable findings dir is caught one layer earlier, when
+  # enumeration cannot be staged, so the assertion is on the invariant (fail
+  # closed, say so, write nothing) rather than on which guard fires. The
+  # bookkeeping guard covers the narrower case where the dir is writable but
+  # those specific files are not.
+  local d="$root/autodream/findings/$DATE"
+  mkdir -p "$d"; chmod 500 "$d"
+  run_dream_collision "$root"
+  local rc=$?
+  chmod 700 "$d" 2>/dev/null || true
+  assert_eq "$rc" "1" "the run fails closed when the findings dir cannot be written"
+  assert_grep "$root/run.out" 'FATAL' "the log says it stopped rather than continuing"
+  assert_no_file "$root/dreams/$DATE.md" "no report is produced"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -2349,6 +2375,7 @@ test_collision_membership_probe_failure_aborts
 test_three_way_collision_counts_paths_not_lines
 test_mixed_collision_run_attributes_correctly
 test_persistent_sidecar_failure_counts_rows_not_attempts
+test_unwritable_collision_index_fails_closed
 test_all_excluded_corpus_says_so
 
 echo

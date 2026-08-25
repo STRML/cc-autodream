@@ -442,7 +442,7 @@ scan_roots() {
 
   # A transcript reachable from two roots (one dir a symlink of another) must be
   # triaged exactly once; the first source to claim a path keeps it.
-  sort -u "$SESSIONS_LIST.raw" -o "$SESSIONS_LIST.raw"
+  sort_unique_inplace "$SESSIONS_LIST.raw" "the session worklist" || return 1
   RAW=$(wc -l < "$SESSIONS_LIST.raw" | tr -d ' ')
 }
 
@@ -567,6 +567,23 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
 # the same reason. Instead the two ways two adapters can land on one artifact are
 # detected: the same path claimed twice (a misconfiguration — keep the first),
 # and two DIFFERENT paths truncating to one hash (no sensible winner — skip both).
+# Sort a file unique, in place, atomically, and report failure.
+#
+# `sort -u FILE -o FILE` can leave FILE empty or partial when it fails, and every
+# consumer downstream then trusts that damaged file. The worklist and the
+# collision drop set both used the unchecked form; the drop set was fixed first
+# and the worklist was left, which is exactly the kind of half-fix this whole
+# review has been catching. One helper, both callers.
+sort_unique_inplace() { # $1=file $2=what (for the log)
+  local f="$1" what="$2"
+  if sort -u "$f" > "$f.su.$$" 2>/dev/null && mv -f "$f.su.$$" "$f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$f.su.$$"
+  log "FATAL: could not deduplicate $what; refusing to continue over a possibly damaged list"
+  return 1
+}
+
 # Rewrite a file by filtering it, atomically, with EVERY failure accounted for.
 #
 # This exists because the same three-line pattern was patched site by site across
@@ -599,7 +616,17 @@ build_source_sidecar() {
   local sidecar="$FINDINGS_DIR/sessions-source.txt"
   local seen="$FINDINGS_DIR/.hash-to-path"
   local drop="$FINDINGS_DIR/.collided"
-  : > "$sidecar"; : > "$seen"; : > "$drop"
+  # Fail closed on the bookkeeping files. If .hash-to-path cannot be written,
+  # every path looks unseen and no collision is ever DETECTED; if .collided
+  # cannot be appended, the drop set is short and the fatal dedup block below is
+  # bypassed. Either way both sessions reach dispatch and overwrite the shared
+  # artifact — the failure this whole function exists to prevent, arrived at by
+  # a silently unwritable temp file.
+  if ! { : > "$sidecar"; } 2>/dev/null || ! { : > "$seen"; } 2>/dev/null \
+     || ! { : > "$drop"; } 2>/dev/null; then
+    log "FATAL: cannot write the provenance bookkeeping files in $FINDINGS_DIR; refusing to run collision detection blind"
+    return 1
+  fi
   DUPLICATE_PATHS=0; HASH_COLLISIONS=0; SESSIONS_BY_SOURCE=""
   local src sp h prev counts=""
   # source FIRST, so a path holding any remaining oddity is absorbed whole by the
@@ -635,7 +662,10 @@ build_source_sidecar() {
         # the code did another, which is worse than not checking at all.
         HASH_COLLISIONS=$((HASH_COLLISIONS + 1))
         log "  COLLISION: $h maps to two different sessions; dropping both: $prev / $sp"
-        printf '%s\n%s\n' "$prev" "$sp" >> "$drop"
+        if ! printf '%s\n%s\n' "$prev" "$sp" >> "$drop" 2>/dev/null; then
+          log "FATAL: could not record a collided path for removal; refusing to dispatch two sessions onto one artifact"
+          return 1
+        fi
         # Rewrite unconditionally. `grep -v` exits 1 when it removes the only line,
         # so a guarded `&& mv` left the stale mapping behind in exactly the
         # single-entry case.
@@ -651,8 +681,11 @@ build_source_sidecar() {
       fi
       continue
     fi
-    printf '%s\t%s\n' "$h" "$sp"  >> "$seen"
-    printf '%s\t%s\n' "$h" "$src" >> "$sidecar"
+    if ! printf '%s\t%s\n' "$h" "$sp" >> "$seen" 2>/dev/null; then
+      log "FATAL: could not record $sp in the collision index; refusing to detect collisions blind"
+      return 1
+    fi
+    printf '%s\t%s\n' "$h" "$src" >> "$sidecar" 2>/dev/null || :
     counts="$counts$src"$'\n'
   done < "$SESSIONS_LIST.src"
   rm -f "$seen"
@@ -664,16 +697,10 @@ build_source_sidecar() {
     # collision on the same hash, so three paths sharing one hash produce
     # A,B,A,C — four lines describing three drops. Everything below counts and
     # filters from this file, so the duplicate propagated into the telemetry.
-    # Through a temp file, and fatal on failure. An in-place `sort -u -o` that
-    # fails can leave the pattern file empty or partial, and BOTH the worklist
-    # filter and the post-filter verification read it — so a damaged drop file
-    # lets a collided path through to dispatch while everything downstream
-    # reports success. `|| :` on this line was the whole hazard.
-    if sort -u "$drop" > "$drop.uniq" 2>/dev/null && mv -f "$drop.uniq" "$drop" 2>/dev/null; then
-      :
-    else
-      rm -f "$drop.uniq"
-      log "FATAL: could not deduplicate the collision drop set; refusing to filter the worklist against a damaged pattern file"
+    # BOTH the worklist filter and the post-filter verification read this pattern
+    # file, so a damaged one lets a collided path through while everything
+    # downstream reports success.
+    if ! sort_unique_inplace "$drop" "the collision drop set"; then
       rm -f "$drop"; return 1
     fi
 
@@ -720,17 +747,30 @@ build_source_sidecar() {
     # same hash found twice — and a transient failure a later rewrite had already
     # repaired reported 1 when the honest answer was 0. What the reader needs is
     # how many rows are stale now, so that is what is measured.
-    local stale_hashes; stale_hashes=$(
-      while IFS= read -r sp; do
-        [ -n "$sp" ] || continue
-        printf '%s' "$sp" | shasum -a 1 | cut -c1-12
-      done < "$drop" | sort -u
-    )
-    SIDECAR_STALE_ROWS=0
-    local sh
-    for sh in $stale_hashes; do
-      grep -q "^$sh	" "$sidecar" 2>/dev/null && SIDECAR_STALE_ROWS=$((SIDECAR_STALE_ROWS + 1))
-    done
+    local stale_hashes
+    if stale_hashes=$(
+         while IFS= read -r sp; do
+           [ -n "$sp" ] || continue
+           printf '%s' "$sp" | shasum -a 1 | cut -c1-12
+         done < "$drop" | sort -u
+       ); then
+      SIDECAR_STALE_ROWS=0
+      local sh grc2
+      for sh in $stale_hashes; do
+        grep -q "^$sh	" "$sidecar" 2>/dev/null; grc2=$?
+        case "$grc2" in
+          0) SIDECAR_STALE_ROWS=$((SIDECAR_STALE_ROWS + 1)) ;;
+          1) : ;;                       # genuinely absent
+          # An error is NOT "absent". Reporting 0 because the check itself broke
+          # is the false-clean reading this repo already refuses elsewhere with
+          # overlap_measured; say unknown instead.
+          *) SIDECAR_STALE_ROWS=unknown; break ;;
+        esac
+      done
+    else
+      SIDECAR_STALE_ROWS=unknown
+      log "  WARNING: could not compute the stale-row count; reporting it as unknown rather than zero"
+    fi
   fi
   rm -f "$drop"
 
