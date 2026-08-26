@@ -695,7 +695,12 @@ test_no_sessions(){
   local root; root=$(setup_env)   # no mk_session
   run_dream "$root"
   assert_file "$root/dreams/$DATE.md" "stub report written"
-  assert_grep "$root/dreams/$DATE.md" 'No Claude Code sessions' "stub report has the no-sessions notice"
+  assert_grep "$root/dreams/$DATE.md" 'No sessions were triaged' "stub report has the no-sessions notice"
+  # The stub is harness-neutral now, and it distinguishes "nothing was there"
+  # from "everything was refused" — a night where every path was unrepresentable
+  # used to read identically to a quiet one.
+  assert_grep "$root/dreams/$DATE.md" 'No session files were modified' "a genuinely empty night says so"
+  assert_file "$(fdir "$root")/run-stats.txt" "run-stats is written even with zero sessions"
   rm -rf "$root"
 }
 
@@ -1842,6 +1847,754 @@ test_rootprobe_empty_home(){
   rm -rf "$T"
 }
 
+# ---- Enumeration transport: a path a line-based artifact cannot hold ----------
+# sessions.txt is line-delimited and STAYS that way: the hash assignment in l1_missing_count() and :540 key
+# each artifact by sha1 of the whole line, oversized-gate.sh's hash recomputation recomputes
+# that same hash from the file, and every archived findings dir depends on it.
+# So a path containing a newline cannot be represented, and today it is worse
+# than unrepresentable — `find` writes it as two lines and the runner invents a
+# second session that does not exist. Reject it at enumeration instead.
+test_newline_path_is_rejected_not_split(){
+  echo "# enumeration: a path containing a newline is rejected, never split into two"
+  local root; root=$(setup_env)
+  mk_session "$root" good
+  # Some filesystems refuse a newline in a name; if this one does, there is
+  # nothing to reject and the test says so rather than passing vacuously.
+  local bad; bad=$(printf '%s/projects/proj-a/ba\nd.jsonl' "$root")
+  if ! printf '%s\n' '{"type":"user","cwd":"/tmp/proj-a","message":{"content":"x"}}' > "$bad" 2>/dev/null; then
+    ok "the filesystem refuses newline filenames; nothing to reject here"
+    rm -rf "$root"; return 0
+  fi
+  touch -t "$STAMP" "$bad"
+  run_dream "$root"
+  local f; f=$(fdir "$root")
+  assert_eq "$(grep -c . "$f/sessions.txt.raw")" "1" "only the representable session is enumerated"
+  assert_grep "$f/run-stats.txt" 'sessions_rejected_path: 1' "the rejection is counted in run-stats"
+  assert_grep "$root/run.out" 'cannot carry' "the log says why the path was refused"
+  rm -rf "$root"
+}
+
+# ---- Adapter-aware enumeration: source provenance and the artifact contract ----
+# Source is carried in a sidecar keyed by the artifact hash, NOT tagged into
+# sessions.txt. Four consumers derive the artifact key or a filesystem path from
+# a whole line of that file, so adding a field to it would silently invalidate
+# every archived findings dir along with bin/oversized-gate.sh.
+test_source_sidecar_is_written(){
+  echo "# union: every enumerated session gets a source sidecar line keyed by hash"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  run_dream "$root"
+  local f; f=$(fdir "$root")
+  assert_file "$f/sessions-source.txt" "the sidecar exists"
+  local sp h
+  sp=$(head -1 "$f/sessions.txt")
+  h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
+  assert_grep "$f/sessions-source.txt" "^$h	claude$" "the hash maps to its source"
+  assert_grep "$f/run-stats.txt" 'sessions_by_source: claude=' "per-source counts are recorded"
+  assert_grep "$f/run-stats.txt" 'adapters_enabled: claude' "the enabled adapter set is recorded"
+  rm -rf "$root"
+}
+
+test_artifact_hash_contract_is_unchanged(){
+  echo "# union: the artifact key is still sha1 of the bare path, so archived dirs keep working"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  run_dream "$root"
+  local f; f=$(fdir "$root")
+  local sp h
+  sp=$(head -1 "$f/sessions.txt")
+  h=$(printf '%s' "$sp" | shasum -a 1 | cut -c1-12)
+  assert_file "$f/$h.json" "the findings record is keyed by sha1 of the bare path"
+  # A tab in sessions.txt would mean the line stopped being a bare path, which is
+  # the change that breaks oversized-gate.sh's hash recomputation and every archived dir.
+  assert_nogrep "$f/sessions.txt" '	' "sessions.txt carries no tab-delimited fields"
+  rm -rf "$root"
+}
+
+test_preflight_stops_a_run_missing_a_dependency(){
+  echo "# preflight: a missing shared dependency stops the run before anything is enumerated"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  # An empty PATH dir hides shasum, whose absence silently empties the artifact
+  # hash so every session in the night targets one findings filename.
+  local empty; empty=$(mktemp -d "${TMPDIR:-/tmp}/nopath.XXXXXX")
+  PATH="$empty:/usr/bin:/bin" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK"     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE"     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1     AUTODREAM_PREFLIGHT_FORCE_MISSING=shasum     PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams"     bash "$RUN" "$DATE" > "$root/run.out" 2>&1 || true
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  assert_no_file "$(fdir "$root")/sessions.txt" "nothing was enumerated"
+  assert_grep "$root/run.out" 'preflight' "the log says preflight stopped it"
+  rm -rf "$root" "$empty"
+}
+
+# ---- The installed tree must actually contain the adapter runtime ----------
+# install.sh has an EXPLICIT link list. The first version of the adapter change
+# added four new runtime files and none of them to that list, so every
+# documented nightly install would have silently taken the legacy enumeration
+# path with no preflight — while still printing adapters_enabled: claude. It
+# ships broken to the only place that matters and reports success, which is the
+# exact failure shape this repo already has a memory note about.
+test_install_deploys_the_adapter_runtime(){
+  # SIDE EFFECT, deliberate and pre-existing: install.sh's chmod +x step runs
+  # `chmod +x "$REPO_DIR/bin/"*.sh`, so this test makes every bin script
+  # executable in the working tree. That is the repo's own convention, but it
+  # means a `git stash` taken across a suite run can refuse to pop on a bare
+  # mode change. Restore with `git checkout -- bin/` if that happens.
+  echo "# install: the adapter runtime is installed, not just committed"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home"
+  HOME="$T/home" AUTODREAM_DIR="$T/home/.claude/autodream" \
+    bash "$REPO/install.sh" --no-schedule > "$T/install.out" 2>&1 || true
+  local target="$T/home/.claude/autodream"
+  assert_file "$target/lib-project.sh" "lib-project.sh is installed"
+  assert_file "$target/adapters.sh"    "adapters.sh is installed"
+  assert_file "$target/preflight.sh"   "preflight.sh is installed"
+  [ -e "$target/adapters/claude/adapter.sh" ] \
+    && ok "the adapters tree is reachable from the install target" \
+    || no "the adapters tree is reachable from the install target"
+  # And the installed runner must resolve its adapters through the FLAT layout,
+  # where adapters/ sits beside adapters.sh rather than one level up.
+  local got
+  got=$(cd "$target" && bash -c '. ./adapters.sh; adapters_list' 2>/dev/null)
+  assert_eq "$got" "claude" "the installed runner resolves the claude adapter"
+  # Resolving the adapter is not the same as being able to RUN it. The installed
+  # adapter finds its helper scripts through a relative path, so exercise a
+  # subcommand that actually shells out to one rather than stopping at discovery.
+  local sess="$T/s.jsonl" out="$T/s.stats.json"
+  mkdir -p "$T/proj"
+  printf '%s\n' "{\"type\":\"user\",\"cwd\":\"$T/proj\",\"message\":{\"content\":\"x\"}}" > "$sess"
+  if "$target/adapters/claude/adapter.sh" stats "$sess" "$out" 2>/dev/null && [ -s "$out" ]; then
+    ok "an installed adapter subcommand reaches its helper scripts"
+  else
+    no "an installed adapter subcommand reaches its helper scripts"
+  fi
+  assert_eq "$("$target/adapters/claude/adapter.sh" project "$sess" 2>/dev/null)" \
+            "$(cd "$T/proj" && pwd -P)" "the installed adapter resolves a project cwd"
+  rm -rf "$T"
+}
+
+# ---- Characters the artifact list or the L1 fan-out cannot carry -----------
+# Verified on this host against the real consumer rather than assumed: with
+# `xargs -I {}` a tab becomes a space, a backslash is deleted, and a quote kills
+# the whole dispatch with "unterminated quote". An earlier draft accepted tabs
+# because sessions.txt and the hash tolerate them — those two consumers were
+# checked and the fan-out was not.
+test_unrepresentable_characters_are_refused(){
+  echo "# enumeration: characters the fan-out would corrupt are refused, not accepted"
+  local root; root=$(setup_env)
+  mk_session "$root" good
+  local n=0 p
+  local -a bads
+  bads=( "$(printf 'ta\tb')" 'back\slash' 'quo"te' )
+  local bad
+  for bad in "${bads[@]}"; do
+    p="$root/projects/proj-a/$bad.jsonl"
+    printf '%s\n' '{"type":"user","cwd":"/tmp/proj-a","message":{"content":"x"}}' > "$p" 2>/dev/null || continue
+    touch -t "$STAMP" "$p" 2>/dev/null || continue
+    n=$((n + 1))
+  done
+  if [ "$n" -eq 0 ]; then ok "the filesystem refuses these names; nothing to test"; rm -rf "$root"; return 0; fi
+  run_dream "$root"
+  local f; f=$(fdir "$root")
+  assert_eq "$(grep -c . "$f/sessions.txt.raw")" "1" "only the representable session survives enumeration"
+  assert_grep "$f/run-stats.txt" "sessions_rejected_path: $n" "every refusal is counted"
+  # The whole point: the run still completes. A quoted path used to abort the
+  # entire xargs fan-out rather than skipping one session.
+  assert_nonempty "$root/dreams/$DATE.md" "the run still produced a report"
+  rm -rf "$root"
+}
+
+# ---- A failing enumerator must abort, not report over an unread corpus -------
+# This is the test whose ABSENCE let 306 assertions pass over a broken fix. The
+# runner staged enumeration to a file and checked its exit status, but the
+# enumerate_for wrapper ended in a literal `return 0`, so the check received
+# success every time. Nothing exercised an adapter whose enumerate fails, so
+# nothing noticed. A run that cannot read its corpus must fail loudly rather
+# than finalise a cheerful "no sessions" report.
+test_failing_enumerator_aborts_the_run(){
+  echo "# enumeration: an adapter whose enumerate fails costs its root, not the night"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  # A private adapters tree holding one adapter that always fails to enumerate.
+  local ad="$root/adapters"; mkdir -p "$ad/claude"
+  printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
+  printf '#!/bin/bash\ncase "${1:-}" in enumerate) exit 3 ;; *) exit 2 ;; esac\n' > "$ad/claude/adapter.sh"
+  chmod +x "$ad/claude/adapter.sh"
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  # This used to assert the run ABORTS. It no longer does, and the change was
+  # deliberate: on a single-root host — the default install — "enumerator exited
+  # nonzero and returned nothing" is also the shape of a quiet date plus a
+  # transient find error, so aborting cost a night whose honest answer was the
+  # empty-night stub. What replaced the abort is a refusal to LIE: the run
+  # completes, roots_failed counts it, and the stub says the store was not fully
+  # read rather than claiming no files were modified.
+  assert_eq "$rc" "0" "the run completes rather than losing the night"
+  assert_grep "$root/run.out" 'contributes NO sessions' "the log names the enumeration failure"
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^roots_failed: 1$' \
+    "roots_failed records it"
+  assert_grep "$root/dreams/$DATE.md" 'did not read the whole store' \
+    "the report refuses to call this an empty night"
+  assert_nogrep "$root/dreams/$DATE.md" 'No session files were modified' \
+    "and does not state the claim it cannot support"
+  rm -rf "$root"
+}
+
+# ---- One bad root must not take the night with it --------------------------
+# find exits 1 for ANY unreadable directory in the walk, match or no match —
+# verified on this host: an unreadable sibling makes it exit 1 both with and
+# without matches, and exit 0 without one. A secondary root legitimately matches
+# nothing on a given date, so treating "nonzero exit, no output" as fatal for the
+# whole run meant one permission-denied directory under a quiet secondary root
+# killed a night on which the primary had a full corpus — and killed it
+# invisibly, because run() returned before notify.sh and no findings JSONs
+# existed for unassembled_dates() to see.
+test_one_failed_root_does_not_kill_the_night(){
+  echo "# roots: one root that fails to enumerate does not discard the roots that worked"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  # A second root that exists, holds no matching file, and contains a directory
+  # find cannot read. That combination is exit 1 with empty output.
+  local bad="$root/badroot"; mkdir -p "$bad/locked"
+  chmod 000 "$bad/locked"
+  SESSION_ROOTS="$root/projects:$bad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  chmod 755 "$bad/locked"
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  assert_eq "$rc" "0" "the run survives one failed root"
+  assert_nonempty "$root/dreams/$DATE.md" "the healthy root's corpus still produced a report"
+  assert_grep "$root/run.out" 'contributes NO sessions' "the failed root is named in the log"
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^roots_failed: 1$' \
+    "roots_failed counts it, so a shrinking corpus is visible rather than silent"
+  rm -rf "$root"
+}
+
+# ---- A corpus that exists but yields nothing is not an empty night ----------
+# COUNT=0 has three distinct causes and they used to read identically: no files
+# at all, every file an autodream worker transcript, or every file an empty
+# shell. The stub said "No session files were modified" for all three, and the
+# zero-session run-stats omitted the two counters that would have said otherwise.
+test_all_excluded_corpus_says_so(){
+  echo "# zero sessions: an all-excluded corpus reports why, not 'nothing was modified'"
+  local root; root=$(setup_env)
+  # One autodream worker transcript, nothing else. RAW is 1, COUNT is 0.
+  local f="$root/projects/proj-a/worker.jsonl"
+  printf '%s\n' '{"type":"user","message":{"content":"Session transcript to analyze (literal absolute path): /x"}}' > "$f"
+  touch -t "$STAMP" "$f"
+  run_dream "$root"
+  local d; d=$(fdir "$root")
+  assert_file "$d/run-stats.txt" "run-stats is written for a zero-session night"
+  assert_grep "$d/run-stats.txt" 'self_sessions_excluded: 1' "the self-exclusion is counted"
+  assert_grep "$d/run-stats.txt" 'sessions_found_raw: 1' "the raw count shows a file WAS there"
+  assert_nogrep "$root/dreams/$DATE.md" 'No session files were modified' "the stub does not claim an empty night"
+  assert_grep "$root/dreams/$DATE.md" 'autodream-own' "the stub names why nothing was triaged"
+  rm -rf "$root"
+}
+
+# ---- A PARTIAL enumeration must not throw away the corpus it did read -------
+# The existing failing-enumerator test uses an adapter that returns NOTHING, so
+# it would pass under the old fatal-on-any-nonzero code too — it could not tell
+# the regression from the fix. This one is the actual case: BSD find exits 1 when
+# one subdirectory is unreadable or vanishes mid-walk WHILE still printing every
+# other match. Treating that as fatal produced no report on a night the old code
+# reported in full, which is worse than the silent zero the check exists to catch.
+test_partial_enumeration_keeps_what_it_read(){
+  echo "# enumeration: an enumerator that returns data AND fails continues, loudly"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  local sess="$root/projects/proj-a/a.jsonl"
+  local ad="$root/adapters"; mkdir -p "$ad/claude"
+  printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
+  # Emits one real NUL-delimited path, then exits nonzero — exactly find's shape.
+  { printf '#!/bin/bash\n'
+    printf 'case "${1:-}" in\n'
+    printf '  enumerate) printf "%%s\\0" "%s"; exit 1 ;;\n' "$sess"
+    printf '  project) printf "/tmp/proj-a" ;;\n'
+    printf '  memory-root) cd "$(dirname "$2")/../.." 2>/dev/null && pwd -P ;;\n'
+    printf '  normalize|slim) cp "$2" "$3" ;;\n'
+    printf '  stats) "%s/bin/session-stats.sh" "$2" "$3" ;;\n' "$REPO"
+    printf '  is-self) exit 1 ;;\n'
+    printf '  *) exit 2 ;;\n'
+    printf 'esac\n'
+  } > "$ad/claude/adapter.sh"
+  chmod +x "$ad/claude/adapter.sh"
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  local d; d=$(fdir "$root")
+  assert_eq "$rc" "0" "the run completes despite the enumerator failing"
+  assert_grep "$root/run.out" 'INCOMPLETE' "the log warns the corpus may be short"
+  assert_grep "$d/run-stats.txt" 'roots_partially_enumerated: 1' "the partial walk is counted"
+  assert_grep "$d/sessions.txt.raw" 'a.jsonl' "the path it DID return was kept"
+  assert_nonempty "$root/dreams/$DATE.md" "a report is still produced"
+  rm -rf "$root"
+}
+
+# ---- Every configured root unreachable is a failure, not a quiet night ------
+# scan_roots warned and skipped a non-directory root, so a broken SESSION_ROOTS
+# or a vanished store produced RAW=0 with every shortfall counter at 0 and a
+# stub saying no files were modified. A fresh host with NO roots configured is a
+# different thing and must stay legitimate.
+test_all_roots_unavailable_fails(){
+  echo "# roots: all configured roots unreachable fails rather than reporting empty"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  SESSION_ROOTS="$root/does-not-exist-a:$root/does-not-exist-b" \
+    AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  assert_eq "$rc" "1" "the run fails when no configured root is reachable"
+  assert_grep "$root/run.out" 'all .* configured session root' "the log names the cause"
+  assert_no_file "$root/dreams/$DATE.md" "no empty-night report is written"
+  rm -rf "$root"
+}
+
+# ---- A fresh host with no store is a quiet night, not a failure -------------
+# probe_roots falls back to $HOME/.claude/projects when discovery finds nothing.
+# The all-roots-unavailable fatal counted that fallback as a configured root and
+# aborted, so a machine that has simply never run Claude Code failed instead of
+# reporting an empty night. The fatal must fire only on roots someone actually
+# asked for.
+test_fresh_host_with_no_store_is_not_a_failure(){
+  echo "# roots: a fresh host with no session store reports empty, it does not fail"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home" "$T/autodream" "$T/dreams"
+  cp "$REPO/prompts/SESSION_TRIAGE.md" "$T/autodream/SESSION_TRIAGE.md"
+  cp "$REPO/prompts/PROMPT.md"         "$T/autodream/PROMPT.md"
+  # No SESSION_ROOTS, no PROJECTS_DIR, and a HOME with no .claude at all.
+  HOME="$T/home" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$T/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    AUTODREAM_DIR="$T/autodream" DREAMS_DIR="$T/dreams" \
+    bash "$RUN" "$DATE" > "$T/run.out" 2>&1
+  local rc=$?
+  cat "$T/autodream/logs/run-$DATE.log" >> "$T/run.out" 2>/dev/null || true
+  assert_eq "$rc" "0" "a fresh host exits 0"
+  assert_nonempty "$T/dreams/$DATE.md" "a fresh host still gets a report"
+  assert_nogrep "$T/run.out" 'configured session root' "no all-roots-unavailable fatal fires"
+  rm -rf "$T"
+}
+
+# ---- A fatal must not vandalise a date that already succeeded ---------------
+# fatal_exit truncates run-stats.txt and posts a FAILED banner. AUTODREAM_FORCE
+# bypasses the idempotency guard by design — it is the documented
+# `autodream-now.sh <date> --force` path — so any fatal under it would overwrite
+# that date's full L1/L2 telemetry with a five-line stub and announce a failure
+# for a night whose report is sitting right there. unassembled_dates() would not
+# catch it either, because the report exists.
+test_fatal_does_not_clobber_a_complete_date(){
+  echo "# fatal: a forced rerun that dies leaves the completed date's stats alone"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  local env_common=(AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 AUTODREAM_NETCHECK=0
+                    AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1)
+  # A good night first.
+  env "${env_common[@]}" CLAUDE_BIN="$MOCK" AUTODREAM_CONFIG="$root/autodream/config" \
+    AUTODREAM_CONSUME_DATE="$DATE" PROJECTS_DIR="$root/projects" \
+    AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run1.out" 2>&1
+  assert_nonempty "$root/dreams/$DATE.md" "the first run produced a report"
+  local before; before=$(wc -l < "$root/autodream/findings/$DATE/run-stats.txt" | tr -d ' ')
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/notify-args.txt"\n' "$root" \
+    > "$root/autodream/notify.sh"
+  chmod +x "$root/autodream/notify.sh"
+  # Now force a rerun that dies: every configured root unavailable.
+  env "${env_common[@]}" CLAUDE_BIN="$MOCK" AUTODREAM_CONFIG="$root/autodream/config" \
+    AUTODREAM_CONSUME_DATE="$DATE" AUTODREAM_FORCE=1 \
+    SESSION_ROOTS="$root/gone-a:$root/gone-b" \
+    AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run2.out" 2>&1
+  local after; after=$(wc -l < "$root/autodream/findings/$DATE/run-stats.txt" | tr -d ' ')
+  assert_eq "$after" "$before" "the completed date's run-stats.txt is untouched"
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^sessions_triaged: [1-9]' \
+    "and still carries the real triage count, not a stub zero"
+  # The banner MUST still fire. An earlier version of this test asserted the
+  # opposite and passed, which is how the guard came to suppress it: the run-stats
+  # write is what must not clobber a complete date, and the banner got taken down
+  # with it by being inside the same `return`. This branch is reachable only under
+  # AUTODREAM_FORCE, i.e. `autodream-now.sh <date> --force`, which runs detached
+  # under launchd — where a silent death leaves the operator polling
+  # dreams/<date>.md, finding the OLD report, and reading the failed rebuild as a
+  # success.
+  assert_file "$root/notify-args.txt" \
+    "a failed --force rebuild still posts a banner even though the date has a report"
+  assert_grep "$root/notify-args.txt" '[-][-]failure' "and posts it in failure mode"
+  assert_grep "$root/notify-args.txt" 'existing report' \
+    "and says the standing report is the OLD one, not this run's output"
+  rm -rf "$root"
+}
+
+# ---- A total outage must leave a trace ------------------------------------
+# adapters/claude/adapter.sh losing its exec bit is a mundane accident — a
+# tarball copy, a restrictive umask, core.fileMode=false — and _adapter_ok
+# demands -x. The loader then accepts nothing, scan_roots goes fatal, and run()
+# returns ~600 lines before notify.sh with no findings JSON and no run-stats.txt.
+# A host that reported fine last night reports nothing, every night, and the only
+# record is a log line nobody reads.
+test_no_usable_adapter_leaves_a_trace(){
+  echo "# adapters: a total outage writes a fatal marker the next night can see"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  local ad="$root/adapters"; mkdir -p "$ad/claude"
+  printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
+  cp "$REPO/adapters/claude/adapter.sh" "$ad/claude/adapter.sh"
+  chmod -x "$ad/claude/adapter.sh"          # the whole trigger
+  # A notify.sh that records how it was called. fatal_exit gates on -x, so without
+  # one installed the failure-notification step is skipped and unobservable.
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/notify-args.txt"\n' "$root" \
+    > "$root/autodream/notify.sh"
+  chmod +x "$root/autodream/notify.sh"
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  local rc=$?
+  assert_eq "$rc" "1" "the run still refuses to scan"
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^fatal: ' \
+    "a fatal marker is left behind rather than nothing at all"
+  # The marker alone is not enough for a PERSISTENT cause. A lost exec bit repeats
+  # every night, so no later run ever succeeds to read the marker and report it —
+  # the surface that works tonight is the banner. The stub records its arguments.
+  assert_file "$root/notify-args.txt" "notify.sh was invoked on the fatal path"
+  # Bracket the dashes. assert_grep takes (file, pattern, message) and passes the
+  # pattern straight to grep, so a literal `--failure` reads as end-of-options and
+  # an inserted `--` becomes the pattern — which is what the first version did.
+  assert_grep "$root/notify-args.txt" '[-][-]failure' "and invoked in failure mode"
+  assert_grep "$root/notify-args.txt" "$DATE" "naming the date that died"
+  # And the next night must surface it. Run a LATER date and check it names this one.
+  local later=2020-01-03
+  mk_session_dated "$root" b "$later" 2>/dev/null || true
+  chmod +x "$ad/claude/adapter.sh"
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$later" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$later" > "$root/run2.out" 2>&1
+  cat "$root/autodream/logs/run-$later.log" >> "$root/run2.out" 2>/dev/null || true
+  assert_grep "$root/run2.out" "$DATE" "the next night's run names the date that died"
+  rm -rf "$root"
+}
+
+# ---- The adapter set is resolved once, not once per caller ------------------
+# The first attempt at this was a memoised enabled_adapters that every caller
+# invoked as $(enabled_adapters), so the cache assignment died with the subshell
+# and the loader re-ran on every call — the exact trap adapters.sh's header
+# documents.
+#
+# What this test pins is the user-visible shape: the not-adapter-aware warning
+# appears once. It does NOT discriminate against that subshell bug — checked, by
+# restoring the broken memo and re-running, and it still passed. The bug is a
+# repeated INVOCATION, and the second invocation happens on a path whose warning
+# does not reach the log a second time, so no assertion over log content can see
+# it. Measuring it needs the function instrumented, which a test cannot do to a
+# script it invokes rather than sources; it was measured that way by hand
+# instead — 2 invocations before the fix, 1 after.
+#
+# Left in because the warning multiplying IS worth pinning, and said plainly so
+# the next reader does not mistake this for coverage of the subshell trap.
+test_enabled_adapters_resolves_once(){
+  echo "# adapters: a second installed adapter warns once per run, not once per caller"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  local ad="$root/adapters"
+  mkdir -p "$ad/claude" "$ad/other"
+  printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
+  cp "$REPO/adapters/claude/adapter.sh" "$ad/claude/adapter.sh"
+  chmod +x "$ad/claude/adapter.sh"
+  printf '{"name":"other","engine_bin":"true","writes_memory":false}\n' > "$ad/other/manifest.json"
+  printf '#!/bin/bash\nexit 2\n' > "$ad/other/adapter.sh"; chmod +x "$ad/other/adapter.sh"
+  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run.out" 2>&1
+  cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
+  local n
+  n=$(grep -c "is enabled but per-session dispatch" "$root/run.out" 2>/dev/null || true)
+  n=${n:-0}
+  assert_eq "$n" "1" "the not-adapter-aware warning is emitted exactly once"
+  assert_nonempty "$root/dreams/$DATE.md" "the run still produced a report"
+  rm -rf "$root"
+}
+
+# ---- Upgrade lag: run.sh is a symlink, the libraries are not there yet -------
+# The live install symlinks each script individually into ~/.claude/autodream, so
+# merging a branch changes run.sh the instant it lands while lib-project.sh,
+# adapters.sh, preflight.sh and adapters/ only appear when install.sh is re-run.
+# Every other test invokes $REPO/bin/run.sh directly, where the libraries sit
+# right beside it, so 358 green assertions all ran with them present and none of
+# them exercised the shape the nightly actually has.
+test_upgrade_lag_install_still_produces_a_report(){
+  echo "# upgrade lag: run.sh symlinked into an install dir with no libraries still reports"
+  local T; T=$(mktemp -d "${TMPDIR:-/tmp}/ccad.XXXXXX")
+  mkdir -p "$T/home/.claude/projects/proj-a" "$T/autodream" "$T/dreams"
+  cp "$REPO/prompts/SESSION_TRIAGE.md" "$T/autodream/SESSION_TRIAGE.md"
+  cp "$REPO/prompts/PROMPT.md"         "$T/autodream/PROMPT.md"
+  # Exactly what a pre-adapter install left behind: the helper scripts, and
+  # run.sh as a symlink into the repo. Deliberately NOT lib-project.sh,
+  # adapters.sh, preflight.sh or adapters/.
+  local h
+  for h in prune-self-sessions.sh root-probe.sh slim-transcript.sh session-stats.sh \
+           overlap-stats.sh vault-notes.sh x-bookmarks.sh notify.sh; do
+    [ -f "$REPO/bin/$h" ] && ln -s "$REPO/bin/$h" "$T/autodream/$h"
+  done
+  ln -s "$REPO/bin/run.sh" "$T/autodream/run.sh"
+  mk_session_in "$T/home/.claude/projects/proj-a" s1
+  HOME="$T/home" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$T/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    AUTODREAM_DIR="$T/autodream" DREAMS_DIR="$T/dreams" \
+    bash "$T/autodream/run.sh" "$DATE" > "$T/run.out" 2>&1
+  local rc=$?
+  cat "$T/autodream/logs/run-$DATE.log" >> "$T/run.out" 2>/dev/null || true
+  assert_eq "$rc" "0" "a symlinked runner with no installed libraries exits 0"
+  assert_nogrep "$T/run.out" 'session_hash: command not found' "session_hash resolved"
+  assert_nonempty "$T/dreams/$DATE.md" "the upgrade-lag install still produced a report"
+  rm -rf "$T"
+}
+
+# ---- Forced hash collision: the branch four review rounds kept touching -----
+# A natural 48-bit collision cannot be produced in a test, so the hash is stubbed:
+# a fake `shasum` returning a constant makes every session collide. Without this,
+# every assertion passes whether the collision handling works or not — which is
+# exactly what happened while this branch was patched across four review rounds.
+#
+# The stub goes in $HOME/.local/bin because run.sh hard-overrides PATH to a fixed
+# list ("$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:...").
+# A stub anywhere else is simply not seen — the first version of this test put it
+# in a temp dir on PATH and silently measured nothing.
+collision_sandbox(){ # -> a root whose HOME holds a constant-hash shasum stub
+  local root; root=$(setup_env)
+  mkdir -p "$root/home/.local/bin"
+  printf '#!/bin/bash\ncat >/dev/null 2>&1\nprintf "%%s  -\\n" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n' \
+    > "$root/home/.local/bin/shasum"
+  chmod +x "$root/home/.local/bin/shasum"
+  printf '%s' "$root"
+}
+run_dream_collision(){ # $1=root
+  HOME="$1/home" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$1/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
+    PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
+    bash "$RUN" "$DATE" > "$1/run.out" 2>&1
+  local rc=$?
+  cat "$1/autodream/logs/run-$DATE.log" >> "$1/run.out" 2>/dev/null || true
+  return $rc
+}
+
+test_forced_hash_collision_drops_both(){
+  echo "# collision: two paths on one hash drop BOTH and never reach dispatch"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  run_dream_collision "$root"
+  local rc=$?
+  local d; d=$(fdir "$root")
+  assert_eq "$rc" "0" "a handled collision is not a run failure"
+  assert_grep "$root/run.out" 'COLLISION' "the collision is detected and logged"
+  # The design requires this explicitly: neither session may reach the artifact
+  # they would have shared. Asserting the counters without asserting this would
+  # have let the drop be bookkeeping only.
+  assert_no_file "$d/aaaaaaaaaaaa.json" "the shared artifact is never written"
+  assert_no_file "$d/aaaaaaaaaaaa.stats.json" "nor its stats sidecar"
+  assert_grep "$d/run-stats.txt" 'sessions_found_raw: 2' "RAW still reports what was ENUMERATED"
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_to_collision: 2' "both dropped paths are counted"
+  assert_grep "$d/run-stats.txt" 'self_sessions_excluded: 0' "collided files are NOT called autodream-own"
+  assert_grep "$d/run-stats.txt" 'sessions_hash_collision: 1' "the collision is counted"
+  # BOTH paths gone. This is the assertion that would have caught the branch
+  # logging "skipping both" while skipping neither.
+  assert_eq "$(grep -c . "$d/sessions.txt.raw" 2>/dev/null || true)" "0" \
+    "both colliding paths are removed from the worklist"
+  assert_eq "$(grep -c . "$d/sessions-source.txt" 2>/dev/null || true)" "0" \
+    "no provenance row survives for a dropped session"
+  rm -rf "$root"
+}
+
+test_collision_worklist_failure_aborts(){
+  echo "# collision: a worklist rewrite that cannot happen fails closed"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # A grep that answers the membership probe normally so detection still runs,
+  # then fails hard on the -vxF worklist rewrite — the path that must abort
+  # rather than dispatch two sessions onto one artifact.
+  { printf '#!/bin/bash\n'
+    printf 'for a in "$@"; do case "$a" in -vxF) exit 2 ;; esac; done\n'
+    printf 'exec /usr/bin/grep "$@"\n'
+  } > "$root/home/.local/bin/grep"
+  chmod +x "$root/home/.local/bin/grep"
+  run_dream_collision "$root"
+  local rc=$?
+  assert_eq "$rc" "1" "the run fails closed when the worklist cannot be rewritten"
+  assert_grep "$root/run.out" 'refusing to dispatch two sessions onto one artifact' \
+    "the log says why it refused"
+  assert_no_file "$root/dreams/$DATE.md" "no report is produced over a corrupted worklist"
+  rm -rf "$root"
+}
+
+test_collision_membership_probe_failure_aborts(){
+  echo "# collision: a failing membership probe fails closed, it does not skip the row"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # Fail ONLY the -qxF membership probe. The previous fixture failed the -vxF
+  # rewrite instead, so reverting the probe to `|| continue` would have left the
+  # whole suite green — a fail-open on the way IN to the check that fails closed
+  # on the way out.
+  { printf '#!/bin/bash\n'
+    printf 'for a in "$@"; do case "$a" in -qxF) exit 2 ;; esac; done\n'
+    printf 'exec /usr/bin/grep "$@"\n'
+  } > "$root/home/.local/bin/grep"
+  chmod +x "$root/home/.local/bin/grep"
+  run_dream_collision "$root"
+  local rc=$?
+  assert_eq "$rc" "1" "the run fails closed when the membership probe errors"
+  assert_grep "$root/run.out" 'refusing to build provenance over an unreadable list' \
+    "the log names the unreadable worklist"
+  assert_no_file "$root/dreams/$DATE.md" "no report is produced"
+  rm -rf "$root"
+}
+
+test_three_way_collision_counts_paths_not_lines(){
+  echo "# collision: three paths on one hash count as three drops, not four"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  mk_session "$root" three
+  run_dream_collision "$root"
+  local d; d=$(fdir "$root")
+  # The earlier path is re-appended for every LATER collision, so the drop file
+  # reads A,B,A,C for three paths. Counting lines reported four drops for three.
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_to_collision: 3' "three paths count as three"
+  assert_grep "$d/run-stats.txt" 'sessions_found_raw: 3' "and all three were enumerated"
+  # Deliberate drops are not failures and are not autodream-own.
+  assert_grep "$d/run-stats.txt" 'self_sessions_excluded: 0' "collision drops are not charged to self-exclusion"
+  rm -rf "$root"
+}
+
+# A MIXED run — some collide, one survives — is the case that reaches the normal
+# run-stats writer. The all-collide fixtures above take the zero-session path,
+# which emits a reduced key set, so neither of them can prove that the normal
+# writer carries the collision keys or that deliberate drops stay out of the
+# failure denominator.
+test_mixed_collision_run_attributes_correctly(){
+  echo "# collision: a mixed run keeps drops out of the failure count"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  mk_session "$root" solo
+  # Collide everything EXCEPT the path containing "solo", which keeps its real
+  # hash and survives to be triaged normally.
+  { printf '#!/bin/bash\n'
+    printf 'in=$(cat)\n'
+    printf 'case "$in" in\n'
+    printf '  *solo*) printf "%%s  -\\n" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ;;\n'
+    printf '  *) printf "%%s  -\\n" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ;;\n'
+    printf 'esac\n'
+  } > "$root/home/.local/bin/shasum"
+  chmod +x "$root/home/.local/bin/shasum"
+  run_dream_collision "$root"
+  local rc=$?
+  local d; d=$(fdir "$root")
+  assert_eq "$rc" "0" "the run completes with one surviving session"
+  assert_grep "$d/run-stats.txt" 'sessions_found_raw: 3' "all three were enumerated"
+  assert_grep "$d/run-stats.txt" 'sessions_triaged: 1' "one survived to triage"
+  # The keys that existed only in the zero-session writer until now.
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_to_collision: 2' "the normal writer carries the collision count"
+  assert_grep "$d/run-stats.txt" 'sidecar_stale_rows: 0' "and the stale-row count"
+  # The attribution that was wrong: deliberate drops are neither self-sessions
+  # nor failures.
+  assert_grep "$d/run-stats.txt" 'self_sessions_excluded: 0' "drops are not autodream-own"
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_after_failures: 0' "drops are not failures"
+  rm -rf "$root"
+}
+
+test_persistent_sidecar_failure_counts_rows_not_attempts(){
+  echo "# collision: a persistently unwritable sidecar counts ROWS, not attempts"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # Fail only the sidecar rewrite (-v "^<hash>\t"), leaving the worklist filter
+  # (-vxF) and the membership probe (-qxF) working. One provenance row is then
+  # permanently stale. Counting ATTEMPTS reported 3 for it: one at detection plus
+  # the same hash seen once per dropped path.
+  { printf '#!/bin/bash\n'
+    printf 'prev=""\n'
+    printf 'for a in "$@"; do\n'
+    printf '  if [ "$prev" = "-v" ]; then case "$a" in ^*) exit 2 ;; esac; fi\n'
+    printf '  prev="$a"\n'
+    printf 'done\n'
+    printf 'exec /usr/bin/grep "$@"\n'
+  } > "$root/home/.local/bin/grep"
+  chmod +x "$root/home/.local/bin/grep"
+  run_dream_collision "$root" || true
+  local d; d=$(fdir "$root")
+  assert_grep "$d/run-stats.txt" 'sidecar_stale_rows: 1' "one stale ROW is reported, not three attempts"
+  assert_grep "$d/run-stats.txt" 'sessions_dropped_to_collision: 2' "the drop count is unaffected"
+  rm -rf "$root"
+}
+
+test_unwritable_collision_index_fails_closed(){
+  echo "# collision: an unwritable bookkeeping file stops the run, it does not detect blind"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # The findings dir exists but cannot be written into. The invariant under test
+  # is that this stops the run rather than proceeding blind: if the collision
+  # index cannot be written, every path looks unseen, no collision is ever
+  # DETECTED, and both sessions reach dispatch onto one artifact.
+  #
+  # In practice an unwritable findings dir is caught one layer earlier, when
+  # enumeration cannot be staged, so the assertion is on the invariant (fail
+  # closed, say so, write nothing) rather than on which guard fires. The
+  # bookkeeping guard covers the narrower case where the dir is writable but
+  # those specific files are not.
+  local d="$root/autodream/findings/$DATE"
+  mkdir -p "$d"; chmod 500 "$d"
+  run_dream_collision "$root"
+  local rc=$?
+  chmod 700 "$d" 2>/dev/null || true
+  assert_eq "$rc" "1" "the run fails closed when the findings dir cannot be written"
+  assert_grep "$root/run.out" 'FATAL' "the log says it stopped rather than continuing"
+  assert_no_file "$root/dreams/$DATE.md" "no report is produced"
+  rm -rf "$root"
+}
+
+test_broken_shasum_never_collapses_sessions(){
+  echo "# hash: a shasum that fails at runtime must not send every session to one artifact"
+  local root; root=$(collision_sandbox)
+  mk_session "$root" one
+  mk_session "$root" two
+  # Preflight only checks that shasum EXISTS. This one exists and fails, which
+  # used to yield an empty hash — and an empty hash means every session in the
+  # night targets ".json", the silent overwrite reached from the other direction.
+  printf '#!/bin/bash\nexit 3\n' > "$root/home/.local/bin/shasum"
+  chmod +x "$root/home/.local/bin/shasum"
+  run_dream_collision "$root" || true
+  local d; d=$(fdir "$root")
+  assert_no_file "$d/.json" "no artifact is written under an empty hash"
+  # Whatever else happens, two sessions must never share one findings record.
+  local n; n=$(find "$d" -maxdepth 1 -name '*.json' ! -name '*.stats.json' 2>/dev/null | wc -l | tr -d ' ')
+  [ "${n:-0}" -le 2 ] && ok "no more than one record per session" || no "no more than one record per session (got $n)"
+  rm -rf "$root"
+}
+
 # ---- run the new tests ----
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
@@ -1849,6 +2602,56 @@ test_multiroot_flags_unindexed
 test_rootprobe_remembers_choice
 test_rootprobe_no_write_mode_flags_but_does_not_write
 test_rootprobe_empty_home
+test_newline_path_is_rejected_not_split
+test_source_sidecar_is_written
+test_artifact_hash_contract_is_unchanged
+test_preflight_stops_a_run_missing_a_dependency
+test_install_deploys_the_adapter_runtime
+test_unrepresentable_characters_are_refused
+test_failing_enumerator_aborts_the_run
+test_one_failed_root_does_not_kill_the_night
+test_enabled_adapters_resolves_once
+test_no_usable_adapter_leaves_a_trace
+test_fatal_does_not_clobber_a_complete_date
+test_partial_enumeration_keeps_what_it_read
+test_all_roots_unavailable_fails
+test_fresh_host_with_no_store_is_not_a_failure
+test_upgrade_lag_install_still_produces_a_report
+test_forced_hash_collision_drops_both
+test_collision_worklist_failure_aborts
+test_collision_membership_probe_failure_aborts
+test_three_way_collision_counts_paths_not_lines
+test_mixed_collision_run_attributes_correctly
+test_persistent_sidecar_failure_counts_rows_not_attempts
+test_unwritable_collision_index_fails_closed
+test_broken_shasum_never_collapses_sessions
+test_all_excluded_corpus_says_so
+
+# ---- The unit suites, run here and not only in CI ---------------------------
+# CLAUDE.md tells contributors "run tests/run-all.sh after any run.sh/prompt
+# change", and these five were wired into the workflow only — so a local pre-push
+# run skipped adapter containment, the manifest-name check and the entire
+# contract suite, which is the gap the CI step's own comment says it closes.
+# Their counts fold into the totals below, so a red unit suite fails this script.
+echo
+echo "===== unit suites ====="
+for _suite in lib-project preflight adapters adapter-claude adapter-contract; do
+  _out=$(bash "$HERE/$_suite.sh" 2>&1)
+  _rc=$?
+  _p=$(printf '%s\n' "$_out" | sed -n 's/^passed: *\([0-9][0-9]*\).*/\1/p' | tail -1)
+  _f=$(printf '%s\n' "$_out" | sed -n 's/.*failed: *\([0-9][0-9]*\).*/\1/p' | tail -1)
+  pass=$((pass + ${_p:-0}))
+  fail=$((fail + ${_f:-0}))
+  if [ "$_rc" -ne 0 ] || [ "${_f:-0}" -ne 0 ]; then
+    printf '  FAIL - unit suite %s\n' "$_suite"
+    printf '%s\n' "$_out" | grep 'FAIL' | head -5
+    # A suite that dies before printing a total reports no failures at all, so
+    # count one rather than letting a crash read as green.
+    [ -n "$_f" ] && [ "$_f" -ne 0 ] || fail=$((fail + 1))
+  else
+    printf '  ok   - unit suite %-18s (%s assertions)\n' "$_suite" "${_p:-0}"
+  fi
+done
 
 echo
 echo "----------------------------------------"
