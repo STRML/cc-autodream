@@ -316,11 +316,20 @@ fatal_exit() {
   # then overwrite that date's full L1/L2 telemetry with a five-line stub and
   # announce a FAILED night while dreams/<date>.md sits there complete.
   # unassembled_dates() would not catch it either, because the report exists.
+  #
+  # The guard covers the WRITE, and only the write. The first version returned
+  # here, which took the banner down with it — and this branch is reachable in
+  # exactly one situation, the documented `autodream-now.sh <date> --force`
+  # rebuild, which runs detached under launchd where the banner is the only
+  # surface an operator sees. jq off the launchd PATH, preflight fatals, no
+  # marker (correctly), no banner, and unassembled_dates() skips the date because
+  # a report exists: the operator polls dreams/<date>.md, finds the OLD report
+  # sitting there, and reads a failed rebuild as a successful one. Nothing about
+  # protecting a complete date's telemetry requires staying quiet about the run
+  # that just died trying to replace it.
   if [ -s "$REPORT_PATH" ]; then
     log "  not overwriting run-stats.txt: $TARGET_DATE already has a complete report"
-    if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
-      log "  suppressing the failure banner for the same reason"
-    fi
+    notify_fatal "$reason (the existing report for $TARGET_DATE is unchanged)"
     return 1
   fi
   {
@@ -330,11 +339,16 @@ fatal_exit() {
     printf 'fatal: %s\n' "$reason"
     printf 'sessions_triaged: 0\n'
   } > "$FINDINGS_DIR/run-stats.txt" 2>/dev/null || true
-  if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
-    "$AUTODREAM_DIR/notify.sh" --failure "$TARGET_DATE" "$reason" \
-      || log "failure notification returned non-zero (continuing)"
-  fi
+  notify_fatal "$reason"
   return 1
+}
+
+# Both fatal paths post the banner, so the posting lives in one place. Keeping
+# two copies is how the guarded path lost its banner in the first place.
+notify_fatal() { # $1=reason
+  [ -x "$AUTODREAM_DIR/notify.sh" ] || return 0
+  "$AUTODREAM_DIR/notify.sh" --failure "$TARGET_DATE" "$1" \
+    || log "failure notification returned non-zero (continuing)"
 }
 
 # Wipe the isolated worker bucket. Claude Code's async AI-title generation writes a

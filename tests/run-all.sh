@@ -2223,11 +2223,19 @@ test_fatal_does_not_clobber_a_complete_date(){
   assert_eq "$after" "$before" "the completed date's run-stats.txt is untouched"
   assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^sessions_triaged: [1-9]' \
     "and still carries the real triage count, not a stub zero"
-  if [ -f "$root/notify-args.txt" ]; then
-    no "no FAILED banner is posted for a date that has a report"
-  else
-    ok "no FAILED banner is posted for a date that has a report"
-  fi
+  # The banner MUST still fire. An earlier version of this test asserted the
+  # opposite and passed, which is how the guard came to suppress it: the run-stats
+  # write is what must not clobber a complete date, and the banner got taken down
+  # with it by being inside the same `return`. This branch is reachable only under
+  # AUTODREAM_FORCE, i.e. `autodream-now.sh <date> --force`, which runs detached
+  # under launchd — where a silent death leaves the operator polling
+  # dreams/<date>.md, finding the OLD report, and reading the failed rebuild as a
+  # success.
+  assert_file "$root/notify-args.txt" \
+    "a failed --force rebuild still posts a banner even though the date has a report"
+  assert_grep "$root/notify-args.txt" '[-][-]failure' "and posts it in failure mode"
+  assert_grep "$root/notify-args.txt" 'existing report' \
+    "and says the standing report is the OLD one, not this run's output"
   rm -rf "$root"
 }
 

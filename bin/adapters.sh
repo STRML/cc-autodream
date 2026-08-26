@@ -95,7 +95,13 @@ _adapter_reject_broken_marker() {
 }
 _adapter_reject() { # $1=name
   local log; log=$(adapters_reject_log)
-  printf '%s\n' "$1" >> "$log" 2>/dev/null \
+  # The BRACES matter. `printf ... >> "$log" 2>/dev/null` sets up the append
+  # before the suppression, so bash reports a failure to OPEN $log on the
+  # original stderr and the line reads as silenced while it is not — visible in
+  # tests/adapters.sh as a raw `bin/adapters.sh: line NN: …: Is a directory`.
+  # run.sh happens to capture this call under `adapters_list 2>/dev/null`, so the
+  # nightly never saw it; any other caller does.
+  { printf '%s\n' "$1" >> "$log"; } 2>/dev/null \
     || : > "$(_adapter_reject_broken_marker)" 2>/dev/null || true
 }
 

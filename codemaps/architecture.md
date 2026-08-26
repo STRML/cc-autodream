@@ -14,7 +14,13 @@ bin/run.sh  TARGET_DATE
       │
       ├─ probe_roots: resolve SESSION_ROOTS (env/config | PROJECTS_DIR | root-probe autodetect)
       │     └─ write findings/<date>/unindexed-roots.txt (folders found but not indexed; before guard)
-      ├─ enumerate: find *.jsonl in [TARGET_DATE, NEXT_DATE) per root → sessions.txt.raw (sort -u)
+      ├─ preflight.sh: hard-dep gate (jq, shasum, realpath, find, the L2 engine) — fatal before any scan
+      ├─ adapters.sh: load adapters/<name>/ (manifest.json validated, basename = identity, realpath-contained)
+      │     └─ refusals recorded to a FILE (adapters_rejected); accepting none is fatal
+      ├─ enumerate: adapter_run <name> enumerate <root> <date> <next> → NUL-delimited paths
+      │     │   (claude adapter = find *.jsonl in [TARGET_DATE, NEXT_DATE); inline fallback if the
+      │     │    installed adapters/ link is stale — claude only, never a second adapter's roots)
+      │     ├─ sessions.txt.raw (bare paths, sort -u) + sessions.txt.src (<adapter>\t<path>)
       │     └─ prune-self-sessions.sh --filter                → sessions.txt   (drops autodream's own)
       │
       ├─ L1 retry loop (AUTODREAM_L1_ROUNDS):
@@ -38,7 +44,11 @@ bin/run.sh  TARGET_DATE
 
 | File | Role |
 |---|---|
-| `bin/run.sh` | orchestrator: guard, enumerate+filter, L1 retry loop, changelog, L2 retry loop, notify, gc |
+| `bin/run.sh` | orchestrator: guard, preflight, adapter load, enumerate+filter, L1 retry loop, changelog, L2 retry loop, notify, gc. Every fatal goes through `log_fatal`/`fatal_exit` (marker + banner) |
+| `adapters/<name>/` | one harness. `manifest.json` (DATA — jq-parsed, never sourced) + `adapter.sh` + `facts.md`. Subcommands: `enumerate normalize project memory-root stats slim is-self skills-inventory apply-pin`; contract table in `docs/design/unify-harness-adapters-2026-08-23.md`. `_fixture` is test-only (leading `_` excludes it) |
+| `bin/adapters.sh` | adapter discovery + dispatch. Identity is the DIRECTORY BASENAME (dispatch builds a path from it), must agree with `manifest.name`; realpath containment; refusals go to a file because `adapters_list` runs inside `$(...)` |
+| `bin/lib-project.sh` | the canonical project key every adapter must agree on: `encode_project` (everything outside `[A-Za-z0-9-]` → `-`), `canonical_project` (realpath first), `session_hash` (12 lowercase hex, validated) |
+| `bin/preflight.sh` | shared-dependency gate, run before anything is enumerated. Fatal on a missing hard dep rather than a quiet empty night |
 | `bin/autodream-now.sh` | run NOW via a transient one-shot launchd agent (escapes the ~10-min cap on bg tasks/ssh). `[DATE] [--force] [--watch] [--dry-run]`. RunAtLoad only (no kickstart → no double run); picks the scheduled plist that runs `run.sh` for its label namespace |
 | `bin/prune-self-sessions.sh` | self-session predicate (single source of truth): list / `--delete` / `--filter` |
 | `bin/oversized-gate.sh` | recompute the #12 measurement gate over a trailing window from the sidecars/findings on disk (`--days N`, or explicit findings dirs). Recovers dates whose `run-stats.txt` predates the counters; artifacts only, no model calls |
@@ -47,7 +57,8 @@ bin/run.sh  TARGET_DATE
 | `bin/review.sh` | interactive morning triage (`claude --append-system-prompt <report>`); `AUTODREAM_TRIAGE_SURFACE=cmux` (config/env) launches it in its own cmux workspace instead of inline. Skips the session entirely (prints a notice) when the report has 0 open questions or is already triaged — reads the `<!-- autodream:open-questions=N -->` marker, falls back to prose, launches on anything ambiguous; `--force` overrides. Skip check runs before the cmux branch so a skip never spawns a workspace |
 | `prompts/SESSION_TRIAGE.md` | L1 prompt: per-session JSON schema |
 | `prompts/PROMPT.md` | L2 prompt: report sections incl. Upstream changes + Autodream self-audit, memory rules |
-| `tests/run-all.sh` | integration tests for `run.sh` vs `mock-claude.sh` (offline) |
+| `tests/run-all.sh` | integration tests for `run.sh` vs `mock-claude.sh` (offline). Also runs the five unit suites and folds their counts in, so one command covers what CI covers |
+| `tests/{lib-project,preflight,adapters,adapter-claude,adapter-contract}.sh` | unit suites: project key, dep gate, adapter loading/containment, the claude adapter, and the contract every adapter must satisfy |
 | `tests/review-skip.sh` | tests for `review.sh`'s skip/launch decision (offline; inline mock claude) |
 | `tests/mock-claude.sh` | stand-in claude; modes: good / l1_incomplete / l1_flaky |
 | `launchd/com.user.autodream.plist.example` | schedule (multi-trigger catch-up + pmset note) |
@@ -58,6 +69,10 @@ bin/run.sh  TARGET_DATE
 - L1 worker is **idempotent**: a session with a non-empty `<sha>.json` is skipped. Failures leave no JSON (retry target); deterministic errors (unreadable file) write a JSON (done).
 - A `dreams/<date>.md` exists only after a successful L2 → it is the "done" signal for the idempotency guard.
 - `prune-self-sessions.sh` matches only the FIRST user turn against autodream's own prompt framing → human sessions about autodream are not false positives.
+- **The manifest is data.** JSON, read with jq, never sourced. `$HOME` is substituted, never evaluated.
+- **Identity is the directory basename**, never a manifest field, because dispatch builds a command path from it. A basename check is not containment — every adapter dir is realpath-resolved and required to stay under the adapters root.
+- **`sessions.txt` stays BARE PATHS.** Provenance lives in the `.src` sidecar. Anything that adds a column to `sessions.txt` breaks every consumer that reads it as a path list.
+- A variable assigned inside `$(...)` never reaches the caller. Every cross-boundary signal in this repo (adapter refusals, the broken-log marker, fetch failure reasons) is a FILE for that reason.
 - claude is always invoked with the lean flags + subscription auth; never `--bare`/`CLAUDE_CODE_SIMPLE` (breaks auth).
 
 ## Environment overrides

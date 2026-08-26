@@ -28,11 +28,24 @@ for fn in encode_project canonical_project; do
   fi
 done
 
-echo "# lib-project: encode_project maps / . and _ to -"
+echo "# lib-project: encode_project maps everything outside [A-Za-z0-9-] to -"
 assert_eq "$(encode_project /Users/x/sites)"   "-Users-x-sites"  "plain path"
 assert_eq "$(encode_project /Users/x/.claude)" "-Users-x--claude" "dot becomes a dash"
 assert_eq "$(encode_project /Users/x/a_b)"     "-Users-x-a-b"    "underscore becomes a dash"
 assert_eq "$(encode_project /Users/x/.a_b.c)"  "-Users-x--a-b-c" "dots and underscores together"
+# The three characters above are what the first version mapped, and they are the
+# ones this repo's own paths happen to contain. The two below are what it missed,
+# and both are live on this host: a stale `-…-Personal Items-…` bucket sits beside
+# the real `-…-Personal-Items-…` one, holding an empty memory/ — a project already
+# split in two by an encoder that preserved the space.
+assert_eq "$(encode_project "/Users/x/Personal Items/RAW")" "-Users-x-Personal-Items-RAW" \
+  "a SPACE becomes a dash"
+assert_eq "$(encode_project "/Users/x/House (39 Loring)/Imp")" "-Users-x-House--39-Loring--Imp" \
+  "parentheses become dashes, one each"
+assert_eq "$(encode_project "/Users/x/a+b,c;d")" "-Users-x-a-b-c-d" \
+  "every other punctuation character too"
+assert_eq "$(encode_project "/Users/x/AbC-9")" "-Users-x-AbC-9" \
+  "letters, digits and dashes survive — the map is not a blanket squash"
 
 echo "# lib-project: the encoding matches real Claude buckets on this host"
 # The regression that motivated this file: seanperkins/autodream-merge maps only
@@ -44,6 +57,53 @@ if [ -d "$real_bucket" ]; then
   ok "encode_project agrees with a real on-disk bucket for \$HOME/.claude"
 else
   ok "no \$HOME/.claude bucket on this host; skipped the on-disk cross-check"
+fi
+
+# The stronger version of the check above: sweep EVERY path-derived bucket and
+# require the encoder to reproduce its name from a cwd recorded inside it. This
+# is what found the space bug — an eyeball survey of dash-shaped names cannot,
+# because the broken form is also dash-shaped. Skipped where there is no corpus.
+#
+# Buckets not starting with `-` are CLAUDE_CODE_PROJECT_DIR_NAME slugs
+# (owner-repo), which override cwd encoding entirely and would be counted as
+# false misses. `./` prefixes every glob because a bucket name starting with `-`
+# is an option to every tool that reads it.
+sweep_root="$HOME/.claude/projects"
+if [ -d "$sweep_root" ] && command -v jq >/dev/null 2>&1; then
+  swept=0; missed=0; first_miss=""
+  for d in "$sweep_root"/-*/; do
+    [ -d "$d" ] || continue
+    b=$(basename "$d")
+    f=$(ls "$d"*.jsonl 2>/dev/null | head -1); [ -n "$f" ] || continue
+    # ALL cwds, not the first. A transcript carries subagent records whose cwd is
+    # a different directory, so `head -1` reports a false miss on a correct
+    # encoder — it did exactly that once while this test was being written.
+    hit=0; saw=0
+    while IFS= read -r cwd; do
+      [ -n "$cwd" ] || continue
+      saw=1
+      [ "$(encode_project "$cwd")" = "$b" ] && { hit=1; break; }
+    done <<EOF
+$(jq -re 'select(.cwd != null) | .cwd' "$f" 2>/dev/null | sort -u)
+EOF
+    # A bucket whose sampled transcript records NO cwd says nothing about the
+    # encoder — ai-title stubs and queue-operation envelopes carry none — and
+    # counting it as a miss made this sweep fail on 50 buckets it had no evidence
+    # about. Only a bucket that offered at least one cwd is a test case.
+    [ "$saw" = "1" ] || continue
+    swept=$((swept + 1))
+    if [ "$hit" != "1" ]; then
+      missed=$((missed + 1))
+      [ -n "$first_miss" ] || first_miss="$b"
+    fi
+  done
+  if [ "$swept" -eq 0 ]; then
+    ok "no path-derived buckets to sweep on this host"
+  elif [ "$missed" -eq 0 ]; then
+    ok "encode_project reproduces all $swept path-derived bucket names on this host"
+  else
+    no "encode_project missed $missed of $swept real buckets (first: $first_miss)"
+  fi
 fi
 
 echo "# lib-project: canonical_project resolves symlinks before encoding"

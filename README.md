@@ -229,7 +229,9 @@ arrive without forking the pipeline.
 
 For the internals — data flow, file map, state layout, environment overrides, the
 lean-query pattern, the adapter contract, and the "don't eat your own tail"
-self-pollution defenses — see **`codemaps/architecture.md`** and **`CLAUDE.md`**.
+self-pollution defenses — see **`codemaps/architecture.md`**, **`CLAUDE.md`**, and
+**`docs/design/unify-harness-adapters-2026-08-23.md`** for the subcommand table
+the adapter contract is defined by.
 
 ## Caveats
 
