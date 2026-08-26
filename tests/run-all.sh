@@ -2205,6 +2205,11 @@ test_no_usable_adapter_leaves_a_trace(){
   printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
   cp "$REPO/adapters/claude/adapter.sh" "$ad/claude/adapter.sh"
   chmod -x "$ad/claude/adapter.sh"          # the whole trigger
+  # A notify.sh that records how it was called. fatal_exit gates on -x, so without
+  # one installed the failure-notification step is skipped and unobservable.
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/notify-args.txt"\n' "$root" \
+    > "$root/autodream/notify.sh"
+  chmod +x "$root/autodream/notify.sh"
   ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
@@ -2214,6 +2219,15 @@ test_no_usable_adapter_leaves_a_trace(){
   assert_eq "$rc" "1" "the run still refuses to scan"
   assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^fatal: ' \
     "a fatal marker is left behind rather than nothing at all"
+  # The marker alone is not enough for a PERSISTENT cause. A lost exec bit repeats
+  # every night, so no later run ever succeeds to read the marker and report it —
+  # the surface that works tonight is the banner. The stub records its arguments.
+  assert_file "$root/notify-args.txt" "notify.sh was invoked on the fatal path"
+  # Bracket the dashes. assert_grep takes (file, pattern, message) and passes the
+  # pattern straight to grep, so a literal `--failure` reads as end-of-options and
+  # an inserted `--` becomes the pattern — which is what the first version did.
+  assert_grep "$root/notify-args.txt" '[-][-]failure' "and invoked in failure mode"
+  assert_grep "$root/notify-args.txt" "$DATE" "naming the date that died"
   # And the next night must surface it. Run a LATER date and check it names this one.
   local later=2020-01-03
   mk_session_dated "$root" b "$later" 2>/dev/null || true

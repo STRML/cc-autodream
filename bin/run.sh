@@ -291,6 +291,38 @@ cd "$HOME" || exit 1
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
+# Every FATAL goes through here so the reason survives to the exit path. A run
+# that dies writes no report and posts no banner, and until fatal_exit existed
+# that made a failed night completely silent — the log line was the only record,
+# and nothing reads the log.
+FATAL_REASON=""
+log_fatal() { FATAL_REASON="$1"; log "FATAL: $1"; }
+
+# The one exit for a run that cannot continue. Leaves a marker the next run can
+# read AND posts a banner now, because those cover different failures: a
+# transient cause is caught by the marker when a later night succeeds, while a
+# persistent one — a lost exec bit, jq off the launchd PATH — never has a later
+# success to be read by, so it needs the banner tonight.
+#
+# Deliberately NOT a stub report. A report is what the idempotency guard reads as
+# "this date is complete", and it is not.
+fatal_exit() {
+  local reason="${FATAL_REASON:-the run stopped before it produced a report}"
+  mkdir -p "$FINDINGS_DIR" 2>/dev/null || true
+  {
+    printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
+    printf 'runner_commit: %s\n' "$RUNNER_COMMIT"
+    printf 'runner_dirty: %s\n' "$RUNNER_DIRTY"
+    printf 'fatal: %s\n' "$reason"
+    printf 'sessions_triaged: 0\n'
+  } > "$FINDINGS_DIR/run-stats.txt" 2>/dev/null || true
+  if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
+    "$AUTODREAM_DIR/notify.sh" --failure "$TARGET_DATE" "$reason" \
+      || log "failure notification returned non-zero (continuing)"
+  fi
+  return 1
+}
+
 # Wipe the isolated worker bucket. Claude Code's async AI-title generation writes a
 # one-line `{"type":"ai-title",...}` stub into the launch cwd's session bucket even
 # under --no-session-persistence (that flag only suppresses the full transcript). By
@@ -460,7 +492,7 @@ scan_roots() {
   # overwrite, one stage earlier than the collision index.
   if ! { : > "$SESSIONS_LIST.raw"; } 2>/dev/null \
      || ! { : > "$SESSIONS_LIST.src"; } 2>/dev/null; then
-    log "FATAL: cannot write the session lists in $FINDINGS_DIR"
+    log_fatal "cannot write the session lists in $FINDINGS_DIR"
     return 1
   fi
   REJECTED_PATHS=0
@@ -476,32 +508,18 @@ scan_roots() {
     # containment or manifest failure that never happened.
     local accepted; accepted=$(adapters_list 2>/dev/null | tr '\n' ',' | sed 's/,$//')
     if [ -n "$accepted" ]; then
-      log "FATAL: no usable adapter — accepted [$accepted] but per-session dispatch is claude-only, and claude is not among them. Refusing to scan."
+      log_fatal "no usable adapter — accepted [$accepted] but per-session dispatch is claude-only, and claude is not among them. Refusing to scan."
     else
-      log "FATAL: the adapter loader ran and accepted no adapters (rejected: $(adapters_rejected 2>/dev/null)). Refusing to scan."
+      log_fatal "the adapter loader ran and accepted no adapters (rejected: $(adapters_rejected 2>/dev/null)). Refusing to scan."
     fi
     RAW=0
-    # Leave a marker before returning. This path is a TOTAL outage with a mundane
-    # trigger — adapters/claude/adapter.sh losing its exec bit to a tarball copy,
-    # a restrictive umask or core.fileMode=false — and it returns ~600 lines
-    # before notify.sh, writes no findings JSON for unassembled_dates() to see,
-    # and writes no run-stats.txt. A host that produced a full report last night
-    # then produces nothing, every night, with one log line nobody reads as the
-    # only record.
+    # This path is a TOTAL outage with a mundane trigger — adapters/claude/adapter.sh
+    # losing its exec bit to a tarball copy, a restrictive umask or
+    # core.fileMode=false, since _adapter_ok requires -x. A host that produced a
+    # full report last night then produces nothing, every night.
     #
-    # Not a stub REPORT: a report is what the idempotency guard reads as "this
-    # date is complete", and this date is not. A run-stats.txt carrying `fatal:`
-    # is the honest artifact, and unassembled_dates() below now looks for it, so
-    # the next night that does succeed names this date in its report.
-    mkdir -p "$FINDINGS_DIR" 2>/dev/null || true
-    {
-      printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
-      printf 'runner_commit: %s\n' "$RUNNER_COMMIT"
-      printf 'runner_dirty: %s\n' "$RUNNER_DIRTY"
-      printf 'fatal: no usable adapter\n'
-      printf 'adapters_rejected: %s\n' "$(adapters_rejected 2>/dev/null)"
-      printf 'sessions_triaged: 0\n'
-    } > "$FINDINGS_DIR/run-stats.txt" 2>/dev/null || true
+    # The marker and the banner come from fatal_exit in run(), which every fatal
+    # path funnels through; log_fatal above is what carries the reason to it.
     return 1
   fi
   for src in $adapters; do
@@ -527,7 +545,7 @@ scan_roots() {
   # night, not the loss of it.
   if [ "${SESSION_ROOTS_ARE_FALLBACK:-0}" != "1" ] \
      && [ "$ROOTS_CONFIGURED" -gt 0 ] && [ "$ROOTS_SCANNED" -eq 0 ]; then
-    log "FATAL: all $ROOTS_CONFIGURED configured session root(s) are unavailable; refusing to report an empty night over a store that was never reached"
+    log_fatal "all $ROOTS_CONFIGURED configured session root(s) are unavailable; refusing to report an empty night over a store that was never reached"
     return 1
   fi
 
@@ -565,7 +583,7 @@ scan_one_adapter() { # $1=adapter name
     # failed on permissions or I/O emitted nothing and the run carried on to
     # finalise a cheerful "no sessions" report over a corpus it never saw.
     local nulfile status
-    nulfile=$(mktemp "$FINDINGS_DIR/.enum.XXXXXX") || { log "FATAL: cannot stage enumeration"; return 1; }
+    nulfile=$(mktemp "$FINDINGS_DIR/.enum.XXXXXX") || { log_fatal "cannot stage enumeration in $FINDINGS_DIR"; return 1; }
     enumerate_for "$src" "$r" > "$nulfile"
     status=$?
     if [ "$status" -ne 0 ]; then
@@ -636,7 +654,7 @@ scan_one_adapter() { # $1=adapter name
       # truncated any path holding a tab and silently lost its provenance.
       if ! printf '%s\n' "$sp" >> "$SESSIONS_LIST.raw" 2>/dev/null \
          || ! printf '%s\t%s\n' "$src" "$sp" >> "$SESSIONS_LIST.src" 2>/dev/null; then
-        log "FATAL: could not record $sp in the session lists"
+        log_fatal "could not record $sp in the session lists"
         # Remove the staging file on THIS exit too. Under AUTODREAM_FORCE=1 the
         # findings dir is reused across reruns, so repeated failures would pile up
         # .enum.* files in the directory the aggregator globs.
@@ -700,7 +718,7 @@ sort_unique_inplace() { # $1=file $2=what (for the log)
     return 0
   fi
   rm -f "$f.su.$$"
-  log "FATAL: could not deduplicate $what; refusing to continue over a possibly damaged list"
+  log_fatal "could not deduplicate $what; refusing to continue over a possibly damaged list"
   return 1
 }
 
@@ -744,7 +762,7 @@ build_source_sidecar() {
   # a silently unwritable temp file.
   if ! { : > "$sidecar"; } 2>/dev/null || ! { : > "$seen"; } 2>/dev/null \
      || ! { : > "$drop"; } 2>/dev/null; then
-    log "FATAL: cannot write the provenance bookkeeping files in $FINDINGS_DIR; refusing to run collision detection blind"
+    log_fatal "cannot write the provenance bookkeeping files in $FINDINGS_DIR; refusing to run collision detection blind"
     return 1
   fi
   DUPLICATE_PATHS=0; HASH_COLLISIONS=0; SESSIONS_BY_SOURCE=""
@@ -762,11 +780,11 @@ build_source_sidecar() {
     case "$prc" in
       0) : ;;                # present, carry on
       1) continue ;;         # dropped at enumeration, expected
-      *) log "FATAL: could not check the worklist for $sp (grep exit $prc); refusing to build provenance over an unreadable list"
+      *) log_fatal "could not check the worklist for $sp (grep exit $prc); refusing to build provenance over an unreadable list"
          return 1 ;;
     esac
     if ! h=$(session_hash "$sp"); then
-      log "FATAL: could not derive an artifact hash for $sp; refusing to run collision detection on unusable keys"
+      log_fatal "could not derive an artifact hash for $sp; refusing to run collision detection on unusable keys"
       return 1
     fi
     # The stored path is everything after the 12-char hash and its tab, taken by
@@ -778,7 +796,7 @@ build_source_sidecar() {
     # look new, .collided would stay empty, and both colliding sessions reach
     # dispatch.
     if ! prev=$(awk -v k="$h" 'substr($0,1,12)==k {print substr($0,14); exit}' "$seen" 2>/dev/null); then
-      log "FATAL: could not read the collision index; refusing to detect collisions blind"
+      log_fatal "could not read the collision index; refusing to detect collisions blind"
       return 1
     fi
     if [ -n "$prev" ]; then
@@ -801,7 +819,7 @@ build_source_sidecar() {
         HASH_COLLISIONS=$((HASH_COLLISIONS + 1))
         log "  COLLISION: $h maps to two different sessions; dropping both: $prev / $sp"
         if ! printf '%s\n%s\n' "$prev" "$sp" >> "$drop" 2>/dev/null; then
-          log "FATAL: could not record a collided path for removal; refusing to dispatch two sessions onto one artifact"
+          log_fatal "could not record a collided path for removal; refusing to dispatch two sessions onto one artifact"
           return 1
         fi
         # Rewrite unconditionally. `grep -v` exits 1 when it removes the only line,
@@ -820,7 +838,7 @@ build_source_sidecar() {
       continue
     fi
     if ! printf '%s\t%s\n' "$h" "$sp" >> "$seen" 2>/dev/null; then
-      log "FATAL: could not record $sp in the collision index; refusing to detect collisions blind"
+      log_fatal "could not record $sp in the collision index; refusing to detect collisions blind"
       return 1
     fi
     # Fail closed, like every sibling write in this function. A silent `|| :` here
@@ -829,11 +847,11 @@ build_source_sidecar() {
     # short. This function's own header argues that a silently unwritable file is
     # how you arrive at the failure it exists to prevent.
     if ! printf '%s\t%s\n' "$h" "$src" >> "$sidecar" 2>/dev/null; then
-      log "FATAL: could not record provenance for $h in $sidecar"
+      log_fatal "could not record provenance for $h in $sidecar"
       return 1
     fi
   done < "$SESSIONS_LIST.src" || {
-    log "FATAL: could not read the session source list; refusing to detect collisions over an unreadable input"
+    log_fatal "could not read the session source list; refusing to detect collisions over an unreadable input"
     return 1
   }
   rm -f "$seen"
@@ -856,7 +874,7 @@ build_source_sidecar() {
     # both colliding paths are still in it, so two workers target one <hash>.json
     # and overwrite each other — exactly what this branch exists to prevent.
     if ! rewrite_filtered "$SESSIONS_LIST.raw" "the worklist" -vxF -f "$drop"; then
-      log "FATAL: refusing to dispatch two sessions onto one artifact"
+      log_fatal "refusing to dispatch two sessions onto one artifact"
       rm -f "$drop"; return 1
     fi
     # Verify the drop rather than trusting an exit code. grep -q returns 1 for
@@ -865,7 +883,7 @@ build_source_sidecar() {
     # check that exists to fail closed.
     grep -qxF -f "$drop" "$SESSIONS_LIST.raw" 2>/dev/null; local vrc=$?
     if [ "$vrc" -ne 1 ]; then
-      log "FATAL: could not confirm the collided paths are gone from the worklist (grep exit $vrc); refusing to dispatch two sessions onto one artifact"
+      log_fatal "could not confirm the collided paths are gone from the worklist (grep exit $vrc); refusing to dispatch two sessions onto one artifact"
       rm -f "$drop"; return 1
     fi
     # RAW is the ENUMERATED count and stays that way. Overwriting it with the
@@ -1330,7 +1348,7 @@ run() {
   log "fanout:      $FANOUT"
   log "claude:      $CLAUDE_BIN"
 
-  [ -x "$CLAUDE_BIN" ] || { log "FATAL: claude not at $CLAUDE_BIN"; exit 1; }
+  [ -x "$CLAUDE_BIN" ] || { log_fatal "claude not at $CLAUDE_BIN"; fatal_exit; exit 1; }
 
   # ---- Session roots (which $HOME/.claude*/projects dirs we scan) ----
   probe_roots
@@ -1388,7 +1406,8 @@ run() {
     # l2_engine check could only ever fire from its own test suite — a dependency
     # gate with a branch production never reached.
     if ! bash "$PREFLIGHT" --l2-bin "$CLAUDE_BIN" 2>>"$RUN_LOG"; then
-      log "FATAL: preflight failed; see the MISSING lines in this log. Nothing was enumerated."
+      log_fatal "preflight failed; see the MISSING lines in this log. Nothing was enumerated."
+      fatal_exit
       return 1
     fi
   else
@@ -1402,8 +1421,8 @@ run() {
   # read-only install.
   export ADAPTERS_REJECT_LOG="$FINDINGS_DIR/.adapters-rejected"
   : > "$ADAPTERS_REJECT_LOG" 2>/dev/null || true
-  scan_roots || return 1
-  build_source_sidecar || return 1
+  scan_roots || { fatal_exit; return 1; }
+  build_source_sidecar || { fatal_exit; return 1; }
 
   # Exclude autodream's OWN headless worker/aggregator transcripts. New runs leave none
   # (--no-session-persistence), but runs predating that fix littered ~/.claude/projects/
