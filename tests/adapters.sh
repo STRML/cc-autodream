@@ -139,6 +139,21 @@ fi
 # The valid name still works, so the guard is a check and not a blanket refusal.
 assert_eq "$(adapter_run claude hello)" "ran hello" "a valid name still dispatches"
 
+echo "# adapters: an unwritable reject log reports unknown, never a confident none"
+# The refusal happened; adapters_rejected just cannot name it. Saying `none` there
+# is worst on the total-outage path, where run.sh fatals with "accepted no
+# adapters (rejected: none)" and the operator is told nothing was refused when
+# everything was. The flag has to be a FILE: _adapter_reject runs inside
+# $(adapters_list), so a shell variable set there never reaches this caller.
+root=$(sandbox); mk_adapter "$root" "Bad" "Bad"
+ADAPTERS_ROOT="$root"
+# A directory where the log should be: every append fails, nothing can be named.
+ADAPTERS_REJECT_LOG="$root/.rejected-dir"; mkdir -p "$ADAPTERS_REJECT_LOG"
+rm -f "$(_adapter_reject_broken_marker)"
+assert_eq "$(adapters_list)" "" "the malformed adapter is still refused"
+has "unknown" "$(adapters_rejected)" "an unwritable log reports unknown, not none"
+rm -f "$(_adapter_reject_broken_marker)"
+
 # shellcheck disable=SC2086
 rm -rf $TMPROOTS
 printf '\npassed: %s   failed: %s\n' "$pass" "$fail"

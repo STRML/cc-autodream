@@ -1555,6 +1555,7 @@ run() {
       printf 'l1_elapsed_seconds: 0\n'
       printf 'oversized_total: 0\n'
       printf 'oversized_errored: 0\n'
+      printf 'oversized_unmeasurable: %s\n' "${OVERSIZED_UNMEASURABLE:-0}"
       printf 'stats_sidecars_unparseable: 0\n'
       # A night with nothing to triage genuinely measured no overlap. That is not
       # the same as the overlap pass having failed, and the zero counts below are
@@ -1708,17 +1709,27 @@ EOF
   OVERSIZED_TOTAL=0
   OVERSIZED_ERRORED=0
   STATS_SIDECARS_UNPARSEABLE=0
+  OVERSIZED_UNMEASURABLE=0
   while IFS= read -r session; do
     [ -n "$session" ] || continue
     # Same reasoning as compute_session_stats above: no hash means no sidecar to
-    # read, which is an unparseable sidecar by any honest definition. Dropping the
-    # session instead removed it from stats_sidecars_unparseable AND from
-    # oversized_total, biasing the #12 gate toward staying closed on the one
-    # failure mode that would most deserve a look.
+    # UNMEASURABLE: excluded from both counters, exactly as oversized-gate.sh:105
+    # does for the same case. An earlier version of this counted it in
+    # oversized_total but never in oversized_errored, and its comment claimed that
+    # dropping the session biased the #12 gate closed. The reasoning was inverted.
+    # The gate is oversized_errored / oversized_total, so padding the DENOMINATOR
+    # with sessions whose size was never read pushes the share DOWN and holds the
+    # gate closed; dropping one raises it. That version also made the runner and
+    # oversized-gate.sh disagree about the same findings dir — run.sh reporting
+    # `12 / 0` and GATE CLOSED where the gate tool reported 0 oversized and 12
+    # unmeasurable.
+    #
+    # Nor is it a sidecar parse failure: a session with no derivable key has no
+    # sidecar to parse. Conflating the two hid a keying failure inside a counter
+    # about file contents, so it gets its own.
     hash=$(session_hash "$session") || {
-      STATS_SIDECARS_UNPARSEABLE=$((STATS_SIDECARS_UNPARSEABLE + 1))
-      OVERSIZED_TOTAL=$((OVERSIZED_TOTAL + 1))
-      log "  WARNING: could not derive an artifact hash for $session; counted as an unreadable sidecar"
+      OVERSIZED_UNMEASURABLE=$((OVERSIZED_UNMEASURABLE + 1))
+      log "  WARNING: could not derive an artifact hash for $session; excluded from the oversized gate as unmeasurable"
       continue
     }
     statsfile="$FINDINGS_DIR/$hash.stats.json"
@@ -1866,6 +1877,7 @@ PY
     # for the gate meaning (M/N >= 5% over a trailing week opens issue #12).
     printf 'oversized_total: %s\n' "$OVERSIZED_TOTAL"
     printf 'oversized_errored: %s\n' "$OVERSIZED_ERRORED"
+    printf 'oversized_unmeasurable: %s\n' "${OVERSIZED_UNMEASURABLE:-0}"
     # Sidecar health (#27): how many of sessions_triaged had a stats sidecar that was
     # missing, empty, or carried no numeric transcript_bytes. Every consumer of the
     # sidecars degrades when this is non-zero — `gated` under-counts (an unreadable

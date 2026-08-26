@@ -68,13 +68,35 @@ adapters_rejected() {
   else
     out=""
   fi
+  # `unknown` beats a confident `none` when the log could not be written. The
+  # refusals happened; this just cannot name them.
+  if [ -z "$out" ] && [ -f "$(_adapter_reject_broken_marker)" ]; then
+    out="unknown (the reject log could not be written)"
+  fi
   [ -n "$out" ] || out=none
   printf '%s' "$out"
 }
 
+# A FILE, not a variable — for exactly the reason the header gives. The first
+# version of this used a shell flag, which _adapter_reject sets from inside
+# _adapter_ok, from inside adapters_list, which every caller runs as
+# $(adapters_list): the assignment died with the subshell and the flag was always
+# 0 in the parent. Third time this trap has been laid in this repo, so it is
+# spelled out here as well as at the top.
+#
+# It exists so adapters_rejected can say `unknown` rather than a confident
+# `none`. A false `none` is worst on the total-outage path: the loader refuses
+# every adapter, run.sh fatals with "accepted no adapters (rejected: none)", and
+# the operator is told nothing was refused when everything was. The marker lives
+# beside the log where possible and falls back to TMPDIR, because the case being
+# reported is precisely the log's directory being unwritable.
+_adapter_reject_broken_marker() {
+  printf '%s' "${TMPDIR:-/tmp}/autodream-adapters-rejectlog-broken.$$"
+}
 _adapter_reject() { # $1=name
   local log; log=$(adapters_reject_log)
-  printf '%s\n' "$1" >> "$log" 2>/dev/null || true
+  printf '%s\n' "$1" >> "$log" 2>/dev/null \
+    || : > "$(_adapter_reject_broken_marker)" 2>/dev/null || true
 }
 
 # Safe identifier: lowercase start, then lowercase/digit/underscore/dash only.

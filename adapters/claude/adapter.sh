@@ -30,6 +30,7 @@ case "$cmd" in
     ;;
 
   normalize) # $1=in $2=out
+    [ "$#" -ge 2 ] || exit 2   # see the note on stats|slim below
     # A Claude transcript is a flat list of turns, so normalisation is a copy.
     # It still writes through a .tmp and renames: the contract says a failed
     # subcommand leaves NO output, and a half-written file that a later step
@@ -126,6 +127,10 @@ case "$cmd" in
   # five lines of signal plumbing in a file whose whole claim is that nothing is
   # invented here. Tracked instead.
   stats|slim)
+    # Arity BEFORE dereferencing $2. Under `set -u` a one-arg call died with
+    # "$2: unbound variable" and status 1 — indistinguishable from a legitimate
+    # skip-this-session failure, when the caller actually made a usage error.
+    [ "$#" -ge 2 ] || exit 2
     case "$cmd" in
       stats) delegate="$BIN/session-stats.sh" ;;
       slim)  delegate="$BIN/slim-transcript.sh" ;;
