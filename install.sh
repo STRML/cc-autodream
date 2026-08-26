@@ -60,8 +60,12 @@ link() {
       return 1
     fi
     rmdir "$dst" 2>/dev/null || {
-      echo "  WARNING: could not remove existing directory $dst; skipping" >&2
-      return 0
+      # return 1, like the non-empty branch above and for the same reason: warning
+      # and continuing reports a successful install while adapters_root() resolves
+      # to a directory the loader accepts nothing from, which is the "loader
+      # accepted no adapters" fatal on every nightly run afterward.
+      echo "  ERROR: could not remove existing directory $dst; refusing to continue." >&2
+      return 1
     }
   fi
   ln -s "$src" "$dst"

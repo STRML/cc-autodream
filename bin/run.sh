@@ -309,6 +309,20 @@ log_fatal() { FATAL_REASON="$1"; log "FATAL: $1"; }
 fatal_exit() {
   local reason="${FATAL_REASON:-the run stopped before it produced a report}"
   mkdir -p "$FINDINGS_DIR" 2>/dev/null || true
+  # NEVER over a date that already has a report. Moving the claude check below the
+  # idempotency guard fixed one call site; the destructive behaviour was still
+  # here, and AUTODREAM_FORCE bypasses that guard BY DESIGN — which is the
+  # documented `autodream-now.sh <date> --force` path. Any fatal under it would
+  # then overwrite that date's full L1/L2 telemetry with a five-line stub and
+  # announce a FAILED night while dreams/<date>.md sits there complete.
+  # unassembled_dates() would not catch it either, because the report exists.
+  if [ -s "$REPORT_PATH" ]; then
+    log "  not overwriting run-stats.txt: $TARGET_DATE already has a complete report"
+    if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
+      log "  suppressing the failure banner for the same reason"
+    fi
+    return 1
+  fi
   {
     printf '# Autodream run self-audit — %s\n' "$TARGET_DATE"
     printf 'runner_commit: %s\n' "$RUNNER_COMMIT"
@@ -688,6 +702,17 @@ enumerate_for() { # $1=adapter $2=root -> NUL-delimited paths
     # adapter whose enumerate fails. tests/run-all.sh now has one.
     adapter_run "$1" enumerate "$2" "$TARGET_DATE" "$NEXT_DATE"
     return $?
+  fi
+  # The fallback is CLAUDE-ONLY. It hardcodes *.jsonl, and nothing reads
+  # session_glob from a manifest, so walking another harness's roots with the
+  # Claude glob would return nothing and read as a quiet night — a silent wrong
+  # answer rather than a loud one. Unreachable today because only claude is ever
+  # enabled, but it becomes live the moment a second adapter ships alongside an
+  # install whose adapters/ link is stale, which is the exact skew this fallback
+  # exists for.
+  if [ "$1" != "claude" ]; then
+    log "  no adapter for '$1' and no fallback that knows its session format; this root contributes nothing" >&2
+    return 1
   fi
   find "$2" -type f -name '*.jsonl' \
        -newermt "$TARGET_DATE 00:00:00" \
@@ -1328,7 +1353,11 @@ unassembled_dates() {
     found=$(find "$d" -maxdepth 1 -type f -name '*.json' ! -name '*.stats.json' 2>/dev/null | head -1)
     local why=""
     if [ -z "$found" ]; then
-      why=$(sed -n 's/^fatal: //p' "$d/run-stats.txt" 2>/dev/null | head -1)
+      # Commas out. PROMPT.md tells L2 to read this value as a comma-separated
+      # date list, and the likeliest reason embeds one: the adapter-loader refusal
+      # interpolates adapters_rejected, which is itself comma-separated, so
+      # `rejected: claude,evil` turned one dead date into three list entries.
+      why=$(sed -n 's/^fatal: //p' "$d/run-stats.txt" 2>/dev/null | head -1 | tr ',' ';')
       [ -n "$why" ] || continue
     fi
     report="$DREAMS_DIR/$date_label.md"
@@ -1389,17 +1418,13 @@ run() {
     return 0
   fi
 
-  # Below the idempotency guard, for the reason preflight is: fatal_exit truncates
-  # run-stats.txt and posts a FAILED banner, and this check used to run BEFORE the
-  # guard. A 06:15 catch-up trigger firing while `claude` is momentarily
-  # unavailable — a version-manager shim swap, an upgrade in flight — would then
-  # destroy the completed date's full run-stats.txt, which is every key L2 and
-  # oversized-gate.sh read for it, and tell the user a successful night FAILED.
-  #
-  # Moving it here also makes preflight's --l2-bin branch reachable: with the
-  # check above, an absolute path that passed [ -x ] could never fail
-  # `command -v`, so the l2_engine check was still dead in production.
-  [ -x "$CLAUDE_BIN" ] || { log_fatal "claude not at $CLAUDE_BIN"; fatal_exit; return 1; }
+  # The `claude` binary is checked by preflight below, NOT here. An earlier commit
+  # moved a `[ -x "$CLAUDE_BIN" ]` test to this spot and its message claimed that
+  # made preflight's --l2-bin branch reachable. It did not: this still ran first,
+  # and for an absolute path — which CLAUDE_BIN defaults to — `command -v` cannot
+  # fail once `[ -x ]` has passed, so the l2_engine branch stayed exercised only by
+  # its own test suite. Two gates for one dependency with the second one dead.
+  # Preflight owns it, so the check that reports the failure is the one that fires.
 
   # ---- Preflight: the shared dependencies this script already assumes ----
   # Before anything is ENUMERATED, because the dangerous one fails silently: with
@@ -1547,15 +1572,19 @@ run() {
 
 No sessions were triaged on this date.
 
-$( if [ "${ROOTS_FAILED:-0}" -gt 0 ]; then
+$( if [ "${ROOTS_FAILED:-0}" -gt 0 ] || [ "${ROOTS_UNAVAILABLE:-0}" -gt 0 ]; then
      # A failed root makes "no session files were modified" a claim this run
      # cannot support: it did not read one of the stores it was meant to. The
      # fatal for a single failed root was removed because on a single-root host
      # that shape is a quiet date plus a transient find error, and losing the
      # night is the wrong trade. That is only defensible while the stub refuses
      # to state an empty night as fact.
-     printf '%s of %s session root(s) could not be enumerated, so this run did not read the whole store. Nothing was triaged from what it did read. See roots_failed in run-stats.txt — whether this was an empty night is unknown.' \
-       "$ROOTS_FAILED" "$ROOTS_SCANNED"
+     # Both classes, and against ROOTS_CONFIGURED rather than ROOTS_SCANNED. A root
+     # that was never a directory — a `:` inside a SESSION_ROOTS entry, or a store
+     # that moved — was not read either, and it is missing from ROOTS_SCANNED
+     # entirely, so measuring against that under-reported how many were configured.
+     printf '%s of %s configured session root(s) were unreadable or failed to enumerate, so this run did not read the whole store. Nothing was triaged from what it did read. See roots_failed and roots_unavailable in run-stats.txt — whether this was an empty night is unknown.' \
+       "$(( ROOTS_FAILED + ROOTS_UNAVAILABLE ))" "$ROOTS_CONFIGURED"
    elif [ "$RAW" -eq 0 ] && [ "$refused" -eq 0 ]; then
      printf 'No session files were modified.'
    else

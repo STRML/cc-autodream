@@ -2190,6 +2190,47 @@ test_fresh_host_with_no_store_is_not_a_failure(){
   rm -rf "$T"
 }
 
+# ---- A fatal must not vandalise a date that already succeeded ---------------
+# fatal_exit truncates run-stats.txt and posts a FAILED banner. AUTODREAM_FORCE
+# bypasses the idempotency guard by design — it is the documented
+# `autodream-now.sh <date> --force` path — so any fatal under it would overwrite
+# that date's full L1/L2 telemetry with a five-line stub and announce a failure
+# for a night whose report is sitting right there. unassembled_dates() would not
+# catch it either, because the report exists.
+test_fatal_does_not_clobber_a_complete_date(){
+  echo "# fatal: a forced rerun that dies leaves the completed date's stats alone"
+  local root; root=$(setup_env)
+  mk_session "$root" a
+  local env_common=(AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 AUTODREAM_NETCHECK=0
+                    AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1)
+  # A good night first.
+  env "${env_common[@]}" CLAUDE_BIN="$MOCK" AUTODREAM_CONFIG="$root/autodream/config" \
+    AUTODREAM_CONSUME_DATE="$DATE" PROJECTS_DIR="$root/projects" \
+    AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run1.out" 2>&1
+  assert_nonempty "$root/dreams/$DATE.md" "the first run produced a report"
+  local before; before=$(wc -l < "$root/autodream/findings/$DATE/run-stats.txt" | tr -d ' ')
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/notify-args.txt"\n' "$root" \
+    > "$root/autodream/notify.sh"
+  chmod +x "$root/autodream/notify.sh"
+  # Now force a rerun that dies: every configured root unavailable.
+  env "${env_common[@]}" CLAUDE_BIN="$MOCK" AUTODREAM_CONFIG="$root/autodream/config" \
+    AUTODREAM_CONSUME_DATE="$DATE" AUTODREAM_FORCE=1 \
+    SESSION_ROOTS="$root/gone-a:$root/gone-b" \
+    AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
+    bash "$RUN" "$DATE" > "$root/run2.out" 2>&1
+  local after; after=$(wc -l < "$root/autodream/findings/$DATE/run-stats.txt" | tr -d ' ')
+  assert_eq "$after" "$before" "the completed date's run-stats.txt is untouched"
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^sessions_triaged: [1-9]' \
+    "and still carries the real triage count, not a stub zero"
+  if [ -f "$root/notify-args.txt" ]; then
+    no "no FAILED banner is posted for a date that has a report"
+  else
+    ok "no FAILED banner is posted for a date that has a report"
+  fi
+  rm -rf "$root"
+}
+
 # ---- A total outage must leave a trace ------------------------------------
 # adapters/claude/adapter.sh losing its exec bit is a mundane accident — a
 # tarball copy, a restrictive umask, core.fileMode=false — and _adapter_ok
@@ -2563,6 +2604,7 @@ test_failing_enumerator_aborts_the_run
 test_one_failed_root_does_not_kill_the_night
 test_enabled_adapters_resolves_once
 test_no_usable_adapter_leaves_a_trace
+test_fatal_does_not_clobber_a_complete_date
 test_partial_enumeration_keeps_what_it_read
 test_all_roots_unavailable_fails
 test_fresh_host_with_no_store_is_not_a_failure

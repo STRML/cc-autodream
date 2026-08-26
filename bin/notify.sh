@@ -86,7 +86,12 @@ if [ "$FAILURE_MODE" = "1" ]; then
       && { echo "notify.sh: posted failure banner for $DATE"; posted=1; }
   fi
   if [ "$posted" = "0" ] && command -v osascript >/dev/null 2>&1; then
-    osascript -e "display notification \"FAILED: $FAIL_REASON\" with title \"Autodream — $DATE\"" \
+    # Escape before interpolating into an AppleScript string literal. A reason
+    # containing a `"` — and several do, since they quote paths and adapter lists —
+    # made osascript a syntax error, whose stderr this branch drops, so the one
+    # surface a dead run has failed silently on exactly those runs.
+    osa_reason=$(printf '%s' "$FAIL_REASON" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    osascript -e "display notification \"FAILED: $osa_reason\" with title \"Autodream — $DATE\"" \
       >/dev/null 2>&1 \
       && { echo "notify.sh: posted osascript failure banner for $DATE"; posted=1; }
   fi
