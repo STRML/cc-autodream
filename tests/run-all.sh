@@ -2577,6 +2577,32 @@ test_unwritable_collision_index_fails_closed
 test_broken_shasum_never_collapses_sessions
 test_all_excluded_corpus_says_so
 
+# ---- The unit suites, run here and not only in CI ---------------------------
+# CLAUDE.md tells contributors "run tests/run-all.sh after any run.sh/prompt
+# change", and these five were wired into the workflow only — so a local pre-push
+# run skipped adapter containment, the manifest-name check and the entire
+# contract suite, which is the gap the CI step's own comment says it closes.
+# Their counts fold into the totals below, so a red unit suite fails this script.
+echo
+echo "===== unit suites ====="
+for _suite in lib-project preflight adapters adapter-claude adapter-contract; do
+  _out=$(bash "$HERE/$_suite.sh" 2>&1)
+  _rc=$?
+  _p=$(printf '%s\n' "$_out" | sed -n 's/^passed: *\([0-9][0-9]*\).*/\1/p' | tail -1)
+  _f=$(printf '%s\n' "$_out" | sed -n 's/.*failed: *\([0-9][0-9]*\).*/\1/p' | tail -1)
+  pass=$((pass + ${_p:-0}))
+  fail=$((fail + ${_f:-0}))
+  if [ "$_rc" -ne 0 ] || [ "${_f:-0}" -ne 0 ]; then
+    printf '  FAIL - unit suite %s\n' "$_suite"
+    printf '%s\n' "$_out" | grep 'FAIL' | head -5
+    # A suite that dies before printing a total reports no failures at all, so
+    # count one rather than letting a crash read as green.
+    [ -n "$_f" ] && [ "$_f" -ne 0 ] || fail=$((fail + 1))
+  else
+    printf '  ok   - unit suite %-18s (%s assertions)\n' "$_suite" "${_p:-0}"
+  fi
+done
+
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"

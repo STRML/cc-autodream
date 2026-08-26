@@ -71,6 +71,14 @@ if [ "$FAILURE_MODE" = "1" ]; then
   # which reads a report that does not exist. Always exits 0: a notification that
   # cannot be posted must not become a second failure on top of the first.
   msg="Autodream FAILED for $DATE — $FAIL_REASON"
+  # Honour the dry-run contract, which this branch returned before reaching. Its
+  # documented promise is "writes no inbox file, posts no banner, opens nothing",
+  # and anyone exercising the new failure path with it set got a live banner and a
+  # stray inbox file.
+  if [ "${AUTODREAM_NOTIFY_DRYRUN:-0}" = "1" ]; then
+    echo "notify.sh: DRY RUN — would post a failure banner for $DATE: $FAIL_REASON"
+    exit 0
+  fi
   posted=0
   if [ -n "$NOTIFIER" ]; then
     "$NOTIFIER" -title "Autodream — $DATE" -message "FAILED: $FAIL_REASON" \

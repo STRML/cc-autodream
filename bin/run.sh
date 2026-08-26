@@ -1326,14 +1326,20 @@ unassembled_dates() {
     # died before it could triage anything, which is the case with no other
     # surface at all: no report, no notification, and no findings to rebuild from.
     found=$(find "$d" -maxdepth 1 -type f -name '*.json' ! -name '*.stats.json' 2>/dev/null | head -1)
+    local why=""
     if [ -z "$found" ]; then
-      grep -q '^fatal: ' "$d/run-stats.txt" 2>/dev/null || continue
+      why=$(sed -n 's/^fatal: //p' "$d/run-stats.txt" 2>/dev/null | head -1)
+      [ -n "$why" ] || continue
     fi
     report="$DREAMS_DIR/$date_label.md"
     if [ -s "$report" ] && grep -q 'autodream:open-questions=' "$report" 2>/dev/null; then
       continue
     fi
-    out="${out:+$out, }$date_label"
+    # Carry the REASON, not just the label. fatal_exit writes it into that date's
+    # run-stats.txt, and L2 only ever reads its OWN date's file — so without this
+    # the marker was written and never read by anything, and PROMPT.md's "A night
+    # that died" bullet was unreachable. The banner was the only working half.
+    out="${out:+$out, }$date_label${why:+ (${why})}"
   done < <(find "$root" -maxdepth 1 -type d -name '2[0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]' 2>/dev/null \
     | sort | tail -n "$window")
   printf '%s' "$out"
@@ -1347,8 +1353,6 @@ run() {
   log "report:      $REPORT_PATH"
   log "fanout:      $FANOUT"
   log "claude:      $CLAUDE_BIN"
-
-  [ -x "$CLAUDE_BIN" ] || { log_fatal "claude not at $CLAUDE_BIN"; fatal_exit; exit 1; }
 
   # ---- Session roots (which $HOME/.claude*/projects dirs we scan) ----
   probe_roots
@@ -1384,6 +1388,18 @@ run() {
     log "report already exists for $TARGET_DATE ($REPORT_PATH); nothing to do (AUTODREAM_FORCE=1 to rebuild)"
     return 0
   fi
+
+  # Below the idempotency guard, for the reason preflight is: fatal_exit truncates
+  # run-stats.txt and posts a FAILED banner, and this check used to run BEFORE the
+  # guard. A 06:15 catch-up trigger firing while `claude` is momentarily
+  # unavailable — a version-manager shim swap, an upgrade in flight — would then
+  # destroy the completed date's full run-stats.txt, which is every key L2 and
+  # oversized-gate.sh read for it, and tell the user a successful night FAILED.
+  #
+  # Moving it here also makes preflight's --l2-bin branch reachable: with the
+  # check above, an absolute path that passed [ -x ] could never fail
+  # `command -v`, so the l2_engine check was still dead in production.
+  [ -x "$CLAUDE_BIN" ] || { log_fatal "claude not at $CLAUDE_BIN"; fatal_exit; return 1; }
 
   # ---- Preflight: the shared dependencies this script already assumes ----
   # Before anything is ENUMERATED, because the dangerous one fails silently: with
@@ -1521,7 +1537,10 @@ run() {
       printf 'overlap_measured: no\n'
       printf 'overlap_events: 0\n'
       printf 'sessions_with_overlap: 0\n'
-      printf 'unassembled_dates: %s\n' "${UNASSEMBLED:-none}"
+      # EMPTY, not `none`. PROMPT.md defines empty as "none" for this key and tells
+      # L2 to name the dates for any non-empty value, so `none` was handed to it as
+      # a date list to report.
+      printf 'unassembled_dates: %s\n' "${UNASSEMBLED:-}"
     } > "$FINDINGS_DIR/run-stats.txt" 2>/dev/null || true
     cat > "$REPORT_PATH" <<EOF
 # Autodream — $TARGET_DATE

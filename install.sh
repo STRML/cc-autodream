@@ -49,9 +49,15 @@ link() {
     rm -f "$dst"
   elif [ -d "$dst" ]; then
     if [ -n "$(ls -A "$dst" 2>/dev/null)" ]; then
-      echo "  WARNING: $dst is a non-empty real directory; not replacing it with a symlink" >&2
-      echo "           move it aside and re-run, or the installed tree will be stale" >&2
-      return 0
+      # A hard failure, not a warning. Warning and returning 0 reported a
+      # successful install while leaving adapters_root() pointed at a directory
+      # the loader accepts nothing from — which takes the "loader accepted no
+      # adapters" fatal on every nightly run afterward. A total outage behind one
+      # line of install output is the exact shape this whole change is built to
+      # refuse.
+      echo "  ERROR: $dst is a non-empty real directory; refusing to install over it." >&2
+      echo "         Move or remove it, then re-run install.sh." >&2
+      return 1
     fi
     rmdir "$dst" 2>/dev/null || {
       echo "  WARNING: could not remove existing directory $dst; skipping" >&2
