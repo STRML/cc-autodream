@@ -162,6 +162,19 @@ jq_is "$got" '.message.content[0] | has("content")' 'false' \
   "no content key is invented on a payload-free tool_result"
 jq_is "$got" '.message.content[0].tool_use_id' 'u1' "and the block survives"
 
+echo "# slim: a null or empty field is not marked as a stripped payload"
+# Presence is not a payload. `has("details")` is true when details is null, so
+# every marker site announced a removal that never happened when the field was
+# there but empty. One level in from the bug the markers exist to prevent.
+jq_is "$(slim_one '{"message":{"role":"toolResult","details":null,"content":"x"}}')" \
+  '.message.details | type' 'null' "a null .details is left alone, not marked stripped"
+jq_is "$(slim_one '{"message":{"content":[{"type":"image","source":null}]}}')" \
+  '.message.content[0].source | type' 'null' "a null image .source is left alone"
+jq_is "$(slim_one '{"message":{"content":[{"type":"image_url","image_url":{}}]}}')" \
+  '.message.content[0].image_url | length' '0' "an EMPTY image_url carries no url, so nothing is claimed"
+jq_is "$(slim_one '{"message":{"content":[{"type":"tool_result","tool_use_id":"u1","content":null}]}}')" \
+  '.message.content[0].content | type' 'null' "a null tool_result .content is left alone"
+
 echo "# slim: OMP toolResult details are stripped"
 got=$(slim_one '{"message":{"role":"toolResult","details":{"big":"payload"},"content":"short"}}')
 has 'details stripped' "$got" "OMP .details gets the marker"

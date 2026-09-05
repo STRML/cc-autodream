@@ -60,6 +60,14 @@ if command -v jq >/dev/null 2>&1; then
     # structured .arguments object was flattened to an escaped JSON string even
     # when it was 40x under the cap — destroying the very structure triage reads.
     # Verified against this exact program with jq before and after.
+    # PRESENCE IS NOT A PAYLOAD. A presence check is true when the field is
+    # null, so every guard below turned a null into a marker announcing that a
+    # payload had been stripped -- the same false claim these guards exist to
+    # stop, one level in. An absent key reads as null in jq, so this subsumes
+    # the presence check. An empty object counts as no payload, since an
+    # image_url of {} carries no url.
+    def payload: . != null and (type != "object" or length > 0);
+
     def trunc($n):
       if . == null then null
       elif type == "string" then
@@ -74,7 +82,7 @@ if command -v jq >/dev/null 2>&1; then
         del(.providerPayload)
         # OMP: a whole record is one tool result.
         | (if .role == "toolResult" then
-             (if has("details") then .details = "[autodream: details stripped]" else . end)
+             (if (.details | payload) then .details = "[autodream: details stripped]" else . end)
              # has() guard, not a bare assignment: `.content = (...)` CREATES the
              # key on a record that never had one.
              | (if has("content") then .content = (.content | trunc($tr)) else . end)
@@ -89,7 +97,7 @@ if command -v jq >/dev/null 2>&1; then
                  # the same reason as everywhere else in this program: without it a
                  # block carrying no content came out ASSERTING that content was
                  # stripped, which is a claim about a payload that never existed.
-                 (if has("content")
+                 (if (.content | payload)
                     then .content = "[autodream: tool_result payload stripped]"
                     else . end)
                elif .type == "thinking" then
@@ -113,9 +121,9 @@ if command -v jq >/dev/null 2>&1; then
                # the base64 and a receipt for its deletion. Each shape is stripped
                # where its data actually lives, and only if it is there.
                elif .type == "image" then
-                 (if has("source") then .source = "[autodream: image stripped]" else . end)
+                 (if (.source | payload) then .source = "[autodream: image stripped]" else . end)
                elif .type == "image_url" then
-                 (if has("image_url") then .image_url = "[autodream: image stripped]" else . end)
+                 (if (.image_url | payload) then .image_url = "[autodream: image stripped]" else . end)
                else . end)
            else . end)
       )
