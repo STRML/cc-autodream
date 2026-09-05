@@ -122,6 +122,20 @@ if command -v jq >/dev/null 2>&1; then
                # where its data actually lives, and only if it is there.
                elif .type == "image" then
                  (if (.source | payload) then .source = "[autodream: image stripped]" else . end)
+                 # OMP keeps its image payload in .data, which this branch did not
+                 # touch at all. But .data is NOT always a payload: measured across
+                 # 400 real OMP transcripts on this host, all 289 image blocks carry
+                 # `blob:sha256:<hash>`, a 76-char content-addressed reference
+                 # totalling 22KB against a 262144-byte cap. Replacing those with a
+                 # marker would delete an identifier triage can use and save
+                 # nothing. Only an inline data: URI is a payload, so only that is
+                 # stripped; anything else goes through trunc as a backstop for a
+                 # shape neither of us has seen.
+                 | (if (.data | payload) then
+                      .data = (if (.data | type) == "string" and (.data | startswith("data:"))
+                                 then "[autodream: image stripped]"
+                                 else (.data | trunc($tr)) end)
+                    else . end)
                elif .type == "image_url" then
                  (if (.image_url | payload) then .image_url = "[autodream: image stripped]" else . end)
                else . end)

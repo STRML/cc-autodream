@@ -156,6 +156,19 @@ got=$(slim_one '{"message":{"content":[{"type":"image_url","alt":"a chart"}]}}')
 jq_is "$got" '.message.content[0] | has("image_url")' 'false' \
   "an image_url block with no payload does not have one invented"
 
+echo "# slim: OMP image .data is stripped only when it IS a payload"
+# Grounded in the corpus, not the schema. All 289 image blocks across 400 real OMP
+# transcripts on the author's host carry `blob:sha256:<hash>` — a 76-char
+# content-addressed reference, 22KB in total against a 262144-byte cap. Marking
+# those "stripped" would delete an identifier and reclaim nothing, so only an
+# inline data: URI counts as a payload here.
+got=$(slim_one '{"message":{"content":[{"type":"image","data":"blob:sha256:ea5b55c53f28e07af31be6686b1281d9e4cd7bab9fbf9c4f65dc432affd2a010","mimeType":"image/webp"}]}}')
+has 'blob:sha256:ea5b55c5' "$got" "a blob reference SURVIVES; it is an id, not a payload"
+jq_is "$got" '.message.content[0].mimeType' 'image/webp' "and the block keeps its metadata"
+got=$(slim_one '{"message":{"content":[{"type":"image","data":"data:image/png;base64,SECRETPAYLOAD","mimeType":"image/png"}]}}')
+hasnt 'SECRETPAYLOAD' "$got" "an inline data: URI payload is removed"
+jq_is "$got" '.message.content[0].mimeType' 'image/png' "while its metadata is kept"
+
 echo "# slim: a tool_result with no content does not claim one was stripped"
 got=$(slim_one '{"message":{"content":[{"type":"tool_result","tool_use_id":"u1"}]}}')
 jq_is "$got" '.message.content[0] | has("content")' 'false' \
