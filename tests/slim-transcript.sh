@@ -142,6 +142,26 @@ hasnt 'HUGE' "$got" "and the original payload is actually GONE, not just annotat
 has '"tool_use_id":"tu_1"' "$got" "tool_use_id is kept so triage can name the call"
 has '"is_error":true' "$got" "is_error is kept so triage can tell a failure"
 
+echo "# slim: image payloads leave, in BOTH shapes"
+# This branch claimed to strip base64 image data from the day it was written and
+# did not, for image_url. It set .source (Claude's field) on a block whose payload
+# lives at .image_url.url, so the base64 stayed and the record gained a marker
+# saying it had gone. A receipt for a deletion that never happened.
+got=$(slim_one '{"message":{"content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,SECRETPAYLOAD"}}]}}')
+hasnt 'SECRETPAYLOAD' "$got" "an image_url base64 payload is actually removed"
+has 'image stripped' "$got" "and the block says so"
+got=$(slim_one '{"message":{"content":[{"type":"image","source":{"data":"BASE64HERE"}}]}}')
+hasnt 'BASE64HERE' "$got" "a Claude image .source payload is actually removed"
+got=$(slim_one '{"message":{"content":[{"type":"image_url","alt":"a chart"}]}}')
+jq_is "$got" '.message.content[0] | has("image_url")' 'false' \
+  "an image_url block with no payload does not have one invented"
+
+echo "# slim: a tool_result with no content does not claim one was stripped"
+got=$(slim_one '{"message":{"content":[{"type":"tool_result","tool_use_id":"u1"}]}}')
+jq_is "$got" '.message.content[0] | has("content")' 'false' \
+  "no content key is invented on a payload-free tool_result"
+jq_is "$got" '.message.content[0].tool_use_id' 'u1' "and the block survives"
+
 echo "# slim: OMP toolResult details are stripped"
 got=$(slim_one '{"message":{"role":"toolResult","details":{"big":"payload"},"content":"short"}}')
 has 'details stripped' "$got" "OMP .details gets the marker"

@@ -85,8 +85,13 @@ if command -v jq >/dev/null 2>&1; then
              .content |= map(
                if .type == "tool_result" then
                  # Preserve tool_use_id + is_error so triage can still tell which
-                 # call failed; only the heavy content array goes.
-                 .content = "[autodream: tool_result payload stripped]"
+                 # call failed; only the heavy content array goes. has() guard for
+                 # the same reason as everywhere else in this program: without it a
+                 # block carrying no content came out ASSERTING that content was
+                 # stripped, which is a claim about a payload that never existed.
+                 (if has("content")
+                    then .content = "[autodream: tool_result payload stripped]"
+                    else . end)
                elif .type == "thinking" then
                  # has() guard and NO `// ""`. The first version wrote
                  # `.thinking = ((.thinking // "") | trunc($tk))`, which invented
@@ -99,8 +104,18 @@ if command -v jq >/dev/null 2>&1; then
                elif .type == "toolCall" then
                  del(.partialArgs)
                  | (if has("arguments") then .arguments = (.arguments | trunc($tr)) else . end)
-               elif .type == "image" or .type == "image_url" then
-                 .source = "[autodream: image stripped]"
+               # The two image shapes keep their payload in DIFFERENT places, and
+               # collapsing them cost this branch its entire purpose. Claude puts
+               # the base64 in .source; an OpenAI-style image_url block puts it in
+               # .image_url.url. Setting .source on BOTH left the image_url payload
+               # completely intact and added a marker claiming it had been removed
+               # — a file whose header promises to strip base64 image data, shipping
+               # the base64 and a receipt for its deletion. Each shape is stripped
+               # where its data actually lives, and only if it is there.
+               elif .type == "image" then
+                 (if has("source") then .source = "[autodream: image stripped]" else . end)
+               elif .type == "image_url" then
+                 (if has("image_url") then .image_url = "[autodream: image stripped]" else . end)
                else . end)
            else . end)
       )
