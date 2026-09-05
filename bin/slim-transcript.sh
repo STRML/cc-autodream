@@ -14,7 +14,8 @@
 #
 # Usage: slim-transcript.sh <src.jsonl> <dst>
 # Tunables (env): AUTODREAM_SLIM_MAXLINE (400 chars), _HEAD (400 lines),
-#                 _TAIL (200 lines), _CAP (262144 bytes).
+#                 _TAIL (200 lines), _CAP (262144 bytes),
+#                 _TOOLRESULT (600 chars), _THINKING (800 chars).
 set -u
 
 src="${1:?usage: slim-transcript.sh <src> <dst>}"
@@ -23,35 +24,78 @@ maxline="${AUTODREAM_SLIM_MAXLINE:-400}"
 headn="${AUTODREAM_SLIM_HEAD:-400}"
 tailn="${AUTODREAM_SLIM_TAIL:-200}"
 cap="${AUTODREAM_SLIM_CAP:-262144}"
+trmax="${AUTODREAM_SLIM_TOOLRESULT:-600}"
+tkmax="${AUTODREAM_SLIM_THINKING:-800}"
 
 [ -r "$src" ] || { echo "slim-transcript: cannot read $src" >&2; exit 1; }
 
 lines=$(wc -l < "$src" | tr -d ' ')
 bytes=$(wc -c < "$src" | tr -d ' ')
 
-# Pre-pass: when jq is available, strip the bulky payloads inside tool_result
-# entries (and base64 image_url data) before the line-based head/tail/truncate
-# pass. Orchestrator/review-fan-out transcripts spend most of their bytes on
-# tool_result blocks (entire diffs, file dumps, gh JSON), so cutting just the
-# *.message.content tool_result fields shrinks the file 5-20x while leaving the
-# turn structure intact for fuzzy pattern-spotting. The line-based pass below
-# still runs as a safety net (caps stragglers like assistant turns that paste
-# huge code blocks). Falls back transparently if jq isn't installed or the
-# stream isn't pure JSONL (e.g. a non-Claude session schema we don't know).
+# Pre-pass: when jq is available, strip the bulky payloads that tool calls leave
+# behind, before the line-based head/tail/truncate pass. Two transcript schemas
+# show up here and they store tool output in completely different places:
+#
+#   Claude Code  content blocks of .type == "tool_result" inside .message.content
+#   OMP          whole records with .message.role == "toolResult", carrying the
+#                payload in .message.details + .message.content, plus a
+#                .message.providerPayload blob on assistant turns
+#
+# Handling only the first schema is worse than doing nothing: jq still exits 0 and
+# writes a valid file, so the fallback never fires, and the line pass below then
+# spends its 400-char budget on ~190 chars of OMP envelope (id/parentId/timestamp/
+# toolCallId/toolName) and cuts off at '"content":[' — the worker gets ID soup with
+# no payload and no goal, and returns no findings. Both schemas are stripped here.
+# The line-based pass still runs as a safety net for stragglers. Falls back
+# transparently if jq isn't installed or the stream isn't parseable JSONL.
 pre_src="$src"
 pre_tmp=""
 if command -v jq >/dev/null 2>&1; then
   pre_tmp="$dst.pre.jsonl"
-  if jq -c '
-    if (.message.content | type) == "array" then
-      .message.content |= map(
-        if .type == "tool_result" then
-          # Replace the heavy content array with a one-line marker, preserve
-          # tool_use_id + is_error so triage can still tell which call failed.
-          .content = "[autodream: tool_result payload stripped]"
-        elif .type == "image" or .type == "image_url" then
-          .source = "[autodream: image stripped]"
-        else . end
+  if jq -c --argjson tr "$trmax" --argjson tk "$tkmax" '
+    # tostring is applied ONLY when the value is over the cap, and never to null.
+    # The first version ran it unconditionally, which did three wrong things: a
+    # toolResult with .content null came out carrying the literal string "null",
+    # a record with NO .content had the key invented and set to "null", and a
+    # structured .arguments object was flattened to an escaped JSON string even
+    # when it was 40x under the cap — destroying the very structure triage reads.
+    # Verified against this exact program with jq before and after.
+    def trunc($n):
+      if . == null then null
+      elif type == "string" then
+        (if length > $n then .[0:$n] + "…[autodream: truncated]" else . end)
+      else
+        (tostring as $s
+         | if ($s | length) > $n then $s[0:$n] + "…[autodream: truncated]" else . end)
+      end;
+    if (.message | type) == "object" then
+      .message |= (
+        # Raw provider round-trip, never useful for triage.
+        del(.providerPayload)
+        # OMP: a whole record is one tool result.
+        | (if .role == "toolResult" then
+             (if has("details") then .details = "[autodream: details stripped]" else . end)
+             # has() guard, not a bare assignment: `.content = (...)` CREATES the
+             # key on a record that never had one.
+             | (if has("content") then .content = (.content | trunc($tr)) else . end)
+           else . end)
+        # Claude Code: tool results are blocks. Also caps oversized thinking and
+        # tool-call arguments in either schema.
+        | (if (.content | type) == "array" then
+             .content |= map(
+               if .type == "tool_result" then
+                 # Preserve tool_use_id + is_error so triage can still tell which
+                 # call failed; only the heavy content array goes.
+                 .content = "[autodream: tool_result payload stripped]"
+               elif .type == "thinking" then
+                 .thinking = ((.thinking // "") | trunc($tk))
+               elif .type == "toolCall" then
+                 del(.partialArgs)
+                 | (if has("arguments") then .arguments = (.arguments | trunc($tr)) else . end)
+               elif .type == "image" or .type == "image_url" then
+                 .source = "[autodream: image stripped]"
+               else . end)
+           else . end)
       )
     else . end
   ' "$src" > "$pre_tmp" 2>/dev/null && [ -s "$pre_tmp" ]; then
