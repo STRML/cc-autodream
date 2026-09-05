@@ -37,19 +37,21 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/adclaude.XXXXXX")
 # defers a trapped signal behind a FOREGROUND delegate, so trapping converts a
 # prompt death into a hang. This suite is always either sleeping or in `wait`
 # when a signal arrives, and a trapped signal interrupts both.
-# `pkill -f` matches a REGEX, not a fixed string, so the pattern must not carry
-# an interpolated path. $TMPDIR is the caller's and may hold metacharacters — a
-# TMPDIR of /tmp/a[b] makes the selector quietly match nothing, and pkill's
-# stderr is discarded, so the orphan this whole change exists to prevent comes
-# straight back (Codex review of #62).
+# Reap by PROCESS GROUP, never by name. Two rounds of #62 review went into this
+# and both were spent on `pkill -f`, which is the wrong tool twice over: it
+# matches an unanchored REGEX, so an interpolated $TMPDIR of /tmp/a[b] silently
+# matched nothing, and once $TMPDIR was out of the pattern the mktemp suffix
+# still identified the run only probabilistically. A pattern names processes by
+# what they look like; the group names exactly the ones this run started.
 #
-# Match on the mktemp suffix instead. `mktemp -d` fills XXXXXX from
-# [A-Za-z0-9] only, so `adclaude.orBJsa/fifo/src.jsonl` is regex-inert whatever
-# $TMPDIR contains, and still unique to this run — a concurrent suite has a
-# different suffix and is left alone.
+# `set -m` around the launch puts the adapter in its own process group, so the
+# delegate and the two bash subshells beneath it inherit that pgid. Killing the
+# negative pid reaches all of them in one call, and it keeps working after the
+# adapter dies: a reparented child keeps its process group.
 reap_delegate() {
-  [ -n "${tmp:-}" ] || return 0
-  pkill -f "slim-transcript\.sh .*$(basename "$tmp")/fifo/src\.jsonl" 2>/dev/null
+  [ -n "${slim_pgid:-}" ] || return 0
+  kill -TERM -"$slim_pgid" 2>/dev/null
+  kill -KILL -"$slim_pgid" 2>/dev/null
   return 0
 }
 
@@ -152,8 +154,14 @@ echo "# claude adapter: a signalled slim dies promptly and writes no destination
 fifodir="$tmp/fifo"; mkdir -p "$fifodir"
 mkfifo "$fifodir/src.jsonl" 2>/dev/null
 if [ -p "$fifodir/src.jsonl" ]; then
+  # Monitor mode only around the launch: it gives this job its own process group
+  # (pgid == pid) so reap_delegate can signal the whole tree. Restored right
+  # after, because job control changes behaviour for everything that follows.
+  set -m
   "$A" slim "$fifodir/src.jsonl" "$fifodir/out.jsonl" >/dev/null 2>&1 &
   slim_pid=$!
+  set +m
+  slim_pgid=$slim_pid
   # Wait for the temp to APPEAR before signalling. A busy spin returns long
   # before the adapter has reached mktemp, and killing it that early makes the
   # assertion below vacuous — it passed against the untrapped code exactly once,
