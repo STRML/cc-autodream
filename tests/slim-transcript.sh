@@ -21,7 +21,15 @@ ok(){ printf '  ok   - %s\n' "$1"; pass=$((pass + 1)); }
 no(){ printf '  FAIL - %s\n' "$1"; fail=$((fail + 1)); }
 assert_eq(){ [ "$1" = "$2" ] && ok "$3" || no "$3 (got [$1] want [$2])"; }
 has(){ case "$2" in *"$1"*) ok "$3" ;; *) no "$3 (got: [$2])" ;; esac; }
-hasnt(){ case "$2" in *"$1"*) no "$3 (found [$1] in: [$2])" ;; *) ok "$3" ;; esac; }
+# An EMPTY haystack is a failure, not a pass. Every `hasnt` in this file was
+# vacuous whenever the slimmer produced no output at all — the strongest possible
+# regression, a slimmer that emits nothing, satisfied all of them. The guard lives
+# in the helper because the defect is the helper's, not any one call site's.
+# `has` and `jq_is` already fail on empty input by construction.
+hasnt(){
+  [ -n "$2" ] || { no "$3 (nothing to check: the slimmer produced no output)"; return; }
+  case "$2" in *"$1"*) no "$3 (found [$1] in: [$2])" ;; *) ok "$3" ;; esac
+}
 # Type and presence claims go through jq, never through a substring match.
 # The first version asserted `hasnt '\\"file\\"'` to mean "not stringified" —
 # jq emits ONE backslash there, so the pattern could never match and the
@@ -63,7 +71,10 @@ echo "# slim: a null or absent value is not turned into the string \"null\""
 # a toolResult carrying no content came out asserting the literal text "null" —
 # a value the worker reads as real tool output.
 got=$(slim_one '{"message":{"role":"toolResult","content":null,"toolName":"Read"}}')
-jq_is "$got" '.message.content | type' 'null' "a null .content stays JSON null, not the string \"null\""
+# BOTH assertions, because `type` alone reports "null" for an absent key too, so
+# a regression that simply deleted .content would satisfy the type check.
+jq_is "$got" '.message | has("content")' 'true' "an explicit null .content is KEPT, not deleted"
+jq_is "$got" '.message.content | type' 'null' "and stays JSON null, not the string \"null\""
 has '"toolName":"Read"' "$got" "and the rest of the record survives"
 
 got=$(slim_one '{"message":{"role":"toolResult","toolName":"Read"}}')
@@ -94,17 +105,20 @@ has 'autodream: truncated' "$got" "a 700-char content is truncated at the 600 ca
 
 echo "# slim: Claude Code tool_result blocks are stripped, provenance kept"
 got=$(slim_one '{"message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","is_error":true,"content":[{"type":"text","text":"HUGE"}]}]}}')
-has 'payload stripped' "$got" "the payload goes"
+has 'payload stripped' "$got" "the marker is inserted"
+hasnt 'HUGE' "$got" "and the original payload is actually GONE, not just annotated"
 has '"tool_use_id":"tu_1"' "$got" "tool_use_id is kept so triage can name the call"
 has '"is_error":true' "$got" "is_error is kept so triage can tell a failure"
 
 echo "# slim: OMP toolResult details are stripped"
 got=$(slim_one '{"message":{"role":"toolResult","details":{"big":"payload"},"content":"short"}}')
-has 'details stripped' "$got" "OMP .details is stripped"
+has 'details stripped' "$got" "OMP .details gets the marker"
+hasnt '"big":"payload"' "$got" "and the original details payload is actually gone"
 has '"content":"short"' "$got" "a short OMP content survives intact"
 
 echo "# slim: providerPayload never survives"
 got=$(slim_one '{"message":{"role":"assistant","providerPayload":{"raw":"secretish"},"content":"hi"}}')
+jq_is "$got" '.message.content' 'hi' "the assistant record itself survives"
 hasnt 'providerPayload' "$got" "the raw provider round-trip is dropped"
 hasnt 'secretish' "$got" "and its contents go with it"
 
