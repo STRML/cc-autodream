@@ -19,6 +19,62 @@ assert_eq(){ [ "$1" = "$2" ] && ok "$3" || no "$3 (got [$1] want [$2])"; }
                  printf '\npassed: 0   failed: 1\n'; exit 1; }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/adclaude.XXXXXX")
+
+# Cleanup lives in a trap because this suite parks a process that blocks forever
+# on purpose. The FIFO test below starts a `slim` whose first read waits for a
+# writer that never comes. Both cleanups used to sit on the last lines of the
+# file, so a run that ended any other way — Ctrl-C, a harness timeout, an early
+# exit — reached neither, and the delegate was reparented to init and blocked
+# for good.
+#
+# Measured, not hypothesised: 22 interrupted runs over about 90 minutes on
+# 2026-08-26 left 66 slim-transcript.sh processes alive. They were still there
+# nine days later, each holding a FIFO open in a temp directory that had already
+# been deleted.
+#
+# A trap is safe HERE in a way it is not in adapters/claude/adapter.sh, which
+# documents the opposite conclusion and issue #57 explains at length. The
+# difference is not that this suite is interruptible and that one is not. Bash
+# defers a trapped signal until the FOREGROUND child returns in both, and a
+# foreground `sleep` is NOT interruptible — measured on bash 5.3.15 and on
+# /bin/bash 3.2.57, a trapped TERM sent 1s into `sleep 5` fires at t=5, while
+# the same signal during `wait` fires at t=1.
+#
+# The difference is that the deferral is BOUNDED here and unbounded there. Every
+# foreground child in this file is a `sleep 0.05` or faster, so the worst case
+# is a signal handled 50ms late. adapter.sh's foreground child is the delegate
+# itself, which blocks forever on the FIFO, so a trap there converts a prompt
+# death into a hang.
+# Reap by PROCESS GROUP, never by name. Two rounds of #62 review went into this
+# and both were spent on `pkill -f`, which is the wrong tool twice over: it
+# matches an unanchored REGEX, so an interpolated $TMPDIR of /tmp/a[b] silently
+# matched nothing, and once $TMPDIR was out of the pattern the mktemp suffix
+# still identified the run only probabilistically. A pattern names processes by
+# what they look like; the group names exactly the ones this run started.
+#
+# `set -m` around the launch puts the adapter in its own process group, so the
+# delegate and the two bash subshells beneath it inherit that pgid. Killing the
+# negative pid reaches all of them in one call, and it keeps working after the
+# adapter dies: a reparented child keeps its process group.
+reap_delegate() {
+  [ -n "${slim_pgid:-}" ] || return 0
+  kill -TERM -"$slim_pgid" 2>/dev/null
+  kill -KILL -"$slim_pgid" 2>/dev/null
+  return 0
+}
+
+cleanup() {
+  # Both guards below default under `set -u`: the FIFO branch may never have run
+  # (no mkfifo), leaving $slim_pgid unset, and the trap is armed before $tmp is
+  # guaranteed populated.
+  reap_delegate
+  [ -n "${tmp:-}" ] && [ -d "${tmp:-}" ] && rm -rf "$tmp"
+  return 0
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
 # A real cwd to resolve against, created inside the sandbox so the test owns it.
 proj="$tmp/proj a"          # a space, because NUL transport is supposed to allow it
 mkdir -p "$proj"
@@ -108,8 +164,14 @@ echo "# claude adapter: a signalled slim dies promptly and writes no destination
 fifodir="$tmp/fifo"; mkdir -p "$fifodir"
 mkfifo "$fifodir/src.jsonl" 2>/dev/null
 if [ -p "$fifodir/src.jsonl" ]; then
+  # Monitor mode only around the launch: it gives this job its own process group
+  # (pgid == pid) so reap_delegate can signal the whole tree. Restored right
+  # after, because job control changes behaviour for everything that follows.
+  set -m
   "$A" slim "$fifodir/src.jsonl" "$fifodir/out.jsonl" >/dev/null 2>&1 &
   slim_pid=$!
+  set +m
+  slim_pgid=$slim_pid
   # Wait for the temp to APPEAR before signalling. A busy spin returns long
   # before the adapter has reached mktemp, and killing it that early makes the
   # assertion below vacuous — it passed against the untrapped code exactly once,
@@ -148,7 +210,7 @@ if [ -p "$fifodir/src.jsonl" ]; then
     kill -9 "$slim_pid" 2>/dev/null
   fi
   wait "$slim_pid" 2>/dev/null
-  pkill -f "slim-transcript.sh $fifodir/src.jsonl" 2>/dev/null
+  reap_delegate
   if [ -e "$fifodir/out.jsonl" ]; then
     no "a signalled slim wrote no destination file"
   else
@@ -167,6 +229,7 @@ if "$A" is-self "$S"; then no "a real session is not ours"; else ok "a real sess
 echo "# claude adapter: an unknown subcommand exits 2, never 0"
 "$A" not-a-subcommand >/dev/null 2>&1; assert_eq "$?" "2" "unknown subcommand exits 2"
 
-rm -rf "$tmp"
+# $tmp and any parked delegate are removed by the EXIT trap, which also covers
+# the paths that never reach this line.
 printf '\npassed: %s   failed: %s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
