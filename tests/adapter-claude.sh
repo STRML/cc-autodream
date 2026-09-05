@@ -19,6 +19,34 @@ assert_eq(){ [ "$1" = "$2" ] && ok "$3" || no "$3 (got [$1] want [$2])"; }
                  printf '\npassed: 0   failed: 1\n'; exit 1; }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/adclaude.XXXXXX")
+
+# Cleanup cannot live on the last line, because this suite parks a process that
+# blocks forever on purpose. The FIFO test below starts a `slim` whose first read
+# waits for a writer that never comes; the `pkill` that reaps it, and the
+# `rm -rf "$tmp"` that removes this directory, both sit near the bottom of the
+# file. A run that ends any other way — Ctrl-C, a harness timeout, an early exit
+# — reaches neither, and the delegate is reparented to init and blocks for good.
+#
+# Measured, not hypothesised: 22 interrupted runs over about 90 minutes on
+# 2026-08-26 left 66 slim-transcript.sh processes alive. They were still there
+# nine days later, each holding a FIFO open in a temp directory that had already
+# been deleted.
+#
+# A trap is safe HERE in a way it is not in adapters/claude/adapter.sh, which
+# documents the opposite conclusion and issue #57 explains at length. That file
+# defers a trapped signal behind a FOREGROUND delegate, so trapping converts a
+# prompt death into a hang. This suite is always either sleeping or in `wait`
+# when a signal arrives, and a trapped signal interrupts both.
+cleanup() {
+  # $fifodir is set much later; under `set -u` the default matters.
+  [ -n "${fifodir:-}" ] && pkill -f "slim-transcript.sh $fifodir/src.jsonl" 2>/dev/null
+  [ -n "${tmp:-}" ] && [ -d "${tmp:-}" ] && rm -rf "$tmp"
+  return 0
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
 # A real cwd to resolve against, created inside the sandbox so the test owns it.
 proj="$tmp/proj a"          # a space, because NUL transport is supposed to allow it
 mkdir -p "$proj"
@@ -167,6 +195,7 @@ if "$A" is-self "$S"; then no "a real session is not ours"; else ok "a real sess
 echo "# claude adapter: an unknown subcommand exits 2, never 0"
 "$A" not-a-subcommand >/dev/null 2>&1; assert_eq "$?" "2" "unknown subcommand exits 2"
 
-rm -rf "$tmp"
+# $tmp and any parked delegate are removed by the EXIT trap, which also covers
+# the paths that never reach this line.
 printf '\npassed: %s   failed: %s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
