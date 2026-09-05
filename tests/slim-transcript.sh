@@ -35,8 +35,13 @@ hasnt(){
 # jq emits ONE backslash there, so the pattern could never match and the
 # assertion passed whatever the code did. It survived the red-then-green check
 # for the same reason. An assertion that cannot fail is decoration.
-jq_is(){ # $1=record $2=jq expr $3=want $4=msg
-  local g; g=$(printf '%s' "$1" | jq -r "$2" 2>/dev/null)
+jq_is(){ # $1=slimmer output (may be several lines) $2=jq expr $3=want $4=msg
+  local rec g rc
+  rec=$(printf '%s\n' "$1" | grep -m1 '^{')
+  # jq's exit status is checked. Ignoring it meant a record that produced the
+  # expected value and THEN hit malformed bytes still passed.
+  g=$(printf '%s' "$rec" | jq -r "$2" 2>/dev/null); rc=$?
+  [ "$rc" -eq 0 ] || { no "$4 (jq exit $rc on: [$rec])"; return; }
   assert_eq "$g" "$3" "$4"
 }
 
@@ -63,8 +68,21 @@ slim_one() { # $1=json record -> slimmed record on stdout, or nothing on failure
   AUTODREAM_SLIM_MAXLINE=100000 AUTODREAM_SLIM_HEAD=9000 AUTODREAM_SLIM_TAIL=9000 \
   AUTODREAM_SLIM_CAP=100000000 \
     "$SLIM" "$TMP/in.jsonl" "$TMP/out.txt" >/dev/null 2>&1 || return 1
-  grep -m1 '^{' "$TMP/out.txt" 2>/dev/null
+  # The WHOLE output, not `grep -m1 '^{'`. Returning only the first record meant
+  # every negative assertion inspected one line, so a slimmer emitting a clean
+  # record followed by the original payload on line two passed them all. jq_is
+  # picks the first record out for itself.
+  cat "$TMP/out.txt" 2>/dev/null
 }
+
+echo "# slim: the script parses at all"
+# Cheap, and it would have caught the bug that produced this line. The jq program
+# is a single-quoted shell string, so ONE apostrophe anywhere inside it — in a
+# comment, in the word "commit's" — terminates the quote and the whole file stops
+# parsing. CLAUDE.md documents this trap for run.sh's L1 worker body; it applies
+# to every single-quoted program in this repo.
+if bash -n "$SLIM" 2>/dev/null; then ok "bin/slim-transcript.sh parses"
+else no "bin/slim-transcript.sh has a shell syntax error (stray apostrophe in the jq program?)"; fi
 
 echo "# slim: a null or absent value is not turned into the string \"null\""
 # The bug this suite was written for. `trunc` ran `tostring` unconditionally, so
@@ -79,6 +97,7 @@ has '"toolName":"Read"' "$got" "and the rest of the record survives"
 
 got=$(slim_one '{"message":{"role":"toolResult","toolName":"Read"}}')
 jq_is "$got" '.message | has("content")' 'false' "an ABSENT .content is not invented as a key"
+jq_is "$got" '.message.toolName' 'Read' "and the surrounding record is not simply dropped"
 
 echo "# slim: a small structured value keeps its structure"
 # tostring flattened `arguments` to an escaped JSON string even 40x under the
@@ -94,6 +113,19 @@ jq_is "$got" '.message.content[0].arguments.file' 'a.txt' "and the field names t
 got=$(slim_one '{"message":{"content":[{"type":"toolCall","toolName":"Read"}]}}')
 jq_is "$got" '.message.content[0] | has("arguments")' 'false' \
   "an ABSENT .arguments is not invented either"
+jq_is "$got" '.message.content[0].type' 'toolCall' "and that block is not simply dropped"
+
+echo "# slim: thinking blocks are capped without being fabricated"
+got=$(slim_one '{"message":{"content":[{"type":"thinking","signature":"sig1"}]}}')
+jq_is "$got" '.message.content[0] | has("thinking")' 'false' \
+  "an ABSENT .thinking is not invented as an empty string"
+jq_is "$got" '.message.content[0].signature' 'sig1' "and the block survives"
+got=$(slim_one '{"message":{"content":[{"type":"thinking","thinking":null}]}}')
+jq_is "$got" '.message.content[0].thinking | type' 'null' \
+  "an explicit null .thinking stays null, not \"\""
+bigt=$(printf 'y%.0s' $(seq 1 900))
+got=$(slim_one "{\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"$bigt\"}]}}")
+has 'autodream: truncated' "$got" "a 900-char thinking block is capped at 800"
 
 echo "# slim: an oversized value IS truncated"
 # The cap has to still work, or the fix above traded one silent failure for a

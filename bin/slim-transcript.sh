@@ -88,7 +88,14 @@ if command -v jq >/dev/null 2>&1; then
                  # call failed; only the heavy content array goes.
                  .content = "[autodream: tool_result payload stripped]"
                elif .type == "thinking" then
-                 .thinking = ((.thinking // "") | trunc($tk))
+                 # has() guard and NO `// ""`. The first version wrote
+                 # `.thinking = ((.thinking // "") | trunc($tk))`, which invented
+                 # `thinking: ""` on a block that never carried the key and turned
+                 # an explicit null into an empty string — the same fabrication
+                 # the parent commit fixed for .content and .arguments, at the
+                 # third site of the same class three lines away. trunc handles
+                 # null on its own now, so the `//` was doing nothing but harm.
+                 (if has("thinking") then .thinking = (.thinking | trunc($tk)) else . end)
                elif .type == "toolCall" then
                  del(.partialArgs)
                  | (if has("arguments") then .arguments = (.arguments | trunc($tr)) else . end)
