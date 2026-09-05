@@ -20,12 +20,12 @@ assert_eq(){ [ "$1" = "$2" ] && ok "$3" || no "$3 (got [$1] want [$2])"; }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/adclaude.XXXXXX")
 
-# Cleanup cannot live on the last line, because this suite parks a process that
-# blocks forever on purpose. The FIFO test below starts a `slim` whose first read
-# waits for a writer that never comes; the `pkill` that reaps it, and the
-# `rm -rf "$tmp"` that removes this directory, both sit near the bottom of the
-# file. A run that ends any other way — Ctrl-C, a harness timeout, an early exit
-# — reaches neither, and the delegate is reparented to init and blocks for good.
+# Cleanup lives in a trap because this suite parks a process that blocks forever
+# on purpose. The FIFO test below starts a `slim` whose first read waits for a
+# writer that never comes. Both cleanups used to sit on the last lines of the
+# file, so a run that ended any other way — Ctrl-C, a harness timeout, an early
+# exit — reached neither, and the delegate was reparented to init and blocked
+# for good.
 #
 # Measured, not hypothesised: 22 interrupted runs over about 90 minutes on
 # 2026-08-26 left 66 slim-transcript.sh processes alive. They were still there
@@ -33,10 +33,18 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/adclaude.XXXXXX")
 # been deleted.
 #
 # A trap is safe HERE in a way it is not in adapters/claude/adapter.sh, which
-# documents the opposite conclusion and issue #57 explains at length. That file
-# defers a trapped signal behind a FOREGROUND delegate, so trapping converts a
-# prompt death into a hang. This suite is always either sleeping or in `wait`
-# when a signal arrives, and a trapped signal interrupts both.
+# documents the opposite conclusion and issue #57 explains at length. The
+# difference is not that this suite is interruptible and that one is not. Bash
+# defers a trapped signal until the FOREGROUND child returns in both, and a
+# foreground `sleep` is NOT interruptible — measured on bash 5.3.15 and on
+# /bin/bash 3.2.57, a trapped TERM sent 1s into `sleep 5` fires at t=5, while
+# the same signal during `wait` fires at t=1.
+#
+# The difference is that the deferral is BOUNDED here and unbounded there. Every
+# foreground child in this file is a `sleep 0.05` or faster, so the worst case
+# is a signal handled 50ms late. adapter.sh's foreground child is the delegate
+# itself, which blocks forever on the FIFO, so a trap there converts a prompt
+# death into a hang.
 # Reap by PROCESS GROUP, never by name. Two rounds of #62 review went into this
 # and both were spent on `pkill -f`, which is the wrong tool twice over: it
 # matches an unanchored REGEX, so an interpolated $TMPDIR of /tmp/a[b] silently
@@ -56,7 +64,9 @@ reap_delegate() {
 }
 
 cleanup() {
-  # $fifodir is set much later; under `set -u` the default matters.
+  # Both guards below default under `set -u`: the FIFO branch may never have run
+  # (no mkfifo), leaving $slim_pgid unset, and the trap is armed before $tmp is
+  # guaranteed populated.
   reap_delegate
   [ -n "${tmp:-}" ] && [ -d "${tmp:-}" ] && rm -rf "$tmp"
   return 0
