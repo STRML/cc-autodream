@@ -37,9 +37,25 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/adclaude.XXXXXX")
 # defers a trapped signal behind a FOREGROUND delegate, so trapping converts a
 # prompt death into a hang. This suite is always either sleeping or in `wait`
 # when a signal arrives, and a trapped signal interrupts both.
+# `pkill -f` matches a REGEX, not a fixed string, so the pattern must not carry
+# an interpolated path. $TMPDIR is the caller's and may hold metacharacters — a
+# TMPDIR of /tmp/a[b] makes the selector quietly match nothing, and pkill's
+# stderr is discarded, so the orphan this whole change exists to prevent comes
+# straight back (Codex review of #62).
+#
+# Match on the mktemp suffix instead. `mktemp -d` fills XXXXXX from
+# [A-Za-z0-9] only, so `adclaude.orBJsa/fifo/src.jsonl` is regex-inert whatever
+# $TMPDIR contains, and still unique to this run — a concurrent suite has a
+# different suffix and is left alone.
+reap_delegate() {
+  [ -n "${tmp:-}" ] || return 0
+  pkill -f "slim-transcript\.sh .*$(basename "$tmp")/fifo/src\.jsonl" 2>/dev/null
+  return 0
+}
+
 cleanup() {
   # $fifodir is set much later; under `set -u` the default matters.
-  [ -n "${fifodir:-}" ] && pkill -f "slim-transcript.sh $fifodir/src.jsonl" 2>/dev/null
+  reap_delegate
   [ -n "${tmp:-}" ] && [ -d "${tmp:-}" ] && rm -rf "$tmp"
   return 0
 }
@@ -176,7 +192,7 @@ if [ -p "$fifodir/src.jsonl" ]; then
     kill -9 "$slim_pid" 2>/dev/null
   fi
   wait "$slim_pid" 2>/dev/null
-  pkill -f "slim-transcript.sh $fifodir/src.jsonl" 2>/dev/null
+  reap_delegate
   if [ -e "$fifodir/out.jsonl" ]; then
     no "a signalled slim wrote no destination file"
   else
