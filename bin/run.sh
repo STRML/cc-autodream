@@ -4,7 +4,7 @@
 # Two-layer pipeline:
 #   L1: For each of yesterday's session JSONLs, spawn a parallel `claude --model haiku`
 #       running SESSION_TRIAGE.md → writes one findings.json per session.
-#   L2: One `claude --model opus` running PROMPT.md → reads all findings JSONs,
+#   L2: One `claude` (CLI default model) running PROMPT.md → reads all findings JSONs,
 #       writes $DREAMS_DIR/YYYY-MM-DD.md, updates project MEMORY.md files.
 #
 # Usage:
@@ -33,7 +33,7 @@
 #   AUTODREAM_NETCHECK   set 0 to skip waiting-for-network on retry  default: 1
 #   AUTODREAM_FORCE      set 1 to rebuild even if a report exists    default: 0
 #   AUTODREAM_SLIM_BYTES sessions larger than this are slimmed for L1  default: 262144
-#   AUTODREAM_L2_MODEL   override the L2 aggregator model            default: fable-5 until 2026-06-20, claude-opus-4-7 from 2026-06-21
+#   AUTODREAM_L2_MODEL   pin the L2 aggregator model                 default: unset, so the CLI's own default is used
 #   AUTODREAM_MIN_USER_TURNS  noise-gate floor on user_message_count  default: 2
 #   AUTODREAM_MIN_MINUTES     noise-gate floor on duration_minutes    default: 1
 #   AUTODREAM_STATS_BIN       override the resolved session-stats.sh path, authoritative
@@ -1962,21 +1962,42 @@ PY
   # The aggregator call can also die to a mid-run sleep (this is what left exit 1 +
   # "no report" overnight). Retry until $REPORT_PATH is non-empty, waiting for the
   # network between attempts. Idempotent: a re-run overwrites the report harmlessly.
-  # Fable 5 is included in the subscription only until 2026-06-20; it moves to
-  # usage-based pricing on 2026-06-21, so revert to opus from that day on. The
-  # cutoff keys on the wall-clock run date (when the call is billed), not the
-  # target date being processed. Pin the exact "claude-fable-5[1m]" string: the
-  # CLI silently falls back to opus on unrecognized --model values (verified
-  # 2026-06-09 on 2.1.170), and bare "claude-fable-5" is one of those — only
-  # the alias "fable" and the [1m]-suffixed form actually serve Fable 5.
-  if [ -z "${AUTODREAM_L2_MODEL:-}" ]; then
-    if [ "$(date +%Y%m%d)" -ge 20260621 ]; then
-      AUTODREAM_L2_MODEL="claude-opus-4-7"
-    else
-      AUTODREAM_L2_MODEL="claude-fable-5[1m]"
-    fi
+  # NO --model BY DEFAULT. The aggregator runs on whatever the CLI's default is,
+  # so upgrading the account upgrades the nightly report and nothing here has to
+  # be edited.
+  #
+  # This used to carry a date cutoff that picked "claude-fable-5[1m]" before
+  # 2026-06-21 and "claude-opus-4-7" from that day on, because Fable 5 left the
+  # subscription then. The cutoff has been in the past for months, so the branch
+  # was unreachable and the pin was simply "opus-4-7 forever" — a model two
+  # generations behind by 2026-09, quietly chosen by a comment about billing.
+  # A pin is a decision that has to be re-made every time the roster moves, and
+  # nothing here was ever going to remind anyone.
+  #
+  # AUTODREAM_L2_MODEL still overrides, for pinning a specific model deliberately.
+  # If you set it, pin an EXACT string: the CLI silently falls back on an
+  # unrecognized --model rather than failing (verified 2026-06-09 on 2.1.170;
+  # bare "claude-fable-5" was one of those, where "fable" and the [1m]-suffixed
+  # form both worked). A silent fallback is why the value is recorded below.
+  #
+  # bash 3.2 with set -u treats "${a[@]}" on an EMPTY array as an unbound
+  # variable, so the flag is carried in a guarded array rather than an unquoted
+  # string. An unquoted string would word-split a model name containing a space
+  # and shellcheck would be right to object.
+  L2_MODEL_ARGS=()
+  if [ -n "${AUTODREAM_L2_MODEL:-}" ]; then
+    L2_MODEL_ARGS=(--model "$AUTODREAM_L2_MODEL")
   fi
-  log "L2 model: $AUTODREAM_L2_MODEL"
+  log "L2 model: ${AUTODREAM_L2_MODEL:-<CLI default>}"
+  # Recorded because the model is no longer fixed by this file. When a report's
+  # character changes, the first question is what produced it, and the answer has
+  # to survive in the artifact rather than only in a log nobody reads — the same
+  # argument as runner_commit. `default` is the honest value: the CLI picks, and
+  # this script is not told what it picked.
+  #
+  # Absent on a zero-session night, which is correct rather than the missing-key
+  # bug this file has been bitten by: that path returns before L2 runs at all.
+  printf 'l2_model: %s\n' "${AUTODREAM_L2_MODEL:-default}" >> "$FINDINGS_DIR/run-stats.txt"
 
   # ---- Move a stale report aside before attempting L2 ----
   # The only way to reach this line with $REPORT_PATH already non-empty is
@@ -2033,7 +2054,7 @@ PY
       } | "$CLAUDE_BIN" \
         --print \
         --permission-mode bypassPermissions \
-        --model "$AUTODREAM_L2_MODEL" \
+        ${L2_MODEL_ARGS[@]+"${L2_MODEL_ARGS[@]}"} \
         --no-session-persistence \
         --tools Glob Read Write Edit \
         --disable-slash-commands \
