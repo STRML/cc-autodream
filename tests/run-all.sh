@@ -704,6 +704,46 @@ test_no_sessions(){
   rm -rf "$root"
 }
 
+# ---- L2 runs on the CLI default model unless deliberately pinned ------------
+# This was pinned to claude-opus-4-7 by a date cutoff whose other branch had been
+# unreachable since 2026-06-21, so the nightly quietly aggregated on a model two
+# generations old and nothing said so. The assertion that matters is the ABSENCE
+# of the flag: a comment claiming "no --model" is not a check, and the mock
+# records the real argv.
+test_l2_uses_the_default_model(){
+  echo "# L2: no --model is passed unless AUTODREAM_L2_MODEL is set"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export FANOUT=1 MOCK_CAPTURE_DIR="$root/cap"; run_dream "$root"; unset FANOUT MOCK_CAPTURE_DIR
+  local cap="$root/cap/l2-args.txt"
+  assert_file "$cap" "captured the L2 argv"
+  if grep -qx -- '--model' "$cap"; then
+    no "no --model flag is passed by default (found one)"
+  else
+    ok "no --model flag is passed by default"
+  fi
+  # The call still has to be well-formed, or "no --model" would be satisfied by a
+  # run that never reached claude at all.
+  assert_grep "$cap" '^[-][-]print$' "and the L2 call is otherwise intact"
+  assert_nonempty "$root/dreams/$DATE.md" "and the report still lands"
+  rm -rf "$root"
+}
+
+test_l2_model_pin_is_honoured(){
+  echo "# L2: AUTODREAM_L2_MODEL still pins a model when set"
+  local root; root=$(setup_env); mk_session "$root" sess1
+  export FANOUT=1 MOCK_CAPTURE_DIR="$root/cap" AUTODREAM_L2_MODEL="claude-test-model"
+  run_dream "$root"
+  unset FANOUT MOCK_CAPTURE_DIR AUTODREAM_L2_MODEL
+  local cap="$root/cap/l2-args.txt"
+  assert_grep "$cap" '^[-][-]model$' "the pin puts --model back"
+  assert_grep "$cap" '^claude-test-model$' "with the requested value"
+  # The run-stats key exists because the CLI falls back SILENTLY on an
+  # unrecognised model, so the artifact has to say what was asked for.
+  assert_grep "$root/autodream/findings/$DATE/run-stats.txt" '^l2_model: claude-test-model' \
+    "and run-stats records the pin"
+  rm -rf "$root"
+}
+
 test_framing(){
   echo "# prompt framing regression (literal paths, no \$VAR, blank separator)"
   local root; root=$(setup_env); mk_session "$root" sess1
@@ -1625,6 +1665,8 @@ test_incomplete
 test_idempotent
 test_revalidates_garbage
 test_no_sessions
+test_l2_uses_the_default_model
+test_l2_model_pin_is_honoured
 test_framing
 test_changelog
 test_prune_helper
