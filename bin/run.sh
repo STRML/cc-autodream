@@ -5,7 +5,8 @@
 #   L1: For each of yesterday's session JSONLs, spawn a parallel `claude --model haiku`
 #       running SESSION_TRIAGE.md → writes one findings.json per session.
 #   L2: One `claude` (CLI default model) running PROMPT.md → reads all findings JSONs,
-#       writes $DREAMS_DIR/YYYY-MM-DD.md, updates project MEMORY.md files.
+#       writes $DREAMS_DIR/YYYY-MM-DD.md and pins.jsonl; run.sh then stores the pins in
+#       Mnemopi via apply-pins.sh.
 #
 # Usage:
 #   ./run.sh             # process yesterday
@@ -240,6 +241,10 @@ else
   XBOOKMARKS="$SCRIPT_DIR/x-bookmarks.sh"
   [ -x "$XBOOKMARKS" ] || XBOOKMARKS="$AUTODREAM_DIR/x-bookmarks.sh"
 fi
+# Memory pin applier. find_lib, not SCRIPT_DIR alone: an install that predates
+# apply-pins.sh has run.sh symlinked in and no apply-pins.sh beside it until install.sh
+# runs again, and the repo copy is the one that works in that window.
+APPLY_PINS=$(find_lib apply-pins.sh) || APPLY_PINS="$SCRIPT_DIR/apply-pins.sh"
 
 # Provenance of the code actually executing (#29), stamped into run-stats.txt below.
 # Resolved by walking this script's own symlink chain rather than by reusing SCRIPT_DIR,
@@ -1107,6 +1112,97 @@ report_complete() {
   [ -s "$REPORT_PATH" ] && grep -q 'autodream:open-questions=' "$REPORT_PATH" 2>/dev/null
 }
 
+# $1=adapter name $2=session path -> the project the session belongs to: the directory
+# directly under whichever of the adapter's roots holds it. Claude nests transcripts at
+# several depths under one bucket (<bucket>/<session>.jsonl, <bucket>/<session>/subagents/
+# agent-*.jsonl, <bucket>/<session>/subagents/workflows/wf_*/agent-*.jsonl), and a bucket
+# can itself be named "subagents", so no rule based on directory names finds the bucket at
+# every depth. A session under none of the adapter's roots falls back to its parent dir.
+session_project() {
+  local r rest
+  if [ -n "$1" ]; then
+    while IFS= read -r r; do
+      r=${r%/}
+      [ -n "$r" ] || continue
+      case $2 in
+        "$r"/*/*) rest=${2#"$r"/}; printf '%s' "${rest%%/*}"; return 0 ;;
+      esac
+    done < <(adapter_roots "$1")
+  fi
+  basename "$(dirname "$2")"
+}
+
+# $1=findings dir -> one hash<TAB>project<TAB>cwd row per session in sessions.txt. run.sh
+# calls it before the first model call and holds the result in memory: L1 and L2 both run
+# with the Write tool and bypassPermissions, so every file this reads, sessions.txt and
+# sessions-source.txt included, is one they could rewrite before the pins are applied.
+# The rows feed two consumers: pin_projects_from_rows (the pin authorization list) and the
+# findings project normalization, which looks each findings file up by its hash.
+#
+# It walks sessions.txt, the runner's own worklist, and never a findings JSON. Outside the
+# slim case a findings session_path is whatever the L1 model wrote, so reading it would let
+# a transcript name another project's session and authorize memory there.
+#
+# A cwd is unusable, and recorded as "?", when the adapter cannot resolve it (usually a
+# removed worktree), when it holds a tab or newline, or when its bucket is an encoded path
+# (starts with "-") that the cwd does not encode to. Slug buckets from
+# CLAUDE_CODE_PROJECT_DIR_NAME (owner-repo) skip that encoding check, because no cwd ever
+# encodes to a slug. An adapter cwd is always absolute, so it can never be "?" itself.
+session_rows() {
+  local dir=$1 s hash src proj cwd
+  # A missing worklist would otherwise read as "no projects" and refuse every pin silently.
+  [ -r "$dir/sessions.txt" ] || return 1
+  while IFS= read -r s <&3; do
+    [ -n "$s" ] || continue
+    hash=$(session_hash "$s") || continue
+    src=$(awk -F'\t' -v h="$hash" '$1 == h { print $2; exit }' "$dir/sessions-source.txt" 2>/dev/null)
+    proj=$(session_project "$src" "$s")
+    case $proj in ''|*$'\t'*|*$'\n'*) continue ;; esac
+    cwd="?"
+    if [ -n "$src" ]; then
+      cwd=$(adapter_run "$src" project "$s" 2>/dev/null </dev/null) || cwd="?"
+      [ -n "$cwd" ] || cwd="?"
+    fi
+    case $cwd in *$'\t'*|*$'\n'*) cwd="?" ;; esac
+    case $proj in
+      -*) if [ "$cwd" != "?" ] && [ "$(encode_project "$cwd")" != "$proj" ]; then cwd="?"; fi ;;
+    esac
+    printf '%s\t%s\t%s\n' "$hash" "$proj" "$cwd"
+  done 3< "$dir/sessions.txt"
+}
+
+# stdin: session_rows output -> one project<TAB>cwd row per project. A project gets a cwd
+# only when all its sessions agree on one usable cwd. An unusable "?" still counts as a
+# distinct cwd, so it makes the project ambiguous rather than vanishing. Anything looser
+# stores one project's pin in another project's bank: a transcript sitting in a bucket its
+# cwd does not encode to, or two directories that encode to one bucket (/tmp/a_b and
+# /tmp/a-b). A project with no usable cwd keeps an empty column, and apply-pins.sh refuses
+# its pins as no_cwd.
+pin_projects_from_rows() {
+  awk -F'\t' '
+    NF < 3 { next }
+    !($2 in seen) { seen[$2] = 1; order[++n] = $2 }
+    !(($2, $3) in pair) { pair[$2, $3] = 1; count[$2]++; cwd[$2] = $3 }
+    END {
+      for (i = 1; i <= n; i++) {
+        p = order[i]
+        printf "%s\t%s\n", p, (count[p] == 1 && cwd[p] != "?" ? cwd[p] : "")
+      }
+    }
+  '
+}
+
+# $1=findings dir -> writes the rows pin_projects_from_rows produced before L1 ran to
+# pin-projects.tsv. The old file goes first, so an authorization list from an earlier run
+# never outlives a failed write. Fails when the build itself failed.
+write_pin_projects() {
+  local dir=$1
+  rm -f "$dir/pin-projects.tsv" || return 1
+  [ "${PIN_PROJECTS_BUILT:-0}" = "1" ] || return 1
+  if [ -n "$PIN_PROJECTS_TSV" ]; then printf '%s\n' "$PIN_PROJECTS_TSV"; fi > "$dir/pin-projects.tsv.tmp" \
+    && mv "$dir/pin-projects.tsv.tmp" "$dir/pin-projects.tsv"
+}
+
 net_up() { # exit 0 if the API host is reachable (any HTTP code beats "000" = no route)
   local code
   code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' https://api.anthropic.com/ 2>/dev/null)
@@ -1637,6 +1733,21 @@ EOF
   # participate in overlap (see the comment in bin/overlap-stats.sh).
   compute_overlap_stats
 
+  # ---- Pin authorization, fixed before any model runs ----
+  # L1 and L2 both run with the Write tool and bypassPermissions, so any file they can
+  # reach they can rewrite: sessions.txt, sessions-source.txt, findings JSON. The projects
+  # a memory pin may name are therefore computed here, before the first model call, and
+  # held in this shell's memory until the pins are applied after the report.
+  PIN_PROJECTS_BUILT=0
+  PIN_PROJECTS_TSV=""
+  SESSION_ROWS=""
+  if SESSION_ROWS=$(session_rows "$FINDINGS_DIR") \
+     && PIN_PROJECTS_TSV=$(printf '%s\n' "$SESSION_ROWS" | pin_projects_from_rows); then
+    PIN_PROJECTS_BUILT=1
+  else
+    log "WARNING: could not build the pin authorization list; this run will not store memory pins"
+  fi
+
   # ---- Layer 1: haiku triage, parallel, retried across sleep/network gaps ----
   # Lean-query env (claude-cells internal/claude/query.go pattern): keep subscription
   # OAuth auth but strip per-call bloat — no CLAUDE.md auto-load, no telemetry/error
@@ -1786,26 +1897,30 @@ EOF
   # SESSION_TRIAGE.md asks the L1 worker to emit "project" by hand, and haiku does it
   # nondeterministically: one run surfaced the SAME -Users-sean dir as "-Users-sean",
   # "Users-sean" (dash stripped), and even the bare session UUID (filename, not dir).
-  # That splinters L2's per-project grouping. The encoded project dir is just the parent
-  # directory of the session JSONL, so derive it from each findings JSON's own
-  # session_path (already rewritten back to the real session after any slimming) and
-  # overwrite whatever the model guessed. Deterministic, idempotent on re-runs.
+  # That splinters L2's per-project grouping. The project is the bucket the runner already
+  # computed for each session in SESSION_ROWS (see session_rows), before L1 ran. Each findings
+  # file is looked up by its own name, the session hash, never by the session_path the model
+  # wrote, and its project field is overwritten. Deterministic, idempotent on re-runs.
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$FINDINGS_DIR" <<'PY'
+    SESSION_ROWS="$SESSION_ROWS" python3 - "$FINDINGS_DIR" <<'PY'
 import glob, json, os, sys
 findings_dir = sys.argv[1]
+projects = {}
+for row in os.environ.get("SESSION_ROWS", "").splitlines():
+    parts = row.split("\t")
+    if len(parts) >= 2 and parts[1]:
+        projects[parts[0]] = parts[1]
 fixed = 0
 for path in glob.glob(os.path.join(findings_dir, "*.json")):
+    proj = projects.get(os.path.basename(path)[:-len(".json")])
+    if not proj:
+        continue
     try:
         with open(path) as f:
             data = json.load(f)
     except (ValueError, OSError):
         continue  # malformed JSON: leave for the triage-failures report section
-    sp = data.get("session_path")
-    if not sp:
-        continue
-    proj = os.path.basename(os.path.dirname(sp))
-    if proj and data.get("project") != proj:
+    if data.get("project") != proj:
         data["project"] = proj
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
@@ -2031,6 +2146,7 @@ PY
   # loss this is all guarding. So a failed move disarms consuming for the run rather than
   # logging a warning and carrying on.
   CONSUME_SAFE=1
+  PINS_SAFE=1
   if [ -s "$REPORT_PATH" ]; then
     STALE_REPORT="$REPORT_PATH.stale-$(date +%s)"
     if mv "$REPORT_PATH" "$STALE_REPORT"; then
@@ -2047,12 +2163,32 @@ PY
   L2_RC=1
   for attempt in $(seq 1 "$L2_ATTEMPTS"); do
     log "L2 aggregation attempt $attempt/$L2_ATTEMPTS..."
+    # A pins.jsonl already here came from an earlier run or an earlier attempt, and no
+    # complete report from THIS attempt stands behind it. Move it aside before every
+    # attempt, or a dead attempt's pins get stored alongside the next attempt's report.
+    # Moved, not deleted, so a pin that never reached Mnemopi stays readable. A failed
+    # move clears PINS_SAFE for the run, for the same reason CONSUME_SAFE works that way.
+    if [ -e "$FINDINGS_DIR/pins.jsonl" ]; then
+      # mktemp, not a timestamp: two forced rebuilds inside one second would otherwise pick
+      # the same name, and the second move would overwrite the first run's unapplied pins.
+      if STALE_PINS=$(mktemp "$FINDINGS_DIR/pins.jsonl.stale-XXXXXX") \
+         && mv -f "$FINDINGS_DIR/pins.jsonl" "$STALE_PINS"; then
+        log "moved an earlier pins.jsonl aside before this attempt"
+      else
+        log "WARNING: could not move an earlier pins.jsonl aside; this run will not store memory pins"
+        PINS_SAFE=0
+        # The empty mktemp placeholder is litter once the move fails, one per attempt.
+        if [ -n "${STALE_PINS:-}" ] && [ -f "$STALE_PINS" ] && [ ! -s "$STALE_PINS" ]; then
+          rm -f "$STALE_PINS"
+        fi
+      fi
+    fi
     # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
     # comment): keep the paths as literal data the aggregator hands to Glob/Read/Write,
     # and preserve the blank-line separator before PROMPT.md instead of letting a
     # `prompt=$(...)` capture strip it and glue the doc onto the report-path line.
     # Subshell so the cwd change (isolating the AI-title stub into $WORK_BUCKET, same
-    # as L1) is scoped to this call and doesn't leak into the notify/GC steps below.
+    # as L1) is scoped to this call and doesn't leak into the notify/pin steps below.
     # $? after the subshell is the pipeline's exit (claude's), exactly as before.
     (
       cd "$WORK_DIR" 2>/dev/null || true
@@ -2069,7 +2205,7 @@ PY
         --disable-slash-commands \
         --strict-mcp-config \
         --settings '{"disableAllHooks":true}' \
-        --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May edit project MEMORY.md files per the prompt rules. Print report path and 3-line summary, then exit."
+        --append-system-prompt "Headless aggregator. Read the per-session findings JSONs from the findings directory given on line 1 of the prompt, then write the report, via the Write tool, to the literal report path given on line 2. Those paths are literal strings, not shell variables — never \$-expand them. May write pins.jsonl in the findings directory per the prompt rules; never edit MEMORY.md. Print report path and 3-line summary, then exit."
     )
 
     L2_RC=$?
@@ -2144,6 +2280,33 @@ PY
   if [ -f "$REPORT_PATH" ]; then
     log "report bytes: $(wc -c < "$REPORT_PATH" | tr -d ' ')"
 
+    # ---- Memory pins: L2's pins.jsonl into Mnemopi ----
+    # First step after the report, ahead of notify.sh and the consume steps. notify.sh runs
+    # AUTODREAM_OPEN synchronously, so a blocking editor command holds the run there; if
+    # the run dies in that wait, the next run skips the date and pins placed after it are
+    # never stored.
+    #
+    # Pins need a complete report from THIS run behind them: report_complete, CONSUME_SAFE
+    # (cleared when the old report could not be moved aside), and PINS_SAFE (cleared when an
+    # earlier pins.jsonl could not be moved aside). They skip the consume date gate on
+    # purpose: an old-date rebuild still teaches something real, and apply-pins.sh's ledger
+    # stops a rerun from storing the same pin twice.
+    #
+    # pin-projects.tsv is the authorization list. It holds only projects this run
+    # triaged, each with the working directory its session's adapter resolved, so a pin
+    # naming any other project is refused and memory is never scoped by a path the model
+    # wrote. Plan and failure matrix: docs/plans/2026-09-15-mnemopi-pins.md.
+    PINS="$FINDINGS_DIR/pins.jsonl"
+    if [ -s "$PINS" ] && { ! report_complete || [ "${CONSUME_SAFE:-1}" != "1" ] || [ "$PINS_SAFE" != "1" ]; }; then
+      log "skipping memory pins: no complete report from this run stands behind $PINS"
+    elif [ -s "$PINS" ] && ! write_pin_projects "$FINDINGS_DIR"; then
+      log "skipping memory pins: could not write pin-projects.tsv, so no project is authorized"
+    elif [ -s "$PINS" ]; then
+      bash "$APPLY_PINS" "$FINDINGS_DIR" "$TARGET_DATE" >> "$RUN_LOG" 2>&1 \
+        || log "apply-pins exited non-zero (pins stay in $PINS)"
+      log "memory pins: $(tr '\n' ' ' 2>/dev/null < "$FINDINGS_DIR/pins-result.txt" || echo "counters unavailable")"
+    fi
+
     # ---- Drop open-questions file into Sublime (no-op if zero questions) ----
     if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
       log "writing open-questions inbox file..."
@@ -2207,35 +2370,6 @@ PY
         fi
       else
         log "target date $TARGET_DATE is not $NORMAL_TARGET_DATE (today's normal nightly date); skipping vault-notes archive and x-bookmark mark-read so today's inbox/unread bookmarks aren't consumed by this reprocess (still collected as L2 context)"
-      fi
-    fi
-
-    # ---- Symbiotic GC: trigger cc-simple-memory to consolidate
-    #      around the pins Layer 2 just added (no-op if not installed
-    #      or AUTODREAM_GC=0). Iterates the touched-projects sidecar
-    #      Layer 2 wrote — re-uses the cwd recorded in each project's
-    #      session JSONLs to give claude-memory the right project root.
-    if [ "${AUTODREAM_GC:-1}" != "0" ] && command -v claude-memory >/dev/null 2>&1; then
-      TOUCHED="$FINDINGS_DIR/touched-projects.txt"
-      if [ -s "$TOUCHED" ]; then
-        log "claude-memory detected; running GC for $(wc -l < "$TOUCHED" | tr -d ' ') touched project(s)..."
-        sort -u "$TOUCHED" | while IFS= read -r encoded; do
-          [ -z "$encoded" ] && continue
-          proj="$PROJECTS_DIR/$encoded"
-          [ -d "$proj" ] || { log "  skip: $encoded (no project dir)"; continue; }
-
-          cwd=$(grep -hom1 '"cwd":"[^"]*"' "$proj"/*.jsonl 2>/dev/null \
-                 | head -1 | sed 's/^"cwd":"//;s/"$//')
-          if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
-            log "  skip: $encoded (cwd not resolvable)"
-            continue
-          fi
-          log "  gc: $cwd"
-          ( cd "$cwd" && claude-memory gc ) >> "$RUN_LOG" 2>&1 \
-            || log "    gc failed for $cwd (continuing)"
-        done
-      else
-        log "claude-memory installed but no project memory was touched; skipping per-project GC"
       fi
     fi
   else

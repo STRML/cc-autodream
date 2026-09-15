@@ -4,6 +4,8 @@ Date: 2026-08-23
 Status: APPROVED by panel (executor, auditor, antigravity)
 Baselines read for this document: `cc-autodream` at `0dffef5` (branch `retire-compliance-markers`), `omp-autodream` at `387e7bc` (branch `main`), `seanperkins/autodream-merge` at `c4ebdfc`.
 
+**Revised 2026-09-15.** The pin and memory-GC design below (Decision 3, "Pin protocol", "Memory GC") assumed a per-adapter memory store. Every harness on this host now reads one shared Mnemopi store instead, so the per-`(source, memory_root, project)` triple expansion, the `apply-pin` exit-code routing, and adapter-owned GC described in this document are retired. See `docs/plans/2026-09-15-mnemopi-pins.md` for the current design.
+
 ## Problem
 
 Three repos do one job.
@@ -56,7 +58,7 @@ Five decisions were settled before this document was written.
 
 1. **Repo identity.** Rename `STRML/cc-autodream` to `STRML/autodream`. GitHub redirects the old URL, so existing clones and the live `~/.claude/autodream` symlinks keep working. Archive `omp-autodream` and `autodream-merge` with pointers.
 2. **Aggregation shape.** L1 fans out across every enabled adapter into one findings dir. One L2 pass over the union, always. A single-harness day is the degenerate case where N is 1. There is no conditional merge path and no merge phase.
-3. **Memory writes.** L2 becomes a pure function: findings in, report and proposed pins out, no filesystem writes. Each adapter owns its own memory store and applies the pins routed to it.
+3. **Memory writes.** L2 becomes a pure function: findings in, report and proposed pins out, no filesystem writes. Each adapter owns its own memory store and applies the pins routed to it. Revised 2026-09-15: one shared Mnemopi store serves every harness on this host, so there is no adapter-owned store to route to. L2 still writes proposed pins to a file rather than stdout, and `run.sh` applies them directly against Mnemopi; see `docs/plans/2026-09-15-mnemopi-pins.md`.
 4. **Adapter shape.** A directory holding declarative facts, code, and prompt text.
 5. **Rollout.** One branch, one cutover. A replay harness against an archived corpus stands in for phased verification.
 
@@ -102,8 +104,7 @@ Each adapter is a directory with three required files and one optional one.
   "session_glob": "*.jsonl",
   "engine_bin": "omp",
   "engine_flags_l1": ["--allow-home", "-p", "--permission-mode", "bypassPermissions"],
-  "l1_model": "runinfra/deepseek-v4-flash",
-  "writes_memory": false
+  "l1_model": "runinfra/deepseek-v4-flash"
 }
 ```
 
@@ -133,9 +134,8 @@ line-based artifact is `sessions.txt`, which is a different thing from the
 transport — see the note on that split below.
 | `is-self <session>` | exit 0 if this is one of autodream's own worker transcripts | `prune-self-sessions.sh` 19% |
 | `skills-inventory` | prints the active skill list, one per line | `omp-autodream/bin/skills-inventory.sh` |
-| `apply-pin <json>` | writes one pin; `0` wrote, `10` declined (reason on stdout), any other code is a failure | new |
-| `memory-root <session>` | prints the absolute, canonical memory-store root that owns this session; empty output is legal **only** for a `writes_memory: false` adapter | new |
-| `gc <memory-root> <project>` | resettles this harness's consolidator around newly written pins; only ever called for a triple whose `apply-pin` returned `0`, so a no-store adapter never receives it | `bin/run.sh:1290-1310` |
+
+`apply-pin` and `gc` were dropped from this table on 2026-09-15, and `memory-root` is retired with them: one shared Mnemopi store has no per-adapter root to resolve. `bin/apply-pins.sh` applies pins for every adapter (see Pin protocol).
 
 **Every subcommand has a named skip path and atomic output.** A subcommand that writes a file writes to `<out>.tmp` in the destination directory and renames on success; a nonzero exit leaves no `<out>` and removes any partial `<out>.tmp`. A nonzero exit from `project`, `stats`, or `slim` skips that session with its own counter, exactly as `normalize` does — the earlier draft specified failure handling only for `normalize`, which left three subcommands with undefined behavior on a partial write.
 
@@ -151,7 +151,7 @@ The runner also re-checks readability immediately before each read rather than o
 | --- | --- | --- |
 | `sandbox_friction` | a `permissions.allow` line in `settings.json` | OMP has no `settings.json`; a different mechanism |
 | `missed_skill` | a trigger phrase in a `SKILL.md` | OMP skill roots plus `config.yml` `ignoredSkills`; built-ins are compiled into the binary and are not on disk |
-| `memory_miss` | a pinned entry in `MEMORY.md` | a rule, a hook, or a doc note; mnemopi autolearn owns memory |
+| `memory_miss` | a Mnemopi pin, written to `pins.jsonl` and applied by `bin/apply-pins.sh` | a rule, a hook, or a doc note; mnemopi autolearn owns memory |
 | `compliance_failure` | cite `~/.claude/CLAUDE.md` | cite OMP's rule surface |
 
 Without this, L2 proposes editing a `settings.json` that does not exist for the session it is talking about. Roughly half of today's 15% `PROMPT.md` divergence is exactly this text.
@@ -215,16 +215,16 @@ Symlink resolution matters on macOS: Claude records the physical path, so a sess
 1. `run.sh` resolves enabled adapters from `AUTODREAM_ADAPTERS` (default: every `adapters/*/manifest.json` except `_fixture`), then verifies each adapter's `engine_bin`. An adapter whose engine is absent is disabled with a counter; this is not fatal. The L2 engine check at step 0 is separate and *is* fatal, because without it no report is possible.
 2. Per adapter, `enumerate` produces a session list. The union is written to `sessions.txt` (bare paths) plus `sessions-source.txt` (hash to source), with `sessions.txt.raw` kept pre-filter as today.
 3. Per session: `is-self` filter, then `normalize`, then `stats` sidecar, then the noise gate, then `slim`, then the L1 worker on that adapter's engine and model.
-4. The L1 model emits **triage payload only**. `run.sh` validates that JSON and then envelopes it, atomically, with provenance the runner already resolved: the session path, the adapter `source`, the raw `cwd` from `adapter project`, `encode(cwd)` as `project`, and the `memory_root` from `adapter memory-root`. The result is one `<hash>.json` per session in one findings dir.
+4. The L1 model emits **triage payload only**. `run.sh` validates that JSON and then envelopes it, atomically, with provenance the runner already resolved: the session path, the adapter `source`, the raw `cwd` from `adapter project`, and `encode(cwd)` as `project`. The result is one `<hash>.json` per session in one findings dir.
 
-   **The model never supplies its own provenance.** Those five fields later authorize pin routing and memory placement, so a model that could write them could name a source and project it never touched — and L1 reads a transcript, which is attacker-adjacent input on any day someone pastes something interesting into a session. Runner-stamped provenance makes the authorization set a property of what the runner enumerated rather than of what a transcript talked the model into. Any provenance field present in the model's own output is discarded, not merged. A fixture emits forged `source` and `project` from L1 and asserts they cannot affect pin eligibility.
+   **The model never supplies its own provenance.** Those four fields later authorize pins and scope each memory to a project, so a model that could write them could name a source and project it never touched — and L1 reads a transcript, which is attacker-adjacent input on any day someone pastes something interesting into a session. Runner-stamped provenance makes the authorization set a property of what the runner enumerated rather than of what a transcript talked the model into. Any provenance field present in the model's own output is discarded, not merged. A fixture emits forged `source` and `project` from L1 and asserts they cannot affect pin eligibility.
 
    Raw `cwd` and canonical `project` are both retained: with only the canonical value, `tests/replay.sh --artifacts` could assert nothing about the encoder except that it agrees with itself. Keeping the input alongside the output makes `encode(cwd) == project` a real assertion.
 5. Shared collectors run once for the date: changelog window, operator notes, X bookmarks, skills inventory (the union across adapters), `run-stats.txt`.
 6. L2 runs once, on the globally configured engine, with `--tools Glob Read`. Its prompt is `PROMPT.md` followed by each enabled adapter's `facts.md`.
 7. L2 prints the report to stdout, terminated by `AUTODREAM_REPORT_END`, followed by a pin block. `run.sh` slices from the last sentinel, validates, and writes `dreams/<date>.md` through a temp file and rename.
-8. Pins dispatch to adapters, sequentially.
-9. Consume gates run: vault note archive, bookmark mark-read, project memory GC. The first two are unchanged. GC is not; see below.
+8. L2's proposed pins, if any, land in `<findings-dir>/pins.jsonl`. Revised 2026-09-15: once the report is confirmed complete, and before `notify.sh` or any consume step (either can hold or end the run first), `run.sh` writes `pin-projects.tsv` and runs `bin/apply-pins.sh` to apply each pin against the one shared Mnemopi store every harness reads; see "Pin protocol" below.
+9. Consume gates run: vault note archive, bookmark mark-read. Project memory GC is retired along with the per-adapter store; see "Memory GC" below.
 
 Steps 7 and 8 are ordered deliberately. The report reaches disk before any pin is applied, so a pin failure cannot cost a report.
 
@@ -248,56 +248,37 @@ This is the same defect `autodream-merge` ships: it reuses cc-autodream's `PROMP
 
 ### Pin protocol
 
-After the report sentinel, L2 emits one JSON object per line so nothing requires a multi-line parse:
+**Revised 2026-09-15.** This section originally routed pins per `(source, memory_root, project)` triple, one adapter store per harness. Every harness on this host now reads one shared Mnemopi store, so there is nothing left to route between. The design below is `docs/plans/2026-09-15-mnemopi-pins.md`, restated here so this document stays the single reference for the pin path.
+
+L2 writes proposed pins to `<findings-dir>/pins.jsonl`, one JSON object per line:
 
 ```
-AUTODREAM_REPORT_END
-AUTODREAM_PINS
-{"sources":["claude","omp"],"project":"-Users-x-sites","index_line":"...","body":"...","type":"feedback"}
-AUTODREAM_PINS_END
+{"project":"-Users-x-repo","title":"one line, at most 150 chars","body":"the full memory","kind":"correction"}
 ```
 
-**`sources` is model-controlled input and is validated as such.** It must be an array with at least one entry: `{"sources":[]}` would otherwise satisfy pair validation vacuously — every member of an empty set is valid — and apply nowhere, so a pin that reads as accepted silently does nothing. An empty or absent `sources` is rejected with `pins_invalid`. Each entry must match an enabled adapter name exactly, from the set the runner already resolved. Anything else is rejected and counted: a value such as `../../tmp` would otherwise resolve a command path outside `adapters/`. Path separators, `.`, and empty strings are rejected before any command path is constructed.
+`project` is the canonical `project` value already stamped onto a findings record for this run. `kind` is one of `correction`, `preference`, `fact`, or `decision`. `body` is at most 4000 characters. No file means no pins.
 
-**Validation is on the observed `(source, memory_root, project)` triple, not on each field independently.** Checking that the source is enabled and that the project appears somewhere in the run is too weak: L2 could name a project that only OMP sessions touched, pair it with `claude`, and have the claude adapter write memory for a project Claude never worked in.
+Before each L2 attempt, `run.sh` moves an existing `pins.jsonl` aside to a unique `pins.jsonl.stale-XXXXXX` made by `mktemp`: it came from an earlier run or a dead attempt, and no complete report from this attempt stands behind it. A failed move clears `PINS_SAFE`, and the run stores no pins.
 
-The runner already holds the exact set of observed triples. Each findings record carries the runner-stamped `source`, `memory_root` and canonical `project`, so the allowed set is a projection of the records this run actually wrote. A pin names a `(source, project)` pair; the runner **expands** it to every distinct observed triple matching that pair.
+After a complete report, and only when `CONSUME_SAFE=1` and `PINS_SAFE=1`, `run.sh` writes `<findings-dir>/pin-projects.tsv`: one `project<TAB>cwd` row per distinct project in this run's worklist (`sessions.txt`). The rows are computed before the first L1 call and held in the runner's memory until the pins are applied, because L1 and L2 both run with the Write tool and could otherwise rewrite the worklist files before they are read. The project is the directory directly under the session root that holds the session, so a subagent transcript (`<bucket>/<session>/subagents/agent-*.jsonl`) or a workflow agent one level deeper counts toward its bucket, and a bucket literally named `subagents` stays itself. The findings normalization takes its project from the same rows, looked up by findings file hash. `cwd` comes from the `project` subcommand of that session's own adapter (looked up in `sessions-source.txt`); a session whose cwd the adapter cannot resolve counts as one more distinct, unusable cwd. Neither is read from a findings JSON: outside the slim case its `session_path` is whatever the L1 model wrote, and a forged one would otherwise authorize memory for a project the run never triaged. Two more checks keep a pin in its own project's bank. For a dash bucket, the cwd must encode (`encode_project`) to the bucket its session is stored in; a `CLAUDE_CODE_PROJECT_DIR_NAME` slug bucket skips this, since no cwd encodes to a slug. And a bucket whose sessions report more than one distinct cwd, such as `/tmp/a_b` and `/tmp/a-b`, gets no cwd at all, counting any cwd that failed the first check as one of them. It then runs `bin/apply-pins.sh <findings-dir> <date>`. Pins do not depend on the date gate the report does: an old-date rebuild is still a real lesson, and the ledger below stops a rerun from writing it twice.
 
-**One pair can legitimately map to several roots, and expanding rather than choosing is the point.** The same canonical project is one real directory, and a host running several config dirs works that directory from more than one of them — this host does exactly that. `-Users-x-repo` therefore has sessions under both `~/.claude` and `~/.claude-ds4`, one `source`, one `project`, two memory roots. Picking one root implicitly would drop the pin from the other, which is the multi-root loss this design set out to fix, reintroduced one layer down and harder to see. So the pin is applied once per matching triple, and GC runs once per triple that returned `0`.
+**Project validation replaces source validation.** There is no adapter to name, so a pin is checked against `pin-projects.tsv` instead of against an enabled-adapter set: a project absent from that file is rejected with `pins_rejected_project`, and a project present but with an empty or missing `cwd` is rejected with `pins_no_cwd`. Both are read from the file the runner itself wrote for this run, the same authorization principle the old triple check served: a pin can only name what this run actually observed.
 
-A pair with no matching triple is rejected with `pins_rejected_pair`, a distinct counter from `pins_rejected_source`, because a well-formed source with an unobserved project is a different mistake from a fabricated adapter name. A fixture covers one `(source, project)` observed under two memory roots and asserts the pin lands in both and both are GC'd.
+`bin/apply-pins.sh` validates each line's schema (`kind` one of the four values, `title` non-empty, at most 150 characters, no newline, `body` non-empty, at most 4000 characters), then calls `shared-memory call mnemopi_remember '<json>' --cwd <cwd>` with content `title\n\nbody`, `source: cc-autodream`, `importance: 0.7`, metadata `{kind, project, autodream_date, origin: "cc-autodream"}`, and `bank` set to the `retainBank` that `shared-memory context --cwd <cwd>` reports. `mnemopi_remember` resolves its bank from the payload, then `MNEMOPI_MCP_BANK`, then `default`, never from `--cwd`, so leaving it out would put every project's pin in the global store. A call succeeds only on exit `0` with `status: "stored"` and a string `memory_id`.
 
-Validated pins route to `adapters/<source>/adapter.sh apply-pin` **once per distinct expanded `(source, memory_root, project)` triple**, not once per adapter. The `sources` array is deduplicated *before* expansion, so a pin naming `["claude","claude"]` expands the same set once rather than twice; but one `claude` entry that expands to two memory roots dispatches twice, which is the whole point of the expansion. Reading this as one dispatch per adapter would silently drop the pin from every root after the first.
+**Each success is ledgered so a rerun cannot double-write.** A successful call appends `<sha1 of the canonical pin>\t<memory_id>` to `pins-applied.tsv`; a pin whose hash is already ledgered is skipped rather than resent. Counters (`pins_total`, `pins_applied`, `pins_invalid`, `pins_rejected_project`, `pins_no_cwd`, `pins_duplicate`, `pins_cli_missing`, `pins_failed`, `pins_unledgered`, `pins_unreadable`) go to `pins-result.txt`. A pin that was stored but whose ledger row could not be written counts as `pins_unledgered`, never as applied, and its memory id goes to the run log. The script always exits `0` after its arguments parse, on the same principle the old `apply-pin` exit-code contract served: a pin must never cost a report.
 
-**The adapter is handed an envelope, not the model's line.** For each expanded triple, `run.sh` constructs the `apply-pin` payload from the validated pin body plus that triple's `memory_root`. The model's line never reaches the adapter unmodified, and the adapter is never asked to work out which root it should write to — it is told.
+`SHARED_MEMORY_BIN` overrides the CLI path. The test suite pins it to `tests/mock-shared-memory.sh`, so no test can write real memory.
 
-**`apply-pin` signals its outcome by exit code**, because the orchestrator has to distinguish "wrote" from "declined" to know which triples deserve GC, and a prose reason on stdout is not something `run.sh` should be parsing. `0` means a pin was written, and only a `0` schedules `(adapter, memory-root, project)` for GC. `10` means a deliberate per-pin decline by an adapter that *does* have a store — the pin duplicates a pinned entry it must not rewrite, or the project's file is at its size cap — and the reason is printed for the log and counted, not treated as an error. "No store" is never an exit `10`, because such an adapter is short-circuited at the manifest and `apply-pin` is not spawned. Any other nonzero code is a failure, counted separately, and never schedules GC. A pattern with evidence in both harnesses therefore reaches both adapters. The claude adapter writes `MEMORY.md` and appends to `touched-projects.txt`; the lesson is never silently dropped, and never written where the originating harness cannot read it.
+Deleted along with the triple-based design: the `sources` array and its path-separator and unknown-adapter checks, the `(source, memory_root, project)` expansion, `apply-pin`'s exit-code routing (`0`/`10`/other), and the `writes_memory` manifest flag's role in pin dispatch. `apply-pin` never shipped in any adapter.
 
-**An adapter declaring `writes_memory: false` is not invoked at all.** Its triples are observed, so a pin naming it passes pair validation; the orchestrator then short-circuits on the triple's non-writable state, counts `pins_declined_no_store`, and records the reason. That is a routing decision made from the manifest, and it is distinct from both an exit `10` and a `pins_rejected_pair`: a declaration means the process is never spawned, a `10` means an adapter that does have a store chose not to write this particular pin, and a rejected pair means the model named a combination this run never saw. A declarative manifest exists so the orchestrator can route without spawning a subprocess; invoking the adapter anyway would make the declaration dead weight.
-
-**Pins apply sequentially.** Two pins for one project are read-modify-write against the same `MEMORY.md`, and `touched-projects.txt` is an append target shared across every pin in the run. Parallel dispatch loses updates. Sequential application costs nothing at this volume.
-
-Lines that fail `jq` validation are counted and logged, never guessed at.
-
-The existing memory rules survive intact inside the claude adapter: always pin with the marker, never rewrite an existing pinned entry, hold each index line under about 150 characters, keep the file within 200 lines and 25,000 bytes, and put longer bodies in a topic file with frontmatter.
+Known limit: the ledger stops the same pin text landing twice. Reworded pins from a forced rebuild do land twice. Mnemopi's own review pass owns consolidation, as `claude-memory gc` did before.
 
 ### Memory GC
 
-GC becomes an adapter operation. `run.sh` calls `adapter gc <memory-root> <project>` once per distinct `(adapter, memory-root, project)` triple whose `apply-pin` returned `0`, after every pin in the run has been applied. These are the same triples the pin expansion produced, deduplicated. Today's implementation is hard-coded to Claude storage — `proj="$PROJECTS_DIR/$encoded"` (`bin/run.sh:1296`) and `( cd "$cwd" && claude-memory gc )` (`bin/run.sh:1306`) — which cannot be correct for an adapter with a different store.
+**Retired 2026-09-15.** GC was an adapter operation: `run.sh` called `adapter gc <memory-root> <project>` once per triple whose `apply-pin` returned `0`, so each harness's own consolidator could resettle around newly written pins. That whole mechanism depended on a per-adapter memory store to resettle, and no such store exists once every harness reads one shared Mnemopi store. There is no `gc` subcommand, no `AUTODREAM_GC` knob, and no `touched-projects.txt` sidecar to drive it; `bin/run.sh`'s consume-gate step no longer calls out to any consolidator.
 
-**The memory root is runner-stamped provenance, not a reconstruction and not a model-supplied field.** `adapter memory-root <session>` is called during enumeration, and its answer is stamped into the findings record alongside `source`, `cwd` and `project`, under the same rule: a value present in the model's own output is discarded. GC then uses the stamped root rather than rebuilding a path from `$PROJECTS_DIR`.
-
-**For an adapter with `writes_memory: true`, the root is validated before the record is written.** It must be non-empty, absolute, and `realpath`-canonical, and it must exist as a directory. Anything else skips the session with `memory_root_invalid` and writes **no findings record at all** — not a record carrying an empty root. The distinction matters because the observed-triple set is a projection of the records: a record with `memory_root=""` would enter that set, authorize an `apply-pin`, and hand an adapter an empty root to write against, where a fallback or default-root write is exactly the silent misplacement this provenance chain exists to prevent, and GC would then run against the same empty target.
-
-**A `writes_memory: false` adapter still contributes a triple**, with `memory_root` explicitly `null` and the triple marked non-writable. It is tempting to say such adapters simply never enter the set, but that makes the no-store short-circuit unreachable: with no observed triple, pair validation would reject an OMP-sourced pin as `pins_rejected_pair` before anything could decline it, and the report would call a legitimate cross-harness pin invalid instead of saying the harness has nowhere to put it. That distinction is the whole reason `source` is tracked — the remedy differs per harness, and "OMP has no memory store, so this is a rule or a hook" is a real answer while "unobserved pair" is a bug report about nothing.
-
-So the order is: validate the pair against observed triples (an OMP triple is present, so it passes), then short-circuit on the triple's non-writable state, counting `pins_declined_no_store` and recording the reason. `apply-pin` is never spawned and GC is never scheduled for that triple.
-
-Two fixtures pin this. A session whose `memory-root` returns empty under a *memory-writing* adapter produces no findings record, no pin dispatch, and no GC call. A cross-harness pin naming both `claude` and `omp` is written to the Claude root and reported as declined-no-store for OMP, counted under `pins_declined_no_store` and never under `pins_rejected_pair`.
-
-That is what fixes the defect live in `main` today, which this change does not cause but must not inherit. The runner scans every configured Claude root since multi-root scanning landed (`bin/run.sh:294`), while GC resolves projects only under `$PROJECTS_DIR`, the primary root — so a pin written for a session in a secondary Claude profile is recorded and then skipped with "no project dir". Reconstruction is the bug; carrying the value the runner already knew is the fix. Tracked as `STRML/cc-autodream#52`.
-
-A fixture asserts that a pin for a session enumerated from a secondary root is GC'd against that root, which is the case the current code silently skips.
+This also retires the defect this section used to track: `bin/run.sh:294` scanned every configured Claude root while GC resolved projects only under `$PROJECTS_DIR`, so a pin written for a session in a secondary profile was recorded and then silently skipped. That was filed as `STRML/cc-autodream#52`. Pins now route by `cwd`, read fresh from `pin-projects.tsv` for the project this run actually observed, not reconstructed from a primary-root assumption, so the failure mode #52 tracked cannot occur. `STRML/cc-autodream#52` should be closed as obsolete with a pointer to `docs/plans/2026-09-15-mnemopi-pins.md`.
 
 ## Failure handling
 
@@ -310,15 +291,20 @@ A fixture asserts that a pin for a session enumerated from a secondary root is G
 | adapter `engine_bin` absent | disable that adapter, count, report; not fatal |
 | every adapter disabled | hard failure; there is nothing to triage |
 | `normalize`, `project`, `stats`, or `slim` exits nonzero | skip the session with that subcommand's own counter; partial output removed |
-| `memory-root` returns empty, relative, non-canonical or absent for a `writes_memory: true` adapter | skip the session, count `memory_root_invalid`, write no findings record |
 | a session path contains a newline, tab, backslash or quote | rejected at enumeration with `sessions_rejected_path`, logged with control characters escaped. The newline because a line-based `sessions.txt` cannot represent it; the other three because the `xargs -I` fan-out corrupts them, and a quote aborts the whole dispatch (issue #54) |
 | one path enumerated by two adapters | keep the first, log both, count `sessions_duplicate_path` |
 | two distinct paths truncate to one hash | skip both, log both, count `sessions_hash_collision` |
 | adapter directory basename is unsafe, disagrees with manifest `name`, or resolves outside the adapters root | refuse to load that adapter, count `adapters_rejected_identity` |
 | L2 capture missing sentinel or marker | treated as truncated, retried per `AUTODREAM_L2_ATTEMPTS`, same as today |
-| a pin line fails validation, or names an unknown source, or an unobserved `(source, project)` pair | counted and logged; the report is already on disk |
-| `apply-pin` exits `10` | a deliberate decline; reason logged, `pins_declined_by_adapter` counted, no GC scheduled |
-| `apply-pin` exits nonzero and not `10` | a failure; `pins_failed` counted and logged, no GC scheduled; never blocks anything downstream |
+| a pin line fails validation, or names a project this run never triaged | counted (`pins_invalid`, `pins_rejected_project`) and logged; the report is already on disk |
+| a pin's project has no resolvable working directory | counted `pins_no_cwd`; nothing stored |
+| `pins.jsonl` exists but cannot be read | counted `pins_unreadable`; nothing stored, the file stays |
+| `shared-memory` is missing, exits nonzero, or returns no `memory_id` | counted (`pins_cli_missing`, `pins_failed`); no ledger row, so a rerun of that date retries it. The nightly run only processes yesterday, so nothing retries it automatically (#69); never blocks anything downstream |
+| the store succeeds but the ledger append fails | counted `pins_unledgered` with the memory id logged; a rerun stores that pin again |
+| the store reports `stored` with an empty `memory_id` | counted `pins_failed`; no ledger row |
+| `pins-applied.tsv` exists but cannot be read | counted `pins_failed` before any store, since a duplicate cannot be ruled out |
+| the store returns `mutation_committed_journal_incomplete` with a `memory_id` (the CLI exits 1) | the write is committed: counted `pins_applied`, ledgered, warning logged, so a rerun cannot store it again |
+| `shared-memory context` exits nonzero, even with a bank in its output | counted `pins_failed`; no store |
 
 Unchanged from today: SIGPIPE hardening on the log path, the L1 retry rounds with a network wait between them, the L2 retry loop, the idempotency guard, the stale-report move-aside that disarms consuming on failure, the trailing-week `unassembled_dates` sweep, and the vault-note and bookmark consume gates.
 
@@ -331,8 +317,9 @@ New keys in `run-stats.txt`, following the existing rule that a degraded measure
 - `sessions_by_source` — `claude=21,omp=33`. A source that drops to zero on a day the user worked in it is the signal that ingest broke.
 - `sessions_duplicate_path`, `sessions_rejected_path`, `sessions_hash_collision`.
 - `adapters_rejected_identity`.
-- `normalize_failed`, `project_failed`, `stats_failed`, `slim_failed`, `memory_root_invalid`.
-- `pins_proposed`, `pins_applied`, `pins_declined_no_store`, `pins_declined_by_adapter`, `pins_failed`, `pins_invalid`, `pins_rejected_source`, `pins_rejected_pair`.
+- `normalize_failed`, `project_failed`, `stats_failed`, `slim_failed`.
+
+Pin counters live in `findings/<date>/pins-result.txt`, not `run-stats.txt`, because pins apply after L2 has already read the stats: `pins_total`, `pins_applied`, `pins_duplicate`, `pins_invalid`, `pins_rejected_project`, `pins_no_cwd`, `pins_failed`, `pins_unledgered`, `pins_cli_missing`, `pins_unreadable`.
 - `l2_input_bytes` — the total size of the findings the aggregator was handed.
 
 `runner_commit` and `runner_dirty` stay, and matter more after the rename, since the live install still symlinks into the working tree.
@@ -350,7 +337,7 @@ The response is the same shape as this repo's existing issue #12 gate, which blo
 1. **Fixture adapter.** `adapters/_fixture/` exercises the full contract with neither real harness installed, using a synthetic transcript format. This is what makes the claim "adding codex later is one directory" checkable rather than aspirational. It is excluded from the default adapter set.
 2. **Encoding regression.** A project fixture whose path contains a dot, an underscore, and a symlinked prefix. The bug in `merge-reports.sh:162` becomes a permanent test rather than a fixed defect.
 3. **Linearizer rejection fixtures.** Malformed JSON, a dangling `parentId`, and a `parentId` cycle, each asserting a nonzero exit with no output. A replay corpus cannot prove these paths, because it only contains whatever happened to occur.
-4. **Pin validation fixtures.** A `sources` entry containing a path separator, an unknown adapter name, a well-formed source paired with a project that source never touched, and an unparseable line — each asserting rejection with the right counter and no command path constructed. The pair case matters most: it is the one that a naive per-field check passes.
+4. **Pin validation fixtures.** Superseded 2026-09-15: pin validation is no longer keyed on an adapter `source`, since one shared Mnemopi store serves every harness. `tests/apply-pins.sh` and `tests/run-all.sh` carry the current fixture set (schema violations, a project absent from `pin-projects.tsv`, a missing `cwd`, a duplicate pin, shell-metacharacter payloads); see the failure matrix in `docs/plans/2026-09-15-mnemopi-pins.md`.
 
 5. **Enumeration rejection fixtures.** A path containing a newline, two adapters claiming one path, and two paths forced onto one truncated hash — each asserting the named counter and that no findings record was written for the rejected session. The forced-collision case is constructed by stubbing the hash function, since a natural 48-bit collision cannot be produced in a test.
 6. **Replay harness.** `tests/replay.sh` has two modes, because an archived findings dir and a live session store answer different questions and an earlier draft did not say which one it used.
@@ -372,7 +359,7 @@ One branch, one cutover.
 2. Write the OMP linearizer from scratch, with its rejection fixtures. Build the omp adapter around it, bringing `skills-inventory` and the dual-schema stats parsing across from `omp-autodream`.
 3. Unify the two `SESSION_TRIAGE.md` files, which are four lines apart.
 4. Rewrite `PROMPT.md` as a pure stdout prompt with every write instruction removed, and split the harness-specific remedy text into per-adapter `facts.md`.
-5. Add the pin protocol with source and project validation, sequential application, and adapter-owned GC.
+5. Add the pin protocol with project validation against `pin-projects.tsv` and sequential application, via `bin/apply-pins.sh`, against the shared Mnemopi store. Revised 2026-09-15: no adapter-owned GC; see `docs/plans/2026-09-15-mnemopi-pins.md`.
 6. Add the fixture adapter, the encoding regression, the pin validation fixtures, and the replay harness.
 7. Run the replay harness against archived corpora from several real dates.
 8. Rename the repo, update `install.sh` and the adapter install hooks, re-run it, verify the symlinks resolve.
@@ -384,7 +371,7 @@ One branch, one cutover.
 
 Two problems surfaced that exist in shipped code and are not caused by this change:
 
-1. **GC ignores secondary Claude roots.** `bin/run.sh:294` scans every configured root; `bin/run.sh:1296` resolves projects only under `$PROJECTS_DIR`. Pins for sessions in a secondary profile are recorded and skipped.
+1. **GC ignores secondary Claude roots (obsolete).** `bin/run.sh:294` scans every configured root; `bin/run.sh:1296` resolves projects only under `$PROJECTS_DIR`. Pins for sessions in a secondary profile were recorded and skipped. Filed as `STRML/cc-autodream#52`. Superseded 2026-09-15: pins now route by `cwd`, read from `pin-projects.tsv` for the project this run observed, not through per-root Claude memory GC, so this failure mode no longer applies. See `docs/plans/2026-09-15-mnemopi-pins.md`.
 2. **`omp-autodream` reads OMP session trees raw.** `omp-autodream/bin/run.sh:623` sets `readpath="$session"` and no linearizer exists in that repo, so triage sees branches the user abandoned.
 
 ## Open questions carried forward
