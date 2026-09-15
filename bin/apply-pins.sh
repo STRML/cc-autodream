@@ -17,7 +17,8 @@
 #   pins-applied.tsv  <sha1 of the canonical pin><TAB><memory_id> per stored
 #                     pin. A pin already listed is skipped, so a rerun never
 #                     stores the same memory twice. A failed call writes no row,
-#                     so a later run retries it.
+#                     so a rerun of the same date retries it. Nothing sweeps
+#                     older dates yet (#69).
 #   pins-result.txt   counters, one `key: value` per line.
 #
 # Exit 2 on bad arguments. Otherwise exit 0 whatever happened to the pins: a
@@ -54,7 +55,7 @@ VALID='select(type == "object")
   | select(.kind as $k | ["correction", "preference", "fact", "decision"] | index($k))
   | {project, title, body, kind}'
 
-total=0 applied=0 duplicate=0 invalid=0 rejected_project=0 no_cwd=0 failed=0 cli_missing=0
+total=0 applied=0 duplicate=0 invalid=0 rejected_project=0 no_cwd=0 failed=0 unledgered=0 cli_missing=0
 
 write_result() {
   {
@@ -65,9 +66,10 @@ write_result() {
     printf 'pins_rejected_project: %s\n' "$rejected_project"
     printf 'pins_no_cwd: %s\n' "$no_cwd"
     printf 'pins_failed: %s\n' "$failed"
+    printf 'pins_unledgered: %s\n' "$unledgered"
     printf 'pins_cli_missing: %s\n' "$cli_missing"
   } > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
-  echo "apply-pins: total=$total applied=$applied duplicate=$duplicate invalid=$invalid rejected_project=$rejected_project no_cwd=$no_cwd failed=$failed cli_missing=$cli_missing"
+  echo "apply-pins: total=$total applied=$applied duplicate=$duplicate invalid=$invalid rejected_project=$rejected_project no_cwd=$no_cwd failed=$failed unledgered=$unledgered cli_missing=$cli_missing"
 }
 
 # $1=project -> prints its cwd column; exit 1 when the run never saw the project.
@@ -101,7 +103,14 @@ apply_line() {
   # reads stdin must never be able to swallow the pins after this one.
   out=$("$SM" call mnemopi_remember "$payload" --cwd "$cwd" </dev/null) || { echo failed; return; }
   id=$(jq -er 'select(.status == "stored") | .memory_id | strings' <<<"$out" 2>/dev/null) || { echo failed; return; }
-  printf '%s\t%s\n' "$hash" "$id" >> "$LEDGER"
+  # The memory is already stored. A ledger row that cannot be written means the next run
+  # stores it again, so this is its own outcome and never counts as applied. The id goes
+  # to the run log so the duplicate can be found and removed.
+  if ! printf '%s\t%s\n' "$hash" "$id" >> "$LEDGER" 2>/dev/null; then
+    echo "apply-pins: stored $id but could not write $LEDGER; a rerun will store this pin again" >&2
+    echo unledgered
+    return
+  fi
   echo applied
 }
 
@@ -127,6 +136,7 @@ while IFS= read -r line <&3 || [ -n "$line" ]; do
     invalid)          invalid=$((invalid + 1)) ;;
     rejected_project) rejected_project=$((rejected_project + 1)) ;;
     no_cwd)           no_cwd=$((no_cwd + 1)) ;;
+    unledgered)       unledgered=$((unledgered + 1)) ;;
     *)                failed=$((failed + 1)) ;;
   esac
 done 3< "$PINS"

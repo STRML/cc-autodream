@@ -2699,6 +2699,59 @@ test_pins_stale_file_is_moved_aside(){
   rm -rf "$root"
 }
 
+test_pins_tab_in_cwd_never_splits_the_row(){
+  echo "# pins: a working directory containing a tab never splits a pin-projects.tsv row"
+  local root; root=$(setup_env)
+  local dir="$root/wo"$'\t'"rk"; mkdir -p "$dir"
+  local f="$root/projects/proj-a/s1.jsonl"
+  {
+    jq -cn --arg c "$(cd "$dir" && pwd -P)" '{type:"user",cwd:$c,message:{content:"start the task"}}'
+    printf '%s\n' '{"type":"user","message":{"content":"keep going"}}' \
+      '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}'
+  } > "$f"
+  touch -t "$STAMP" "$f"
+  export MOCK_MODE=pins; pins_run "$root"; unset MOCK_MODE
+  local d; d=$(fdir "$root")
+  assert_file "$d/pin-projects.tsv" "pin-projects.tsv was written"
+  assert_eq "$(awk -F'\t' 'NF != 2' "$d/pin-projects.tsv" 2>/dev/null | wc -l | tr -d ' ')" "0" "every row has exactly two fields"
+  assert_eq "$(sm_calls "$root")" "0" "no remember call for a project with no usable cwd"
+  rm -rf "$root"
+}
+
+test_pins_failed_authorization_rebuild_stores_nothing(){
+  echo "# pins: a failed pin-projects.tsv rebuild never falls back to an old one"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  local cwd; cwd=$(cd "$root/work" && pwd -P)
+  mk_session_with_cwd "$root" s1 "$cwd"
+  local d="$root/autodream/findings/$DATE"
+  # A directory where the temp file goes makes the rebuild's redirect fail.
+  mkdir -p "$d/pin-projects.tsv.tmp"
+  printf 'proj-a\t%s\n' "$cwd" > "$d/pin-projects.tsv"
+  export MOCK_MODE=pins; pins_run "$root"; unset MOCK_MODE
+  assert_eq "$(sm_calls "$root")" "0" "no remember call"
+  assert_no_file "$d/pin-projects.tsv" "the old authorization list is gone"
+  assert_grep "$root/run.out" 'could not write pin-projects.tsv' "the run log says why"
+  rm -rf "$root"
+}
+
+test_pins_forged_session_path_authorizes_nothing(){
+  echo "# pins: an L1 session_path naming another project's session authorizes no pin there"
+  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b" "$root/projects/proj-b"
+  mk_session_with_cwd "$root" s1 "$(cd "$root/work-a" && pwd -P)"
+  # proj-b's session exists and is readable, but its mtime is outside the target date,
+  # so the run never triages it. Only a forged session_path can point at it.
+  local other="$root/projects/proj-b/other.jsonl"
+  printf '{"type":"user","cwd":"%s","message":{"content":"x"}}\n' "$(cd "$root/work-b" && pwd -P)" > "$other"
+  export MOCK_MODE=pins_forged MOCK_FORGED_SESSION="$other" MOCK_PIN_PROJECT=proj-b
+  pins_run "$root"
+  unset MOCK_MODE MOCK_FORGED_SESSION MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored for the untriaged project"
+  assert_nogrep "$d/pin-projects.tsv" '^proj-b' "proj-b is not on the authorization list"
+  assert_grep   "$d/pin-projects.tsv" '^proj-a' "the triaged project is"
+  rm -rf "$root"
+}
+
 test_no_markdown_memory_writer_remains(){
   echo "# pins: the MEMORY.md writer and the claude-memory GC are gone"
   assert_nogrep "$REPO/prompts/PROMPT.md" 'touched-projects' "PROMPT.md has no touched-projects sidecar"
@@ -2712,6 +2765,9 @@ test_no_markdown_memory_writer_remains(){
 test_pins_applied_after_complete_report
 test_pins_not_applied_after_truncated_report
 test_pins_stale_file_is_moved_aside
+test_pins_tab_in_cwd_never_splits_the_row
+test_pins_failed_authorization_rebuild_stores_nothing
+test_pins_forged_session_path_authorizes_nothing
 test_no_markdown_memory_writer_remains
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup

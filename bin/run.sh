@@ -1114,26 +1114,34 @@ report_complete() {
 
 # $1=findings dir -> writes pin-projects.tsv, one project<TAB>cwd row per project this
 # run triaged. apply-pins.sh refuses a pin whose project is not listed and scopes the
-# memory by this cwd. The cwd comes from the session's own adapter, looked up through
-# sessions-source.txt, never from anything the model wrote. A project keeps a resolvable
-# cwd when any of its sessions has one; with none, the column stays empty and its pins
-# are refused as no_cwd.
+# memory by this cwd.
+#
+# It walks sessions.txt, the runner's own worklist, and never a findings JSON. Outside the
+# slim case a findings session_path is whatever the L1 model wrote, so reading it would let
+# a transcript name another project's session and authorize memory there. The project is
+# the session's parent directory, the same rule the findings normalization applies, and
+# the cwd comes from the session's own adapter via sessions-source.txt. A project keeps a
+# resolvable cwd when any of its sessions has one; with none, the column stays empty and
+# its pins are refused as no_cwd.
 write_pin_projects() {
-  local dir=$1 f hash src sess proj cwd
-  for f in "$dir"/*.json; do
-    [ -f "$f" ] || continue
-    case $f in *.stats.json) continue ;; esac
-    proj=$(jq -r '.project // empty' "$f" 2>/dev/null)
-    [ -n "$proj" ] || continue
-    hash=$(basename "$f" .json)
+  local dir=$1 s hash src proj cwd
+  # An authorization list from an earlier run must never outlive a failed rebuild.
+  rm -f "$dir/pin-projects.tsv" || return 1
+  while IFS= read -r s <&3; do
+    [ -n "$s" ] || continue
+    hash=$(session_hash "$s") || continue
+    [ -f "$dir/$hash.json" ] || continue
+    proj=$(basename "$(dirname "$s")")
     src=$(awk -F'\t' -v h="$hash" '$1 == h { print $2; exit }' "$dir/sessions-source.txt" 2>/dev/null)
-    sess=$(jq -r '.session_path // empty' "$f" 2>/dev/null)
     cwd=""
-    if [ -n "$src" ] && [ -n "$sess" ]; then
-      cwd=$(adapter_run "$src" project "$sess" 2>/dev/null) || cwd=""
+    if [ -n "$src" ]; then
+      cwd=$(adapter_run "$src" project "$s" 2>/dev/null </dev/null) || cwd=""
     fi
+    # A tab or newline in a real directory name would split this row, and apply-pins.sh
+    # would read a different directory out of it. Such a project gets no cwd at all.
+    case $cwd in *$'\t'*|*$'\n'*) cwd="" ;; esac
     printf '%s\t%s\n' "$proj" "$cwd"
-  done | sort -t $'\t' -k1,1 -k2,2r | awk -F'\t' '!seen[$1]++' > "$dir/pin-projects.tsv.tmp" \
+  done 3< "$dir/sessions.txt" | sort -t $'\t' -k1,1 -k2,2r | awk -F'\t' '!seen[$1]++' > "$dir/pin-projects.tsv.tmp" \
     && mv "$dir/pin-projects.tsv.tmp" "$dir/pin-projects.tsv"
 }
 
@@ -2248,8 +2256,9 @@ PY
     PINS="$FINDINGS_DIR/pins.jsonl"
     if [ -s "$PINS" ] && { ! report_complete || [ "${CONSUME_SAFE:-1}" != "1" ] || [ "$PINS_SAFE" != "1" ]; }; then
       log "skipping memory pins: no complete report from this run stands behind $PINS"
+    elif [ -s "$PINS" ] && ! write_pin_projects "$FINDINGS_DIR"; then
+      log "skipping memory pins: could not write pin-projects.tsv, so no project is authorized"
     elif [ -s "$PINS" ]; then
-      write_pin_projects "$FINDINGS_DIR"
       bash "$APPLY_PINS" "$FINDINGS_DIR" "$TARGET_DATE" >> "$RUN_LOG" 2>&1 \
         || log "apply-pins exited non-zero (pins stay in $PINS)"
       log "memory pins: $(tr '\n' ' ' < "$FINDINGS_DIR/pins-result.txt" 2>/dev/null)"

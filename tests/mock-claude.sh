@@ -17,6 +17,8 @@
 #   MOCK_MODE=pins           L1 writes a real session_path (like l1_badproject); L2
 #                            writes a complete report plus one pins.jsonl pin for proj-a.
 #   MOCK_MODE=pins_partial   as pins, but the report is truncated (like l2_partial).
+#   MOCK_MODE=pins_forged    L1 writes session_path=$MOCK_FORGED_SESSION, a session it was
+#                            never given; L2 pins $MOCK_PIN_PROJECT (default proj-a).
 #   MOCK_CAPTURE_DIR=<dir>   dump each layer's stdin + argv to <dir>/l{1,2}-*.txt
 #                            so tests can assert on the exact prompt framing.
 #   MOCK_CALL_LOG=<file>     append the L1 output path for every invocation of
@@ -45,6 +47,8 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
   case "$mode" in
     l1_incomplete) : ;;                 # never write — simulates a worker that exits empty
     l1_badproject|pins|pins_partial) write_badproject ;;  # wrong project + real path — exercises normalization
+    pins_forged)                        # session_path names a session this worker was never given
+      printf '{"session_path":"%s","project":"WRONG-PROJECT","findings":[]}' "$MOCK_FORGED_SESSION" > "$out" ;;
     l1_flaky)                           # fail the first dispatch per session, succeed on retry
       if [ -f "$out.attempt" ]; then write_findings; else : > "$out.attempt"; fi ;;
     *) write_findings ;;
@@ -61,9 +65,9 @@ else
     echo "mock: aggregator failed" >&2
     exit 1
   fi
-  if [ "$mode" = "pins" ] || [ "$mode" = "pins_partial" ]; then
+  if [ "$mode" = "pins" ] || [ "$mode" = "pins_partial" ] || [ "$mode" = "pins_forged" ]; then
     fdir=$(printf '%s' "$line1" | sed 's/^Findings directory to aggregate (literal absolute path): //')
-    printf '{"project":"proj-a","title":"Mock lesson","body":"Mock evidence and rule.","kind":"correction"}\n' > "$fdir/pins.jsonl"
+    printf '{"project":"%s","title":"Mock lesson","body":"Mock evidence and rule.","kind":"correction"}\n' "${MOCK_PIN_PROJECT:-proj-a}" > "$fdir/pins.jsonl"
   fi
   # l2_partial: a NON-EMPTY report with no open-questions marker — what a mid-write kill
   # leaves behind. `-s` cannot tell this from a good report, which is why run.sh checks

@@ -121,7 +121,7 @@ run_ap
 assert_eq "$(stat_of pins_rejected_project)" "1" "rejected without an observed-project list"
 assert_eq "$(calls)" "0" "no call"
 
-echo "# A11: CLI failure is not ledgered, and a later run retries"
+echo "# A11: CLI failure is not ledgered, and a rerun of the same date retries"
 setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"
 MOCK_SM_MODE=fail run_ap
 assert_eq "$RC" "0" "exits 0"
@@ -144,6 +144,16 @@ pin proj-a "Title" "$body" > "$F/pins.jsonl"
 run_ap
 assert_eq "$(jq -r .payload.content "$T/calls.jsonl" 2>/dev/null)" "$(printf 'Title\n\n%s' "$body")" "content byte-identical"
 [ ! -e "$T/pwned" ] && [ ! -e "$T/pwned2" ] && ok "no command ran" || no "no command ran"
+
+echo "# A15: stored, but the ledger row cannot be written"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"
+mkdir "$F/pins-applied.tsv"   # a directory: every append to it fails, even as root
+run_ap
+assert_eq "$RC" "0" "exits 0"
+assert_eq "$(calls)" "1" "the store call ran"
+assert_eq "$(stat_of pins_unledgered)" "1" "pins_unledgered is 1"
+assert_eq "$(stat_of pins_applied)" "0" "not counted as applied"
+grep -q 'stored m1 but could not write' "$T/out" && ok "the memory id is logged" || no "the memory id is logged"
 
 echo "# A14: no arguments"
 setup

@@ -22,7 +22,7 @@ L2 keeps its tools for now. It writes pins to a file, and the runner applies the
 
 2. Before each L2 attempt, `run.sh` moves an existing `pins.jsonl` to `pins.jsonl.stale-<epoch>-<attempt>`. That file came from an earlier run or a dead attempt, and no complete report from this attempt stands behind it. A failed move clears `PINS_SAFE`, and the run stores no pins.
 
-3. After a complete report, and only when `CONSUME_SAFE=1` and `PINS_SAFE=1`, `run.sh` writes `<findings-dir>/pin-projects.tsv`: one `project<TAB>cwd` row per distinct project in this run's findings. It gets `cwd` from the `project` subcommand of each session's own adapter (looked up in `sessions-source.txt`), and leaves it empty when no session of that project resolves. Then it runs `bin/apply-pins.sh <findings-dir> <date>`. Pins do not depend on the date gate: an old-date rebuild is still a real lesson, and the ledger stops a rerun from writing twice.
+3. After a complete report, and only when `CONSUME_SAFE=1` and `PINS_SAFE=1`, `run.sh` writes `<findings-dir>/pin-projects.tsv`: one `project<TAB>cwd` row per distinct project in this run's worklist (`sessions.txt`). The project is the session's real parent directory, and `cwd` comes from the `project` subcommand of that session's own adapter (looked up in `sessions-source.txt`), left empty when no session of that project resolves. Nothing here is read from a findings JSON, because its `session_path` is model output. Then it runs `bin/apply-pins.sh <findings-dir> <date>`. Pins do not depend on the date gate: an old-date rebuild is still a real lesson, and the ledger stops a rerun from writing twice.
 
 4. `bin/apply-pins.sh` validates each line, then calls
    `shared-memory call mnemopi_remember '<json>' --cwd <cwd>` with content `title\n\nbody`, `source: cc-autodream`, `importance: 0.7`, and metadata `{kind, project, autodream_date, origin: "cc-autodream"}`. A call succeeds only on exit 0 with `status: "stored"` and a string `memory_id`. Each success appends `<sha1 of the canonical pin>\t<memory_id>` to `pins-applied.tsv`. Counters go to `pins-result.txt`. The script always exits 0 after arguments parse, because a pin must never cost a report.
@@ -49,12 +49,16 @@ Each row is a test in `tests/apply-pins.sh` (A) or `tests/run-all.sh` (R).
 | A8 project not in this run | skips | memory for a project the run never saw | `pins_rejected_project: 1`, no call |
 | A9 project seen, cwd empty or missing dir | skips | memory scoped to the wrong project | `pins_no_cwd: 2`, no call |
 | A10 `pin-projects.tsv` missing | rejects every pin | writes without authorization | `pins_rejected_project` counts all |
-| A11 CLI exits nonzero | no ledger row | failure recorded as applied | `pins_failed: 1`; a later run retries and applies |
+| A11 CLI exits nonzero | no ledger row | failure recorded as applied | `pins_failed: 1`; a rerun of the same date retries and applies (no nightly sweep of older dates yet, #69) |
 | A12 CLI exits 0 with non-JSON output | no ledger row | garbage read as success | `pins_failed: 1` |
 | A13 quotes, backslash, `$(...)`, newline in body | passed through as JSON data | shell injection or mangled text | payload content byte-identical, no command ran |
 | A14 no arguments | usage | runs against `$PWD` | exit 2 |
+| A15 store succeeds, ledger append fails | no applied count | counted as applied, silently stored again next run | `pins_unledgered: 1`, memory id in the run log |
 | R1 complete report plus pins | pins applied after the report | pins before report | ledger present, log line |
 | R2 truncated report plus pins | not applied | pins from a dead L2 | no call, no ledger |
 | R3 forced rebuild with an old `pins.jsonl`, new L2 writes none | old file moved aside, nothing applied | old pins applied again | `pins.jsonl.stale-*` exists, no call |
 | R4 prompt text | no `MEMORY.md` write or `touched-projects` directive | the old writer comes back | grep assertion |
 | R5 runner text | no `claude-memory` or `touched-projects` | the old GC comes back | grep assertion |
+| R6 session cwd contains a tab | that project gets an empty cwd | the TSV row splits and a different directory is used | every `pin-projects.tsv` row has two fields |
+| R7 `pin-projects.tsv` rebuild fails, an old one exists | old file removed, pins skipped | stale authorization list reused | no call, no `pin-projects.tsv`, log line |
+| R8 L1 writes a `session_path` naming an untriaged project's session | the authorization list comes from `sessions.txt`, not findings JSON | a model-written path authorizes memory for a project the run never saw | no call, that project absent from `pin-projects.tsv` |
