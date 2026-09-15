@@ -1122,11 +1122,16 @@ report_complete() {
 # the session's parent directory, the same rule the findings normalization applies, and
 # the cwd comes from the session's own adapter via sessions-source.txt.
 #
-# A cwd counts only when it encodes to the bucket its session is stored in, and a project
-# gets a cwd only when its sessions agree on exactly one. Anything else would store one
-# project's pin in another project's bank: a transcript sitting in a bucket its cwd does
-# not encode to, or two directories that encode to one bucket (/tmp/a_b and /tmp/a-b).
-# A project with no usable cwd keeps an empty column, and its pins are refused as no_cwd.
+# A project gets a cwd only when its sessions agree on exactly one usable cwd. A cwd is
+# unusable when it holds a tab or newline, or when its bucket is an encoded path (starts
+# with "-") that the cwd does not encode to. Slug buckets from CLAUDE_CODE_PROJECT_DIR_NAME
+# (owner-repo) skip that encoding check, because no cwd ever encodes to a slug. An unusable
+# cwd is recorded as "?" (an adapter cwd is always absolute, so it can never be "?") and
+# still counts as a distinct cwd, so it makes the bucket ambiguous rather than vanishing.
+# Anything looser would store one project's pin in another project's bank: a transcript
+# sitting in a bucket its cwd does not encode to, or two directories that encode to one
+# bucket (/tmp/a_b and /tmp/a-b). A project with no usable cwd keeps an empty column, and
+# its pins are refused as no_cwd.
 write_pin_projects() {
   local dir=$1 s hash src proj cwd
   # An authorization list from an earlier run must never outlive a failed rebuild.
@@ -1150,13 +1155,20 @@ write_pin_projects() {
     fi
     # A tab or newline in a real directory name would split this row, and apply-pins.sh
     # would read a different directory out of it. Such a project gets no cwd at all.
-    case $cwd in *$'\t'*|*$'\n'*) cwd="" ;; esac
-    if [ -n "$cwd" ] && [ "$(encode_project "$cwd")" != "$proj" ]; then cwd=""; fi
+    case $cwd in *$'\t'*|*$'\n'*) cwd="?" ;; esac
+    case $proj in
+      -*) if [ -n "$cwd" ] && [ "$cwd" != "?" ] && [ "$(encode_project "$cwd")" != "$proj" ]; then cwd="?"; fi ;;
+    esac
     printf '%s\t%s\n' "$proj" "$cwd"
   done 3< "$dir/sessions.txt" | awk -F'\t' '
     !($1 in seen) { seen[$1] = 1; order[++n] = $1 }
     $2 != "" && !(($1, $2) in pair) { pair[$1, $2] = 1; count[$1]++; cwd[$1] = $2 }
-    END { for (i = 1; i <= n; i++) { p = order[i]; printf "%s\t%s\n", p, (count[p] == 1 ? cwd[p] : "") } }
+    END {
+      for (i = 1; i <= n; i++) {
+        p = order[i]
+        printf "%s\t%s\n", p, (count[p] == 1 && cwd[p] != "?" ? cwd[p] : "")
+      }
+    }
   ' > "$dir/pin-projects.tsv.tmp" \
     && mv "$dir/pin-projects.tsv.tmp" "$dir/pin-projects.tsv"
 }

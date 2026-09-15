@@ -2821,6 +2821,39 @@ test_pins_colliding_cwds_authorize_nothing(){
   rm -rf "$root"
 }
 
+test_pins_custom_slug_bucket_keeps_its_cwd(){
+  echo "# pins: a CLAUDE_CODE_PROJECT_DIR_NAME slug bucket keeps its cwd"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  local cwd; cwd=$(cd "$root/work" && pwd -P)
+  # Slug buckets (owner-repo) override cwd encoding, so no cwd ever encodes to them. On
+  # this host they are the main Rush and STRML repos, 68 of 359 buckets in ~/.claude.
+  mk_session_with_cwd "$root" s1 "$cwd" "STRML-demo"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT=STRML-demo; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  assert_eq "$(sm_calls "$root")" "1" "the pin for the slug bucket was stored"
+  assert_eq "$(jq -r .cwd "$root/sm-calls.jsonl" 2>/dev/null)" "$cwd" "in the session's working directory"
+  rm -rf "$root"
+}
+
+test_pins_invalid_cwd_still_counts_toward_a_collision(){
+  echo "# pins: an unusable cwd in a bucket still makes that bucket ambiguous"
+  local root; root=$(setup_env)
+  local tabdir="$root/a"$'\t'"b" okdir="$root/a-b"; mkdir -p "$tabdir" "$okdir"
+  local tabcwd okcwd; tabcwd=$(cd "$tabdir" && pwd -P); okcwd=$(cd "$okdir" && pwd -P)
+  local b; b=$(encode_project "$okcwd")
+  assert_eq "$(encode_project "$tabcwd")" "$b" "the fixture really collides"
+  mkdir -p "$root/projects/$b"
+  {
+    jq -cn --arg c "$tabcwd" '{type:"user",cwd:$c,message:{content:"start the task"}}'
+    printf '%s\n' '{"type":"user","message":{"content":"keep going"}}' \
+      '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}'
+  } > "$root/projects/$b/s1.jsonl"
+  touch -t "$STAMP" "$root/projects/$b/s1.jsonl"
+  mk_session_with_cwd "$root" s2 "$okcwd"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored in the one usable cwd of an ambiguous bucket"
+  rm -rf "$root"
+}
+
 test_no_markdown_memory_writer_remains(){
   echo "# pins: the MEMORY.md writer and the claude-memory GC are gone"
   assert_nogrep "$REPO/prompts/PROMPT.md" 'touched-projects' "PROMPT.md has no touched-projects sidecar"
@@ -2828,6 +2861,16 @@ test_no_markdown_memory_writer_remains(){
   assert_grep   "$REPO/prompts/PROMPT.md" 'pins.jsonl' "PROMPT.md tells L2 to write pins.jsonl"
   assert_nogrep "$RUN" 'claude-memory' "run.sh no longer runs claude-memory"
   assert_nogrep "$RUN" 'touched-projects' "run.sh no longer reads touched-projects"
+  # pins.jsonl before the report: a kill between the two writes must leave no complete
+  # report claiming pins that were never written.
+  local pin_step report_step
+  pin_step=$(grep -n 'add a pin to `<findings-dir>/pins.jsonl`' "$REPO/prompts/PROMPT.md" | head -1 | cut -d: -f1)
+  report_step=$(grep -n 'Write the report to the literal report path' "$REPO/prompts/PROMPT.md" | head -1 | cut -d: -f1)
+  if [ -n "$pin_step" ] && [ -n "$report_step" ] && [ "$pin_step" -lt "$report_step" ]; then
+    ok "PROMPT.md writes pins before the report"
+  else
+    no "PROMPT.md writes pins before the report (pins step line [$pin_step], report step line [$report_step])"
+  fi
 }
 
 # ---- run the new tests ----
@@ -2840,6 +2883,8 @@ test_pins_forged_session_path_authorizes_nothing
 test_pins_subagent_sessions_keep_their_project
 test_pins_cwd_outside_its_bucket_authorizes_nothing
 test_pins_colliding_cwds_authorize_nothing
+test_pins_custom_slug_bucket_keeps_its_cwd
+test_pins_invalid_cwd_still_counts_toward_a_collision
 test_no_markdown_memory_writer_remains
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
