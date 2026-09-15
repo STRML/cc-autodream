@@ -194,6 +194,22 @@ chmod 600 "$F/pins-applied.tsv"
 assert_eq "$(stat_of pins_failed)" "1" "pins_failed is 1"
 assert_eq "$(calls)" "0" "nothing stored while duplicates cannot be ruled out"
 
+echo "# A21: the write committed but its journal append failed (CLI exits 1)"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"
+MOCK_SM_MODE=journal run_ap
+assert_eq "$(stat_of pins_applied)" "1" "a committed write counts as applied"
+assert_eq "$(stat_of pins_failed)" "0" "not counted as failed"
+assert_eq "$(cut -f2 "$F/pins-applied.tsv" 2>/dev/null)" "m1" "ledgered with its memory id, so a rerun cannot store it again"
+grep -q 'journal' "$T/out" && ok "the incomplete journal is logged" || no "the incomplete journal is logged"
+MOCK_SM_MODE=journal run_ap
+assert_eq "$(calls)" "1" "a rerun makes no second store"
+
+echo "# A22: shared-memory context exits nonzero but still prints a bank"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"
+MOCK_SM_MODE=ctxexit run_ap
+assert_eq "$(stat_of pins_failed)" "1" "pins_failed is 1"
+assert_eq "$(calls)" "0" "no store with a bank from a failed context call"
+
 echo "# A14: no arguments"
 setup
 SHARED_MEMORY_BIN="$SM" bash "$AP" > "$T/out" 2>&1

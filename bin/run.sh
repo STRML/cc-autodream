@@ -1112,9 +1112,11 @@ report_complete() {
   [ -s "$REPORT_PATH" ] && grep -q 'autodream:open-questions=' "$REPORT_PATH" 2>/dev/null
 }
 
-# $1=findings dir -> writes pin-projects.tsv, one project<TAB>cwd row per project this
-# run triaged. apply-pins.sh refuses a pin whose project is not listed and scopes the
-# memory by this cwd.
+# $1=findings dir -> prints one project<TAB>cwd row per project this run enumerated. run.sh
+# calls it before the first model call and holds the result in memory: L1 and L2 both run
+# with the Write tool and bypassPermissions, so every file this reads, sessions.txt and
+# sessions-source.txt included, is one they could rewrite before the pins are applied.
+# apply-pins.sh refuses a pin whose project is not listed and scopes the memory by the cwd.
 #
 # It walks sessions.txt, the runner's own worklist, and never a findings JSON. Outside the
 # slim case a findings session_path is whatever the L1 model wrote, so reading it would let
@@ -1132,14 +1134,13 @@ report_complete() {
 # sitting in a bucket its cwd does not encode to, or two directories that encode to one
 # bucket (/tmp/a_b and /tmp/a-b). A project with no usable cwd keeps an empty column, and
 # its pins are refused as no_cwd.
-write_pin_projects() {
+build_pin_projects() {
   local dir=$1 s hash src proj cwd
-  # An authorization list from an earlier run must never outlive a failed rebuild.
-  rm -f "$dir/pin-projects.tsv" || return 1
+  # A missing worklist would otherwise read as "no projects" and refuse every pin silently.
+  [ -r "$dir/sessions.txt" ] || return 1
   while IFS= read -r s <&3; do
     [ -n "$s" ] || continue
     hash=$(session_hash "$s") || continue
-    [ -f "$dir/$hash.json" ] || continue
     proj=$(basename "$(dirname "$s")")
     # A subagent transcript is <bucket>/<session>/subagents/agent-*.jsonl, and its project
     # is the bucket. Taken literally, every project's subagents would merge into one
@@ -1169,7 +1170,17 @@ write_pin_projects() {
         printf "%s\t%s\n", p, (count[p] == 1 && cwd[p] != "?" ? cwd[p] : "")
       }
     }
-  ' > "$dir/pin-projects.tsv.tmp" \
+  '
+}
+
+# $1=findings dir -> writes the rows build_pin_projects produced before L1 ran to
+# pin-projects.tsv. The old file goes first, so an authorization list from an earlier run
+# never outlives a failed write. Fails when the build itself failed.
+write_pin_projects() {
+  local dir=$1
+  rm -f "$dir/pin-projects.tsv" || return 1
+  [ "${PIN_PROJECTS_BUILT:-0}" = "1" ] || return 1
+  if [ -n "$PIN_PROJECTS_TSV" ]; then printf '%s\n' "$PIN_PROJECTS_TSV"; fi > "$dir/pin-projects.tsv.tmp" \
     && mv "$dir/pin-projects.tsv.tmp" "$dir/pin-projects.tsv"
 }
 
@@ -1693,6 +1704,19 @@ EOF
   # runs inside dispatch_l1 below — gated sessions' sidecars still exist and still
   # participate in overlap (see the comment in bin/overlap-stats.sh).
   compute_overlap_stats
+
+  # ---- Pin authorization, fixed before any model runs ----
+  # L1 and L2 both run with the Write tool and bypassPermissions, so any file they can
+  # reach they can rewrite: sessions.txt, sessions-source.txt, findings JSON. The projects
+  # a memory pin may name are therefore computed here, before the first model call, and
+  # held in this shell's memory until the pins are applied after the report.
+  PIN_PROJECTS_BUILT=0
+  PIN_PROJECTS_TSV=""
+  if PIN_PROJECTS_TSV=$(build_pin_projects "$FINDINGS_DIR"); then
+    PIN_PROJECTS_BUILT=1
+  else
+    log "WARNING: could not build the pin authorization list; this run will not store memory pins"
+  fi
 
   # ---- Layer 1: haiku triage, parallel, retried across sleep/network gaps ----
   # Lean-query env (claude-cells internal/claude/query.go pattern): keep subscription

@@ -19,6 +19,9 @@
 #   MOCK_MODE=pins_partial   as pins, but the report is truncated (like l2_partial).
 #   MOCK_MODE=pins_forged    L1 writes session_path=$MOCK_FORGED_SESSION, a session it was
 #                            never given; L2 pins $MOCK_PIN_PROJECT (default proj-a).
+#   MOCK_MODE=pins_tamper    as pins, and L2 also appends $MOCK_FORGED_SESSION to sessions.txt,
+#                            sessions-source.txt and a findings JSON, as an injected L2 could.
+#   MOCK_MODE=pins_tamper_l1 the same tampering, done by L1 instead of L2.
 #   MOCK_CAPTURE_DIR=<dir>   dump each layer's stdin + argv to <dir>/l{1,2}-*.txt
 #                            so tests can assert on the exact prompt framing.
 #   MOCK_CALL_LOG=<file>     append the L1 output path for every invocation of
@@ -28,6 +31,16 @@
 
 input=$(cat)
 mode="${MOCK_MODE:-good}"
+
+# $1=findings dir. Adds $MOCK_FORGED_SESSION to the runner's worklist files, the way a
+# prompt-injected model with the Write tool could.
+tamper_worklist() {
+  local h
+  h=$(printf '%s' "$MOCK_FORGED_SESSION" | shasum -a 1 | cut -c1-12)
+  printf '%s\n' "$MOCK_FORGED_SESSION" >> "$1/sessions.txt"
+  printf '%s\tclaude\n' "$h" >> "$1/sessions-source.txt"
+  printf '{"session_path":"%s","findings":[]}' "$MOCK_FORGED_SESSION" > "$1/$h.json"
+}
 line1=$(printf '%s\n' "$input" | sed -n '1p')
 line2=$(printf '%s\n' "$input" | sed -n '2p')
 
@@ -46,7 +59,8 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
   write_badproject() { printf '{"session_path":"%s","project":"WRONG-PROJECT","turn_count":2,"tool_call_count":0,"tools_used":[],"skills_invoked":[],"models_used":[],"notable_initiatives":[],"findings":[]}' "$sess" > "$out"; }
   case "$mode" in
     l1_incomplete) : ;;                 # never write — simulates a worker that exits empty
-    l1_badproject|pins|pins_partial) write_badproject ;;  # wrong project + real path — exercises normalization
+    l1_badproject|pins|pins_partial|pins_tamper) write_badproject ;;  # wrong project + real path — exercises normalization
+    pins_tamper_l1) write_badproject; tamper_worklist "$(dirname "$out")" ;;
     pins_forged)                        # session_path names a session this worker was never given
       printf '{"session_path":"%s","project":"WRONG-PROJECT","findings":[]}' "$MOCK_FORGED_SESSION" > "$out" ;;
     l1_flaky)                           # fail the first dispatch per session, succeed on retry
@@ -65,8 +79,13 @@ else
     echo "mock: aggregator failed" >&2
     exit 1
   fi
-  if [ "$mode" = "pins" ] || [ "$mode" = "pins_partial" ] || [ "$mode" = "pins_forged" ]; then
+  case "$mode" in
+    pins|pins_partial|pins_forged|pins_tamper|pins_tamper_l1) writes_pins=1 ;;
+    *) writes_pins=0 ;;
+  esac
+  if [ "$writes_pins" = 1 ]; then
     fdir=$(printf '%s' "$line1" | sed 's/^Findings directory to aggregate (literal absolute path): //')
+    [ "$mode" = "pins_tamper" ] && tamper_worklist "$fdir"
     printf '{"project":"%s","title":"Mock lesson","body":"Mock evidence and rule.","kind":"correction"}\n' "${MOCK_PIN_PROJECT:-proj-a}" > "$fdir/pins.jsonl"
   fi
   # l2_partial: a NON-EMPTY report with no open-questions marker — what a mid-write kill

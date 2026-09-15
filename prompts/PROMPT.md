@@ -66,7 +66,7 @@ For each, ordered by (count × max-severity) descending, cap at 10:
 - **Proposed action**: concrete sentence — skill to invoke, allowlist line, memory pin to propose, or CLAUDE.md edit
 - **Grounded against**: the `file:line` you read to verify the proposal isn't already done or already-rejected, plus what it showed — or "n/a — no concrete artifact". A proposal that touches a concrete artifact with no grounding entry must not ship.
 - **Confidence**: high | medium | low
-- **Pinned**: yes/no (the pin's title when yes; see Memory pins)
+- **Pin proposed**: yes/no (the pin's title when yes; see Memory pins)
 
 **Grounding gate (do this before writing any Proposed action that edits a concrete artifact — a hook script, `settings.json`, a skill, `CLAUDE.md`, a rule):** Read that artifact in full first, *including its code comments*. The artifact you must read is the **edit target** — the exact file your proposal would change — plus, for `missed_skill` and other behavioral findings, the project `CLAUDE.md` (and `.claude/rules/*`) governing that behavior. Reading only a *related* file does not satisfy the gate: a 2026-07-06 report grounded a `missed_skill` proposal against the skill's own frontmatter, never read the project `CLAUDE.md` it proposed to edit, and contradicted a protocol documented right there in the target. If the target documents the flagged behavior as intentional protocol, the finding is a false positive — drop it or restate it as "working as documented". If the change is already implemented, drop the finding or restate it as "already addressed" citing the `file:line`. If the file's comments show a prior attempt was tried and reverted, your proposal must engage with that recorded reason rather than repeat the original idea. This is `verify-spec-against-code` applied to your own recommendation — the report prescribes that check for the sessions it reviews, so it must hold itself to the same bar. Record the result in the **Grounded against** field above.
 
@@ -152,7 +152,7 @@ N is how many questions survived the triviality gate above. Count the questions 
 
 ### 2. Memory pins (high-confidence only)
 
-For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you MAY propose a memory pin. You do not write memory yourself. You write pins to a file, and after your report is complete the runner stores each one in Mnemopi, the shared memory every harness on this host reads.
+For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you MAY propose a memory pin. You do not write memory yourself. You write pins to a file, and after your report is complete the runner tries to store each one in Mnemopi, the shared memory every harness on this host reads.
 
 **Pilot quarantine — LIFTED for `buggy_code_shipped` on 2026-07-28.** Its pilot week ran 2026-07-20…07-27: 28 sessions emitted the category and none was dropped as a false positive, so it is now eligible for the normal memory-write gate above like any other category. (The one date that looked like a mass discard was a single code-review fanout, `wf_e1571958-08b`, which L2 correctly collapsed into one aggregate pattern rather than 9 separate ones.)
 
@@ -166,8 +166,8 @@ Still read the field, for the one thing it proved good at: **compliance detectio
 - `title` is one line of at most 150 characters that states the lesson. `body` holds the rule and its quoted evidence, at most 4000 characters.
 - `kind` is `correction` (the usual one for autodream signal), `preference`, `fact`, or `decision`.
 - Never edit a legacy `MEMORY.md` file.
-- In the report, mark each pinned pattern "Pinned: <title> (stored by the runner after this report)". Do not claim a memory id. The runner assigns it after you exit and records the counts in `pins-result.txt`.
-- Never mark a pattern pinned unless its line is in the `pins.jsonl` you just wrote. A past report cited a pin that was never written.
+- In the report, mark each pattern you wrote a pin for "Pin proposed: <title>". Never say a pin is stored and never claim a memory id. The runner applies pins after you exit, can still refuse one (a project it did not authorize, no usable working directory, a failed store), and records what happened in `pins-result.txt`.
+- Never mark a pin proposed unless its line is in the `pins.jsonl` you just wrote. A past report cited a pin that was never written.
 
 ### 3. Anything you may NOT edit
 

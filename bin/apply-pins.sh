@@ -88,7 +88,7 @@ project_cwd() {
 
 # $1=line -> prints one outcome: invalid rejected_project no_cwd duplicate failed unledgered applied
 apply_line() {
-  local canon project cwd hash bank payload out id
+  local canon project cwd hash ctx bank payload out id
   canon=$(jq -cS -s "if length == 1 then .[0] | $VALID else empty end" <<<"$1" 2>/dev/null)
   [ -n "$canon" ] || { echo invalid; return; }
   project=$(jq -r .project <<<"$canon")
@@ -105,8 +105,10 @@ apply_line() {
   # mnemopi_remember takes its bank from the payload, then MNEMOPI_MCP_BANK, then
   # "default", and never from --cwd. Without the project's retainBank named here, every
   # pin lands in the global store. No bank means no store.
-  bank=$("$SM" context --cwd "$cwd" </dev/null 2>/dev/null \
-    | jq -er '.retainBank | strings | select(length > 0)' 2>/dev/null) || { echo failed; return; }
+  # Captured first so the context call's own exit status counts; piped straight into jq,
+  # only jq's status would.
+  ctx=$("$SM" context --cwd "$cwd" </dev/null 2>/dev/null) || { echo failed; return; }
+  bank=$(jq -er '.retainBank | strings | select(length > 0)' <<<"$ctx" 2>/dev/null) || { echo failed; return; }
   payload=$(jq -cn --argjson pin "$canon" --arg date "$TARGET_DATE" --arg bank "$bank" '{
     bank: $bank,
     content: ($pin.title + "\n\n" + $pin.body),
@@ -116,9 +118,17 @@ apply_line() {
   }')
   # </dev/null: the caller reads pins.jsonl on a separate fd, but a CLI that
   # reads stdin must never be able to swallow the pins after this one.
-  out=$("$SM" call mnemopi_remember "$payload" --cwd "$cwd" </dev/null) || { echo failed; return; }
+  # The exit status cannot decide this on its own. shared-memory exits 1 with status
+  # mutation_committed_journal_incomplete when the write committed but its journal append
+  # failed; that memory exists and has an id, and calling it a failure would store it
+  # again on the next run.
+  out=$("$SM" call mnemopi_remember "$payload" --cwd "$cwd" </dev/null)
   # An empty id is not a stored memory anyone can find; ledgered, it would block every retry.
-  id=$(jq -er 'select(.status == "stored") | .memory_id | strings | select(length > 0)' <<<"$out" 2>/dev/null) || { echo failed; return; }
+  id=$(jq -er 'select(.status == "stored" or .status == "mutation_committed_journal_incomplete")
+    | .memory_id | strings | select(length > 0)' <<<"$out" 2>/dev/null) || { echo failed; return; }
+  if [ "$(jq -r .status <<<"$out" 2>/dev/null)" = "mutation_committed_journal_incomplete" ]; then
+    echo "apply-pins: stored $id, but shared-memory reported mutation_committed_journal_incomplete" >&2
+  fi
   # The memory is already stored. A ledger row that cannot be written means the next run
   # stores it again, so this is its own outcome and never counts as applied. The id goes
   # to the run log so the duplicate can be found and removed.

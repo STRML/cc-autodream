@@ -2854,6 +2854,33 @@ test_pins_invalid_cwd_still_counts_toward_a_collision(){
   rm -rf "$root"
 }
 
+pins_tamper_case(){ # $1=mock mode that appends an unscanned session to the worklist files
+  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
+  local ca cb; ca=$(cd "$root/work-a" && pwd -P); cb=$(cd "$root/work-b" && pwd -P)
+  local bb; bb=$(encode_project "$cb")
+  mk_session_with_cwd "$root" s1 "$ca"
+  # A real session in another project, never enumerated (its mtime is outside the date).
+  mkdir -p "$root/projects/$bb"
+  local other="$root/projects/$bb/other.jsonl"
+  printf '{"type":"user","cwd":"%s","message":{"content":"x"}}\n' "$cb" > "$other"
+  export MOCK_MODE="$1" MOCK_FORGED_SESSION="$other" MOCK_PIN_PROJECT="$bb"
+  pins_run "$root"
+  unset MOCK_MODE MOCK_FORGED_SESSION MOCK_PIN_PROJECT
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored for a session the runner never enumerated ($1)"
+  assert_nogrep "$(fdir "$root")/pin-projects.tsv" "^$bb" "the injected project is not authorized ($1)"
+  rm -rf "$root"
+}
+
+test_pins_l2_cannot_widen_the_worklist(){
+  echo "# pins: L2 appending a session to sessions.txt authorizes no pin for it"
+  pins_tamper_case pins_tamper
+}
+
+test_pins_l1_cannot_widen_the_worklist(){
+  echo "# pins: L1 appending a session to sessions.txt authorizes no pin for it"
+  pins_tamper_case pins_tamper_l1
+}
+
 test_no_markdown_memory_writer_remains(){
   echo "# pins: the MEMORY.md writer and the claude-memory GC are gone"
   assert_nogrep "$REPO/prompts/PROMPT.md" 'touched-projects' "PROMPT.md has no touched-projects sidecar"
@@ -2871,6 +2898,10 @@ test_no_markdown_memory_writer_remains(){
   else
     no "PROMPT.md writes pins before the report (pins step line [$pin_step], report step line [$report_step])"
   fi
+  # L2 exits before any pin is applied, and the runner can still refuse one, so the report
+  # may only say a pin was proposed.
+  assert_nogrep "$REPO/prompts/PROMPT.md" 'stored by the runner after this report' "PROMPT.md does not tell the report to call a pin stored"
+  assert_grep   "$REPO/prompts/PROMPT.md" 'Pin proposed' "PROMPT.md marks pins as proposed"
 }
 
 # ---- run the new tests ----
@@ -2885,6 +2916,8 @@ test_pins_cwd_outside_its_bucket_authorizes_nothing
 test_pins_colliding_cwds_authorize_nothing
 test_pins_custom_slug_bucket_keeps_its_cwd
 test_pins_invalid_cwd_still_counts_toward_a_collision
+test_pins_l2_cannot_widen_the_worklist
+test_pins_l1_cannot_widen_the_worklist
 test_no_markdown_memory_writer_remains
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
