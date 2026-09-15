@@ -1,0 +1,60 @@
+# Route autodream memory pins to Mnemopi
+
+Decided in the 2026-09-15 morning triage of the 2026-09-14 report (open question 2).
+
+## Why
+
+Legacy Markdown memory is retired on this host. `autoMemoryEnabled` is false, `cc-simple-memory` is disabled, and the global `CLAUDE.md` calls `MEMORY.md` "a preserved migration source, not an active writer". L2 still pins into `~/.claude/projects/*/memory/MEMORY.md` and the runner still runs `claude-memory gc` over `touched-projects.txt`. A pin written there is read by nothing.
+
+Every harness on the host (Claude Code, OMP, Codex) reads one shared Mnemopi store. That removes the per-root expansion and the per-adapter GC that `docs/design/unify-harness-adapters-2026-08-23.md` specified, and it makes #52 moot.
+
+## Shape
+
+L2 keeps its tools for now. It writes pins to a file, and the runner applies them. Migration step 4 of the adapter design later changes only the transport (file to stdout block). The line format and the runner side stay.
+
+1. L2 writes `<findings-dir>/pins.jsonl`, one JSON object per line:
+
+   ```
+   {"project":"-Users-x-repo","title":"one line, at most 150 chars","body":"the full memory","kind":"correction"}
+   ```
+
+   `project` is the `project` value of a findings JSON from this run. `kind` is one of `correction`, `preference`, `fact`, `decision`. `body` is at most 4000 chars. No file means no pins.
+
+2. Before each L2 attempt, `run.sh` moves an existing `pins.jsonl` to `pins.jsonl.stale-<epoch>-<attempt>`. That file came from an earlier run or a dead attempt, and no complete report from this attempt stands behind it. A failed move clears `PINS_SAFE`, and the run stores no pins.
+
+3. After a complete report, and only when `CONSUME_SAFE=1` and `PINS_SAFE=1`, `run.sh` writes `<findings-dir>/pin-projects.tsv`: one `project<TAB>cwd` row per distinct project in this run's findings. It gets `cwd` from the `project` subcommand of each session's own adapter (looked up in `sessions-source.txt`), and leaves it empty when no session of that project resolves. Then it runs `bin/apply-pins.sh <findings-dir> <date>`. Pins do not depend on the date gate: an old-date rebuild is still a real lesson, and the ledger stops a rerun from writing twice.
+
+4. `bin/apply-pins.sh` validates each line, then calls
+   `shared-memory call mnemopi_remember '<json>' --cwd <cwd>` with content `title\n\nbody`, `source: cc-autodream`, `importance: 0.7`, and metadata `{kind, project, autodream_date, origin: "cc-autodream"}`. A call succeeds only on exit 0 with `status: "stored"` and a string `memory_id`. Each success appends `<sha1 of the canonical pin>\t<memory_id>` to `pins-applied.tsv`. Counters go to `pins-result.txt`. The script always exits 0 after arguments parse, because a pin must never cost a report.
+
+5. Deleted: the `touched-projects.txt` sidecar, the `claude-memory gc` block, `AUTODREAM_GC`, and every `MEMORY.md` write instruction in `PROMPT.md`. L2 may still read legacy `MEMORY.md` files as context.
+
+`SHARED_MEMORY_BIN` overrides the CLI path. The test suite pins it to a mock, so no test can write real memory.
+
+Known limit: the ledger stops the same pin text from landing twice. Reworded pins from a forced rebuild do land twice. Mnemopi's own review pass owns consolidation, as `claude-memory gc` did before.
+
+## Failure matrix
+
+Each row is a test in `tests/apply-pins.sh` (A) or `tests/run-all.sh` (R).
+
+| state or input | what the operation does | how it can fail | what the caller is told |
+| --- | --- | --- | --- |
+| A1 no `pins.jsonl` | nothing | none | `pins_total: 0`, no call, no ledger |
+| A2 `shared-memory` not found | applies nothing, leaves `pins.jsonl` | none | `pins_cli_missing: 1`, `pins_applied: 0`, no ledger |
+| A3 one valid pin | one remember call with resolved `--cwd` | none | `pins_applied: 1`, ledger row holds the memory id |
+| A4 rerun over the same pins | skips ledgered pins | double write | `pins_duplicate: 1`, no second call |
+| A5 unparseable line among valid ones | skips it, applies the rest | one bad line stops all | `pins_invalid: 1`, the valid pin applied |
+| A6 schema violations (no title, blank body, unknown kind, title over 150, newline in title) | skips each | a bad pin written | `pins_invalid: 5`, no call |
+| A7 blank lines | ignored | counted as invalid | not in `pins_total` |
+| A8 project not in this run | skips | memory for a project the run never saw | `pins_rejected_project: 1`, no call |
+| A9 project seen, cwd empty or missing dir | skips | memory scoped to the wrong project | `pins_no_cwd: 2`, no call |
+| A10 `pin-projects.tsv` missing | rejects every pin | writes without authorization | `pins_rejected_project` counts all |
+| A11 CLI exits nonzero | no ledger row | failure recorded as applied | `pins_failed: 1`; a later run retries and applies |
+| A12 CLI exits 0 with non-JSON output | no ledger row | garbage read as success | `pins_failed: 1` |
+| A13 quotes, backslash, `$(...)`, newline in body | passed through as JSON data | shell injection or mangled text | payload content byte-identical, no command ran |
+| A14 no arguments | usage | runs against `$PWD` | exit 2 |
+| R1 complete report plus pins | pins applied after the report | pins before report | ledger present, log line |
+| R2 truncated report plus pins | not applied | pins from a dead L2 | no call, no ledger |
+| R3 forced rebuild with an old `pins.jsonl`, new L2 writes none | old file moved aside, nothing applied | old pins applied again | `pins.jsonl.stale-*` exists, no call |
+| R4 prompt text | no `MEMORY.md` write or `touched-projects` directive | the old writer comes back | grep assertion |
+| R5 runner text | no `claude-memory` or `touched-projects` | the old GC comes back | grep assertion |

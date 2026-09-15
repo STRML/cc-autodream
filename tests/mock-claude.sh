@@ -14,6 +14,9 @@
 #                            aggregator dying to a mid-run sleep). L1 is unaffected.
 #                            Pair with AUTODREAM_L2_ATTEMPTS=1 so the test doesn't
 #                            sit through the retry loop.
+#   MOCK_MODE=pins           L1 writes a real session_path (like l1_badproject); L2
+#                            writes a complete report plus one pins.jsonl pin for proj-a.
+#   MOCK_MODE=pins_partial   as pins, but the report is truncated (like l2_partial).
 #   MOCK_CAPTURE_DIR=<dir>   dump each layer's stdin + argv to <dir>/l{1,2}-*.txt
 #                            so tests can assert on the exact prompt framing.
 #   MOCK_CALL_LOG=<file>     append the L1 output path for every invocation of
@@ -41,7 +44,7 @@ if printf '%s' "$line1" | grep -q '^Session transcript'; then
   write_badproject() { printf '{"session_path":"%s","project":"WRONG-PROJECT","turn_count":2,"tool_call_count":0,"tools_used":[],"skills_invoked":[],"models_used":[],"notable_initiatives":[],"findings":[]}' "$sess" > "$out"; }
   case "$mode" in
     l1_incomplete) : ;;                 # never write — simulates a worker that exits empty
-    l1_badproject) write_badproject ;;  # wrong project + real path — exercises normalization
+    l1_badproject|pins|pins_partial) write_badproject ;;  # wrong project + real path — exercises normalization
     l1_flaky)                           # fail the first dispatch per session, succeed on retry
       if [ -f "$out.attempt" ]; then write_findings; else : > "$out.attempt"; fi ;;
     *) write_findings ;;
@@ -58,10 +61,14 @@ else
     echo "mock: aggregator failed" >&2
     exit 1
   fi
+  if [ "$mode" = "pins" ] || [ "$mode" = "pins_partial" ]; then
+    fdir=$(printf '%s' "$line1" | sed 's/^Findings directory to aggregate (literal absolute path): //')
+    printf '{"project":"proj-a","title":"Mock lesson","body":"Mock evidence and rule.","kind":"correction"}\n' > "$fdir/pins.jsonl"
+  fi
   # l2_partial: a NON-EMPTY report with no open-questions marker — what a mid-write kill
   # leaves behind. `-s` cannot tell this from a good report, which is why run.sh checks
   # for the marker instead.
-  if [ "$mode" = "l2_partial" ]; then
+  if [ "$mode" = "l2_partial" ] || [ "$mode" = "pins_partial" ]; then
     printf '# Autodream — mock\n\n## Top patterns\n\n1. truncated mid-w' > "$rep"
     echo "mock: partial write"
     exit 0
