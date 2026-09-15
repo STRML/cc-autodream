@@ -98,6 +98,9 @@ apply_line() {
   # `cut` succeeds even when shasum dies, which leaves an empty hash. Ledgered, an empty
   # hash would make every later pin in the file look like a duplicate.
   [[ $hash =~ ^[0-9a-f]{40}$ ]] || { echo failed; return; }
+  # An unreadable ledger reads the same as "not stored yet" below, which would store the
+  # pin again. When duplicates cannot be ruled out, store nothing.
+  if [ -e "$LEDGER" ] && [ ! -r "$LEDGER" ]; then echo failed; return; fi
   if [ -f "$LEDGER" ] && cut -f1 "$LEDGER" | grep -qxF "$hash"; then echo duplicate; return; fi
   # mnemopi_remember takes its bank from the payload, then MNEMOPI_MCP_BANK, then
   # "default", and never from --cwd. Without the project's retainBank named here, every
@@ -114,7 +117,8 @@ apply_line() {
   # </dev/null: the caller reads pins.jsonl on a separate fd, but a CLI that
   # reads stdin must never be able to swallow the pins after this one.
   out=$("$SM" call mnemopi_remember "$payload" --cwd "$cwd" </dev/null) || { echo failed; return; }
-  id=$(jq -er 'select(.status == "stored") | .memory_id | strings' <<<"$out" 2>/dev/null) || { echo failed; return; }
+  # An empty id is not a stored memory anyone can find; ledgered, it would block every retry.
+  id=$(jq -er 'select(.status == "stored") | .memory_id | strings | select(length > 0)' <<<"$out" 2>/dev/null) || { echo failed; return; }
   # The memory is already stored. A ledger row that cannot be written means the next run
   # stores it again, so this is its own outcome and never counts as applied. The id goes
   # to the run log so the duplicate can be found and removed.

@@ -179,6 +179,21 @@ assert_eq "$(stat_of pins_failed)" "1" "pins_failed is 1"
 assert_eq "$(calls)" "0" "no remember call into a guessed bank"
 assert_eq "$(ledger_rows)" "0" "no ledger row"
 
+echo "# A19: the store reports success with an empty memory_id"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"
+MOCK_SM_MODE=emptyid run_ap
+assert_eq "$(stat_of pins_failed)" "1" "pins_failed is 1"
+assert_eq "$(stat_of pins_applied)" "0" "not counted as applied"
+assert_eq "$(ledger_rows)" "0" "no ledger row without a usable id"
+
+echo "# A20: a ledger that exists but cannot be read"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"
+printf 'somehash\tm0\n' > "$F/pins-applied.tsv"; chmod 000 "$F/pins-applied.tsv"
+run_ap
+chmod 600 "$F/pins-applied.tsv"
+assert_eq "$(stat_of pins_failed)" "1" "pins_failed is 1"
+assert_eq "$(calls)" "0" "nothing stored while duplicates cannot be ruled out"
+
 echo "# A14: no arguments"
 setup
 SHARED_MEMORY_BIN="$SM" bash "$AP" > "$T/out" 2>&1

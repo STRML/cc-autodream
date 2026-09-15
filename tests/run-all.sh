@@ -2643,10 +2643,18 @@ test_broken_shasum_never_collapses_sessions(){
 }
 
 # ---- Memory pins go to Mnemopi ----
-# Rows R1-R5 of the failure matrix in docs/plans/2026-09-15-mnemopi-pins.md.
+# Rows R1-R11 of the failure matrix in docs/plans/2026-09-15-mnemopi-pins.md.
 # apply-pins.sh's own rows live in tests/apply-pins.sh.
-mk_session_with_cwd(){ # $1=root $2=name $3=cwd
-  local f="$1/projects/proj-a/$2.jsonl"
+#
+# Sessions go in the bucket Claude would use for their cwd, because run.sh refuses a cwd
+# that does not encode to the bucket its session is stored in. lib-project.sh is the one
+# encoder, so the fixtures use it rather than a second copy of the rule.
+# shellcheck source=/dev/null
+. "$REPO/bin/lib-project.sh"
+mk_session_with_cwd(){ # $1=root $2=name $3=cwd [$4=bucket, default: the cwd's own]
+  local b="${4:-$(encode_project "$3")}"
+  mkdir -p "$1/projects/$b"
+  local f="$1/projects/$b/$2.jsonl"
   printf '%s\n' \
     "{\"type\":\"user\",\"cwd\":\"$3\",\"message\":{\"content\":\"start the task\"}}" \
     '{"type":"user","message":{"content":"keep going"}}' \
@@ -2664,11 +2672,12 @@ test_pins_applied_after_complete_report(){
   local root; root=$(setup_env); mkdir -p "$root/work"
   local cwd; cwd=$(cd "$root/work" && pwd -P)
   mk_session_with_cwd "$root" s1 "$cwd"
-  export MOCK_MODE=pins; pins_run "$root"; unset MOCK_MODE
+  local b; b=$(encode_project "$cwd")
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
   local d; d=$(fdir "$root")
   assert_eq "$(sm_calls "$root")" "1" "one remember call"
   assert_eq "$(jq -r .cwd "$root/sm-calls.jsonl" 2>/dev/null)" "$cwd" "scoped to the session's working directory"
-  assert_grep "$d/pin-projects.tsv" '^proj-a' "pin-projects.tsv lists the observed project"
+  assert_grep "$d/pin-projects.tsv" "^$b"$'\t'"$cwd\$" "pin-projects.tsv pairs the bucket with its cwd"
   assert_nonempty "$d/pins-applied.tsv" "the ledger records the stored pin"
   assert_grep "$root/run.out" 'memory pins:' "the run log reports the pin counts"
   rm -rf "$root"
@@ -2703,14 +2712,18 @@ test_pins_tab_in_cwd_never_splits_the_row(){
   echo "# pins: a working directory containing a tab never splits a pin-projects.tsv row"
   local root; root=$(setup_env)
   local dir="$root/wo"$'\t'"rk"; mkdir -p "$dir"
-  local f="$root/projects/proj-a/s1.jsonl"
+  local tabcwd; tabcwd=$(cd "$dir" && pwd -P)
+  # The bucket really is the tab cwd's own (the tab encodes to a dash), so the bucket check
+  # passes and only the tab guard stands between this row and a split.
+  local b; b=$(encode_project "$tabcwd"); mkdir -p "$root/projects/$b"
+  local f="$root/projects/$b/s1.jsonl"
   {
-    jq -cn --arg c "$(cd "$dir" && pwd -P)" '{type:"user",cwd:$c,message:{content:"start the task"}}'
+    jq -cn --arg c "$tabcwd" '{type:"user",cwd:$c,message:{content:"start the task"}}'
     printf '%s\n' '{"type":"user","message":{"content":"keep going"}}' \
       '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}'
   } > "$f"
   touch -t "$STAMP" "$f"
-  export MOCK_MODE=pins; pins_run "$root"; unset MOCK_MODE
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
   local d; d=$(fdir "$root")
   assert_file "$d/pin-projects.tsv" "pin-projects.tsv was written"
   assert_eq "$(awk -F'\t' 'NF != 2' "$d/pin-projects.tsv" 2>/dev/null | wc -l | tr -d ' ')" "0" "every row has exactly two fields"
@@ -2726,8 +2739,9 @@ test_pins_failed_authorization_rebuild_stores_nothing(){
   local d="$root/autodream/findings/$DATE"
   # A directory where the temp file goes makes the rebuild's redirect fail.
   mkdir -p "$d/pin-projects.tsv.tmp"
-  printf 'proj-a\t%s\n' "$cwd" > "$d/pin-projects.tsv"
-  export MOCK_MODE=pins; pins_run "$root"; unset MOCK_MODE
+  local b; b=$(encode_project "$cwd")
+  printf '%s\t%s\n' "$b" "$cwd" > "$d/pin-projects.tsv"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
   assert_eq "$(sm_calls "$root")" "0" "no remember call"
   assert_no_file "$d/pin-projects.tsv" "the old authorization list is gone"
   assert_grep "$root/run.out" 'could not write pin-projects.tsv' "the run log says why"
@@ -2736,19 +2750,22 @@ test_pins_failed_authorization_rebuild_stores_nothing(){
 
 test_pins_forged_session_path_authorizes_nothing(){
   echo "# pins: an L1 session_path naming another project's session authorizes no pin there"
-  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b" "$root/projects/proj-b"
-  mk_session_with_cwd "$root" s1 "$(cd "$root/work-a" && pwd -P)"
-  # proj-b's session exists and is readable, but its mtime is outside the target date,
+  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
+  local ca cb; ca=$(cd "$root/work-a" && pwd -P); cb=$(cd "$root/work-b" && pwd -P)
+  local ba bb; ba=$(encode_project "$ca"); bb=$(encode_project "$cb")
+  mk_session_with_cwd "$root" s1 "$ca"
+  # work-b's session exists and is readable, but its mtime is outside the target date,
   # so the run never triages it. Only a forged session_path can point at it.
-  local other="$root/projects/proj-b/other.jsonl"
-  printf '{"type":"user","cwd":"%s","message":{"content":"x"}}\n' "$(cd "$root/work-b" && pwd -P)" > "$other"
-  export MOCK_MODE=pins_forged MOCK_FORGED_SESSION="$other" MOCK_PIN_PROJECT=proj-b
+  mkdir -p "$root/projects/$bb"
+  local other="$root/projects/$bb/other.jsonl"
+  printf '{"type":"user","cwd":"%s","message":{"content":"x"}}\n' "$cb" > "$other"
+  export MOCK_MODE=pins_forged MOCK_FORGED_SESSION="$other" MOCK_PIN_PROJECT="$bb"
   pins_run "$root"
   unset MOCK_MODE MOCK_FORGED_SESSION MOCK_PIN_PROJECT
   local d; d=$(fdir "$root")
   assert_eq "$(sm_calls "$root")" "0" "no memory stored for the untriaged project"
-  assert_nogrep "$d/pin-projects.tsv" '^proj-b' "proj-b is not on the authorization list"
-  assert_grep   "$d/pin-projects.tsv" '^proj-a' "the triaged project is"
+  assert_nogrep "$d/pin-projects.tsv" "^$bb" "the untriaged project is not on the authorization list"
+  assert_grep   "$d/pin-projects.tsv" "^$ba" "the triaged project is"
   rm -rf "$root"
 }
 
@@ -2757,7 +2774,7 @@ test_pins_subagent_sessions_keep_their_project(){
   local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
   local p dir agent_b=""
   for p in a b; do
-    dir="$root/projects/proj-$p/uuid-$p/subagents"; mkdir -p "$dir"
+    dir="$root/projects/$(encode_project "$(cd "$root/work-$p" && pwd -P)")/uuid-$p/subagents"; mkdir -p "$dir"
     printf '%s\n' \
       "{\"type\":\"user\",\"cwd\":\"$(cd "$root/work-$p" && pwd -P)\",\"message\":{\"content\":\"start the task\"}}" \
       '{"type":"user","message":{"content":"keep going"}}' \
@@ -2765,12 +2782,42 @@ test_pins_subagent_sessions_keep_their_project(){
     touch -t "$STAMP" "$dir/agent-$p.jsonl"
     agent_b="$dir/agent-$p.jsonl"
   done
-  export MOCK_MODE=pins MOCK_PIN_PROJECT=proj-b; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local bb; bb=$(encode_project "$(cd "$root/work-b" && pwd -P)")
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$bb"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
   local d; d=$(fdir "$root")
   assert_eq "$(sm_calls "$root")" "1" "the proj-b pin was stored"
   assert_eq "$(jq -r .cwd "$root/sm-calls.jsonl" 2>/dev/null)" "$(cd "$root/work-b" && pwd -P)" "in proj-b's working directory"
   assert_nogrep "$d/pin-projects.tsv" '^subagents' "no shared subagents row on the authorization list"
-  assert_eq "$(jq -r .project "$d/$(hash_of "$agent_b").json" 2>/dev/null)" "proj-b" "findings normalization names the real project too"
+  assert_eq "$(jq -r .project "$d/$(hash_of "$agent_b").json" 2>/dev/null)" "$bb" "findings normalization names the real project too"
+  rm -rf "$root"
+}
+
+test_pins_cwd_outside_its_bucket_authorizes_nothing(){
+  echo "# pins: a session whose cwd does not encode to its bucket gives that project no cwd"
+  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
+  local ca cb; ca=$(cd "$root/work-a" && pwd -P); cb=$(cd "$root/work-b" && pwd -P)
+  local ba; ba=$(encode_project "$ca")
+  # Stored under work-a's bucket, but the transcript says it ran in work-b.
+  mk_session_with_cwd "$root" s1 "$cb" "$ba"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$ba"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "0" "no memory for work-a's project stored in work-b's bank"
+  assert_grep "$d/pin-projects.tsv" "^$ba"$'\t'"\$" "the bucket is listed with no cwd"
+  rm -rf "$root"
+}
+
+test_pins_colliding_cwds_authorize_nothing(){
+  echo "# pins: two working directories that encode to one bucket give it no cwd"
+  local root; root=$(setup_env); mkdir -p "$root/a_b" "$root/a-b"
+  local c1 c2; c1=$(cd "$root/a_b" && pwd -P); c2=$(cd "$root/a-b" && pwd -P)
+  local b; b=$(encode_project "$c1")
+  assert_eq "$(encode_project "$c2")" "$b" "the fixture really collides"
+  mk_session_with_cwd "$root" s1 "$c1"
+  mk_session_with_cwd "$root" s2 "$c2"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored in either directory's bank"
+  assert_grep "$d/pin-projects.tsv" "^$b"$'\t'"\$" "the bucket is listed with no cwd"
   rm -rf "$root"
 }
 
@@ -2791,6 +2838,8 @@ test_pins_tab_in_cwd_never_splits_the_row
 test_pins_failed_authorization_rebuild_stores_nothing
 test_pins_forged_session_path_authorizes_nothing
 test_pins_subagent_sessions_keep_their_project
+test_pins_cwd_outside_its_bucket_authorizes_nothing
+test_pins_colliding_cwds_authorize_nothing
 test_no_markdown_memory_writer_remains
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup

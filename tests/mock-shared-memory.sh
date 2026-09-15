@@ -6,6 +6,7 @@
 #   MOCK_SM_MODE=fail     print an error result and exit 1
 #   MOCK_SM_MODE=garbage  exit 0 with output that is not JSON
 #   MOCK_SM_MODE=nocontext  `context` fails; `call` is never reached
+#   MOCK_SM_MODE=emptyid  `call` reports stored with an empty memory_id
 #
 # `context --cwd DIR` answers {"retainBank":"bank-<basename DIR>"} and is not logged.
 
@@ -45,5 +46,6 @@ fi
 case "${MOCK_SM_MODE:-ok}" in
   fail)    printf '{"status":"error","message":"mock failure"}\n'; exit 1 ;;
   garbage) echo "not json"; exit 0 ;;
+  emptyid) printf '{"status":"stored","memory_id":""}\n' ;;
   *)       printf '{"status":"stored","memory_id":"m%s"}\n' "$n" ;;
 esac

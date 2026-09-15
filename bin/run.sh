@@ -1120,9 +1120,13 @@ report_complete() {
 # slim case a findings session_path is whatever the L1 model wrote, so reading it would let
 # a transcript name another project's session and authorize memory there. The project is
 # the session's parent directory, the same rule the findings normalization applies, and
-# the cwd comes from the session's own adapter via sessions-source.txt. A project keeps a
-# resolvable cwd when any of its sessions has one; with none, the column stays empty and
-# its pins are refused as no_cwd.
+# the cwd comes from the session's own adapter via sessions-source.txt.
+#
+# A cwd counts only when it encodes to the bucket its session is stored in, and a project
+# gets a cwd only when its sessions agree on exactly one. Anything else would store one
+# project's pin in another project's bank: a transcript sitting in a bucket its cwd does
+# not encode to, or two directories that encode to one bucket (/tmp/a_b and /tmp/a-b).
+# A project with no usable cwd keeps an empty column, and its pins are refused as no_cwd.
 write_pin_projects() {
   local dir=$1 s hash src proj cwd
   # An authorization list from an earlier run must never outlive a failed rebuild.
@@ -1147,8 +1151,13 @@ write_pin_projects() {
     # A tab or newline in a real directory name would split this row, and apply-pins.sh
     # would read a different directory out of it. Such a project gets no cwd at all.
     case $cwd in *$'\t'*|*$'\n'*) cwd="" ;; esac
+    if [ -n "$cwd" ] && [ "$(encode_project "$cwd")" != "$proj" ]; then cwd=""; fi
     printf '%s\t%s\n' "$proj" "$cwd"
-  done 3< "$dir/sessions.txt" | sort -t $'\t' -k1,1 -k2,2r | awk -F'\t' '!seen[$1]++' > "$dir/pin-projects.tsv.tmp" \
+  done 3< "$dir/sessions.txt" | awk -F'\t' '
+    !($1 in seen) { seen[$1] = 1; order[++n] = $1 }
+    $2 != "" && !(($1, $2) in pair) { pair[$1, $2] = 1; count[$1]++; cwd[$1] = $2 }
+    END { for (i = 1; i <= n; i++) { p = order[i]; printf "%s\t%s\n", p, (count[p] == 1 ? cwd[p] : "") } }
+  ' > "$dir/pin-projects.tsv.tmp" \
     && mv "$dir/pin-projects.tsv.tmp" "$dir/pin-projects.tsv"
 }
 
