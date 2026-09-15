@@ -2695,6 +2695,20 @@ for _suite in lib-project preflight adapters adapter-claude adapter-contract sli
   fi
 done
 
+# Cross-repo drift, last. It is not a unit test — it inspects the sibling checkout, so it
+# can only run on a machine holding both — but it belongs in the same command as the rest,
+# because the failure it catches is one no amount of in-repo testing can see. Both repos
+# passed their own suites for the ten nights this repo's bookmark walk was broken while
+# omp-autodream's identical copy had been fixed. SKIPPED (no sibling) exits 0 and says so;
+# drift exits 1 and counts as a failure here.
+echo
+echo "# cross-repo: shared files must not drift from the sibling autodream repo"
+if bash "$REPO/bin/check-shared-drift.sh"; then
+  ok "shared files match the sibling repo (or the check skipped and said so)"
+else
+  no "shared files have drifted from the sibling repo"
+fi
+
 echo
 echo "----------------------------------------"
 echo "passed: $pass   failed: $fail"
