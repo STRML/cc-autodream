@@ -10,6 +10,7 @@
 #   MOCK_SM_MODE=journal  `call` committed the write but its journal append failed:
 #                         status mutation_committed_journal_incomplete, a memory_id, exit 1
 #   MOCK_SM_MODE=ctxexit  `context` prints a valid retainBank but exits 1
+#   MOCK_SM_MODE=storedexit1  `call` prints a stored result with a memory_id but exits 1
 #
 # `context --cwd DIR` answers {"retainBank":"bank-<basename DIR>"} and is not logged.
 
@@ -51,6 +52,7 @@ case "${MOCK_SM_MODE:-ok}" in
   fail)    printf '{"status":"error","message":"mock failure"}\n'; exit 1 ;;
   garbage) echo "not json"; exit 0 ;;
   emptyid) printf '{"status":"stored","memory_id":""}\n' ;;
+  storedexit1) printf '{"status":"stored","memory_id":"m%s"}\n' "$n"; exit 1 ;;
   journal) printf '{"status":"mutation_committed_journal_incomplete","error":"mutation_committed_journal_incomplete","memory_id":"m%s"}\n' "$n"; exit 1 ;;
   *)       printf '{"status":"stored","memory_id":"m%s"}\n' "$n" ;;
 esac

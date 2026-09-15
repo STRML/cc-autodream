@@ -54,6 +54,7 @@ Each row is a test in `tests/apply-pins.sh` (A) or `tests/run-all.sh` (R).
 | A13 quotes, backslash, `$(...)`, newline in body | passed through as JSON data | shell injection or mangled text | payload content byte-identical, no command ran |
 | A14 no arguments | usage | runs against `$PWD` | exit 2 |
 | A21 store commits but its journal append fails (`mutation_committed_journal_incomplete`, a `memory_id`, exit 1) | counted as applied and ledgered, warning logged | read as failed, so every rerun stores the memory again | `pins_applied: 1`, ledger row, no second store on rerun |
+| A23 store call exits nonzero but prints `stored` with a `memory_id` | pin fails, no ledger row | a failed write is ledgered as applied and never retried | `pins_failed: 1`; only `mutation_committed_journal_incomplete` may pair a nonzero exit with a stored memory |
 | A22 `shared-memory context` exits nonzero but prints a bank | pin fails before any store | the `jq` stage's status hides the failure and the pin goes to that bank | `pins_failed: 1`, no call |
 | A15 store succeeds, ledger append fails | no applied count | counted as applied, silently stored again next run | `pins_unledgered: 1`, memory id in the run log |
 | A16 result file cannot be written, an old one exists | old counters removed first | the run log repeats an earlier run's counts | no stale `pins-result.txt`, exit 0 |

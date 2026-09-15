@@ -210,6 +210,13 @@ MOCK_SM_MODE=ctxexit run_ap
 assert_eq "$(stat_of pins_failed)" "1" "pins_failed is 1"
 assert_eq "$(calls)" "0" "no store with a bank from a failed context call"
 
+echo "# A23: the store call exits nonzero while printing a stored result"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"
+MOCK_SM_MODE=storedexit1 run_ap
+assert_eq "$(stat_of pins_failed)" "1" "a nonzero store is a failure"
+assert_eq "$(stat_of pins_applied)" "0" "not counted as applied"
+assert_eq "$(ledger_rows)" "0" "no ledger row, so a later run can retry"
+
 echo "# A14: no arguments"
 setup
 SHARED_MEMORY_BIN="$SM" bash "$AP" > "$T/out" 2>&1

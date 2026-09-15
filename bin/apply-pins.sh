@@ -88,7 +88,7 @@ project_cwd() {
 
 # $1=line -> prints one outcome: invalid rejected_project no_cwd duplicate failed unledgered applied
 apply_line() {
-  local canon project cwd hash ctx bank payload out id
+  local canon project cwd hash ctx bank payload out rc id
   canon=$(jq -cS -s "if length == 1 then .[0] | $VALID else empty end" <<<"$1" 2>/dev/null)
   [ -n "$canon" ] || { echo invalid; return; }
   project=$(jq -r .project <<<"$canon")
@@ -123,8 +123,13 @@ apply_line() {
   # failed; that memory exists and has an id, and calling it a failure would store it
   # again on the next run.
   out=$("$SM" call mnemopi_remember "$payload" --cwd "$cwd" </dev/null)
-  # An empty id is not a stored memory anyone can find; ledgered, it would block every retry.
-  id=$(jq -er 'select(.status == "stored" or .status == "mutation_committed_journal_incomplete")
+  rc=$?
+  # "stored" counts only with exit 0. mutation_committed_journal_incomplete is the one
+  # status that may pair a nonzero exit with a stored memory; anything else is a failure
+  # and stays retryable. An empty id is not a stored memory anyone can find; ledgered, it
+  # would block every retry.
+  id=$(jq -er --argjson rc "$rc" '
+    select((.status == "stored" and $rc == 0) or .status == "mutation_committed_journal_incomplete")
     | .memory_id | strings | select(length > 0)' <<<"$out" 2>/dev/null) || { echo failed; return; }
   if [ "$(jq -r .status <<<"$out" 2>/dev/null)" = "mutation_committed_journal_incomplete" ]; then
     echo "apply-pins: stored $id, but shared-memory reported mutation_committed_journal_incomplete" >&2
