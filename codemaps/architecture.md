@@ -36,12 +36,12 @@ bin/run.sh  TARGET_DATE
       │       reads all findings/<date>/*.json + changelog-window.md + run-stats.txt
       │       writes dreams/<date>.md; may write findings/<date>/pins.jsonl (proposed pins)
       │
+      ├─ pin-projects.tsv (project → cwd) + bin/apply-pins.sh → shared Mnemopi store
       ├─ notify.sh → open-questions inbox file ($AUTODREAM_OPEN, default `open`)
-      ├─ question-streaks.sh update → question-streaks.tsv
-      │     at AUTODREAM_QUESTION_ESCALATE_AT consecutive reports: a second banner
-      │     + findings/<date>/question-escalations.txt
-      │     (also called on the early no-sessions path, so a question-free night clears streaks)
-      └─ pin-projects.tsv (project → cwd) + bin/apply-pins.sh → shared Mnemopi store
+      └─ question-streaks.sh update → question-streaks.tsv
+            at AUTODREAM_QUESTION_ESCALATE_AT consecutive reports: a second banner
+            + findings/<date>/question-escalations.txt
+            (also called on the early no-sessions path, so a question-free night clears streaks)
 ```
 
 ## Files
