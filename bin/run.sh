@@ -1132,6 +1132,13 @@ write_pin_projects() {
     hash=$(session_hash "$s") || continue
     [ -f "$dir/$hash.json" ] || continue
     proj=$(basename "$(dirname "$s")")
+    # A subagent transcript is <bucket>/<session>/subagents/agent-*.jsonl, and its project
+    # is the bucket. Taken literally, every project's subagents would merge into one
+    # "subagents" row and one cwd would win for all of them. The findings normalization
+    # applies the same rule.
+    if [ "$proj" = "subagents" ]; then
+      proj=$(basename "$(dirname "$(dirname "$(dirname "$s")")")")
+    fi
     src=$(awk -F'\t' -v h="$hash" '$1 == h { print $2; exit }' "$dir/sessions-source.txt" 2>/dev/null)
     cwd=""
     if [ -n "$src" ]; then
@@ -1833,7 +1840,12 @@ for path in glob.glob(os.path.join(findings_dir, "*.json")):
     sp = data.get("session_path")
     if not sp:
         continue
-    proj = os.path.basename(os.path.dirname(sp))
+    parent = os.path.dirname(sp)
+    proj = os.path.basename(parent)
+    # A subagent transcript is <bucket>/<session>/subagents/agent-*.jsonl; its project is
+    # the bucket, not "subagents". write_pin_projects applies the same rule.
+    if proj == "subagents":
+        proj = os.path.basename(os.path.dirname(os.path.dirname(parent)))
     if proj and data.get("project") != proj:
         data["project"] = proj
         tmp = path + ".tmp"
@@ -2083,7 +2095,10 @@ PY
     # Moved, not deleted, so a pin that never reached Mnemopi stays readable. A failed
     # move clears PINS_SAFE for the run, for the same reason CONSUME_SAFE works that way.
     if [ -e "$FINDINGS_DIR/pins.jsonl" ]; then
-      if mv "$FINDINGS_DIR/pins.jsonl" "$FINDINGS_DIR/pins.jsonl.stale-$(date +%s)-$attempt"; then
+      # mktemp, not a timestamp: two forced rebuilds inside one second would otherwise pick
+      # the same name, and the second move would overwrite the first run's unapplied pins.
+      if STALE_PINS=$(mktemp "$FINDINGS_DIR/pins.jsonl.stale-XXXXXX") \
+         && mv -f "$FINDINGS_DIR/pins.jsonl" "$STALE_PINS"; then
         log "moved an earlier pins.jsonl aside before this attempt"
       else
         log "WARNING: could not move an earlier pins.jsonl aside; this run will not store memory pins"
@@ -2261,7 +2276,7 @@ PY
     elif [ -s "$PINS" ]; then
       bash "$APPLY_PINS" "$FINDINGS_DIR" "$TARGET_DATE" >> "$RUN_LOG" 2>&1 \
         || log "apply-pins exited non-zero (pins stay in $PINS)"
-      log "memory pins: $(tr '\n' ' ' < "$FINDINGS_DIR/pins-result.txt" 2>/dev/null)"
+      log "memory pins: $(tr '\n' ' ' 2>/dev/null < "$FINDINGS_DIR/pins-result.txt" || echo "counters unavailable")"
     fi
   else
     # Where the recoverable copies are was already logged above, in the one block that

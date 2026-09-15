@@ -162,7 +162,7 @@ Still read the field, for the one thing it proved good at: **compliance detectio
 
 - Write every pin to `<findings-dir>/pins.jsonl` in one Write call, one JSON object per line and nothing else in the file. Skip the file when there are no pins.
   `{"project":"-Users-x-repo","title":"One-line lesson","body":"Evidence and rule","kind":"correction"}`
-- `project` is the exact `project` value of a findings JSON in this directory. The runner refuses any other value, and it scopes the memory to that project's working directory.
+- `project` is the exact `project` value of a findings JSON in this directory. The runner refuses any other value, and it stores the memory in that project's own Mnemopi bank.
 - `title` is one line of at most 150 characters that states the lesson. `body` holds the rule and its quoted evidence, at most 4000 characters.
 - `kind` is `correction` (the usual one for autodream signal), `preference`, `fact`, or `decision`.
 - Never edit a legacy `MEMORY.md` file.

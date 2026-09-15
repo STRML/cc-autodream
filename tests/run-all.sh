@@ -2752,6 +2752,28 @@ test_pins_forged_session_path_authorizes_nothing(){
   rm -rf "$root"
 }
 
+test_pins_subagent_sessions_keep_their_project(){
+  echo "# pins: subagent transcripts belong to their own project, not a shared 'subagents' bucket"
+  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
+  local p dir agent_b=""
+  for p in a b; do
+    dir="$root/projects/proj-$p/uuid-$p/subagents"; mkdir -p "$dir"
+    printf '%s\n' \
+      "{\"type\":\"user\",\"cwd\":\"$(cd "$root/work-$p" && pwd -P)\",\"message\":{\"content\":\"start the task\"}}" \
+      '{"type":"user","message":{"content":"keep going"}}' \
+      '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}' > "$dir/agent-$p.jsonl"
+    touch -t "$STAMP" "$dir/agent-$p.jsonl"
+    agent_b="$dir/agent-$p.jsonl"
+  done
+  export MOCK_MODE=pins MOCK_PIN_PROJECT=proj-b; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "1" "the proj-b pin was stored"
+  assert_eq "$(jq -r .cwd "$root/sm-calls.jsonl" 2>/dev/null)" "$(cd "$root/work-b" && pwd -P)" "in proj-b's working directory"
+  assert_nogrep "$d/pin-projects.tsv" '^subagents' "no shared subagents row on the authorization list"
+  assert_eq "$(jq -r .project "$d/$(hash_of "$agent_b").json" 2>/dev/null)" "proj-b" "findings normalization names the real project too"
+  rm -rf "$root"
+}
+
 test_no_markdown_memory_writer_remains(){
   echo "# pins: the MEMORY.md writer and the claude-memory GC are gone"
   assert_nogrep "$REPO/prompts/PROMPT.md" 'touched-projects' "PROMPT.md has no touched-projects sidecar"
@@ -2768,6 +2790,7 @@ test_pins_stale_file_is_moved_aside
 test_pins_tab_in_cwd_never_splits_the_row
 test_pins_failed_authorization_rebuild_stores_nothing
 test_pins_forged_session_path_authorizes_nothing
+test_pins_subagent_sessions_keep_their_project
 test_no_markdown_memory_writer_remains
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup

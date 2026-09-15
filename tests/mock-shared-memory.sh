@@ -5,6 +5,23 @@
 #   MOCK_SM_MODE=ok       print a stored result (default)
 #   MOCK_SM_MODE=fail     print an error result and exit 1
 #   MOCK_SM_MODE=garbage  exit 0 with output that is not JSON
+#   MOCK_SM_MODE=nocontext  `context` fails; `call` is never reached
+#
+# `context --cwd DIR` answers {"retainBank":"bank-<basename DIR>"} and is not logged.
+
+if [ "${1:-}" = "context" ]; then
+  shift
+  cwd=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --cwd) cwd=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [ "${MOCK_SM_MODE:-ok}" = "nocontext" ] && { printf '{"status":"error"}\n'; exit 1; }
+  jq -cn --arg b "bank-$(basename "$cwd")" '{retainBank:$b}'
+  exit 0
+fi
 
 [ "${1:-}" = "call" ] || { echo "mock-shared-memory: unsupported: $*" >&2; exit 2; }
 tool=$2

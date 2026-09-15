@@ -66,7 +66,7 @@ c=$(head -1 "$T/calls.jsonl" 2>/dev/null)
 assert_eq "$(jq -r .tool <<<"$c" 2>/dev/null)" "mnemopi_remember" "calls mnemopi_remember"
 assert_eq "$(jq -r .cwd <<<"$c" 2>/dev/null)" "$T/work-a" "--cwd is the project's resolved dir"
 assert_eq "$(jq -r .payload.content <<<"$c" 2>/dev/null)" "$(printf 'Use trash over rm\n\nBody text')" "content is title, blank line, body"
-assert_eq "$(jq -r .payload.bank <<<"$c" 2>/dev/null)" "default" "default bank"
+assert_eq "$(jq -r .payload.bank <<<"$c" 2>/dev/null)" "bank-work-a" "the project's own bank, from shared-memory context"
 assert_eq "$(jq -r .payload.source <<<"$c" 2>/dev/null)" "cc-autodream" "source is cc-autodream"
 assert_eq "$(jq -r .payload.metadata.project <<<"$c" 2>/dev/null)" "proj-a" "metadata.project"
 assert_eq "$(jq -r .payload.metadata.kind <<<"$c" 2>/dev/null)" "correction" "metadata.kind"
@@ -154,6 +154,30 @@ assert_eq "$(calls)" "1" "the store call ran"
 assert_eq "$(stat_of pins_unledgered)" "1" "pins_unledgered is 1"
 assert_eq "$(stat_of pins_applied)" "0" "not counted as applied"
 grep -q 'stored m1 but could not write' "$T/out" && ok "the memory id is logged" || no "the memory id is logged"
+
+echo "# A16: a result file that cannot be written leaves no stale counters behind"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"
+printf 'pins_applied: 99\n' > "$F/pins-result.txt"
+mkdir "$F/pins-result.txt.tmp"
+run_ap
+assert_eq "$RC" "0" "exits 0"
+if grep -q 'pins_applied: 99' "$F/pins-result.txt" 2>/dev/null; then no "stale counters removed"; else ok "stale counters removed"; fi
+
+echo "# A17: a shasum that fails at runtime never writes an empty hash"
+setup; { pin proj-a "One" "Body"; pin proj-a "Two" "Body"; } > "$F/pins.jsonl"
+mkdir -p "$T/bin"; printf '#!/bin/bash\nexit 3\n' > "$T/bin/shasum"; chmod +x "$T/bin/shasum"
+PATH="$T/bin:$PATH" run_ap
+assert_eq "$(stat_of pins_duplicate)" "0" "no pin is mistaken for a duplicate"
+assert_eq "$(stat_of pins_failed)" "2" "both pins fail"
+assert_eq "$(calls)" "0" "nothing stored without a hash"
+assert_eq "$(ledger_rows)" "0" "no ledger row"
+
+echo "# A18: shared-memory context cannot name the project's bank"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"
+MOCK_SM_MODE=nocontext run_ap
+assert_eq "$(stat_of pins_failed)" "1" "pins_failed is 1"
+assert_eq "$(calls)" "0" "no remember call into a guessed bank"
+assert_eq "$(ledger_rows)" "0" "no ledger row"
 
 echo "# A14: no arguments"
 setup

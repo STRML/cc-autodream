@@ -43,6 +43,10 @@ LEDGER="$FINDINGS_DIR/pins-applied.tsv"
 RESULT="$FINDINGS_DIR/pins-result.txt"
 SM="${SHARED_MEMORY_BIN:-shared-memory}"
 
+# Counters from an earlier run of this date must never stand in for this run's if the
+# write below fails; run.sh logs whatever file it finds.
+rm -f "$RESULT"
+
 # A pin is valid when this filter prints it. Anything else, including a line
 # holding two JSON values, prints nothing.
 VALID='select(type == "object")
@@ -82,18 +86,26 @@ project_cwd() {
   printf '%s' "${row#y$'\t'}"
 }
 
-# $1=line -> prints one outcome: invalid rejected_project no_cwd duplicate failed applied
+# $1=line -> prints one outcome: invalid rejected_project no_cwd duplicate failed unledgered applied
 apply_line() {
-  local canon project cwd hash payload out id
+  local canon project cwd hash bank payload out id
   canon=$(jq -cS -s "if length == 1 then .[0] | $VALID else empty end" <<<"$1" 2>/dev/null)
   [ -n "$canon" ] || { echo invalid; return; }
   project=$(jq -r .project <<<"$canon")
   cwd=$(project_cwd "$project") || { echo rejected_project; return; }
   if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then echo no_cwd; return; fi
   hash=$(printf '%s' "$canon" | shasum -a 1 | cut -d' ' -f1)
+  # `cut` succeeds even when shasum dies, which leaves an empty hash. Ledgered, an empty
+  # hash would make every later pin in the file look like a duplicate.
+  [[ $hash =~ ^[0-9a-f]{40}$ ]] || { echo failed; return; }
   if [ -f "$LEDGER" ] && cut -f1 "$LEDGER" | grep -qxF "$hash"; then echo duplicate; return; fi
-  payload=$(jq -cn --argjson pin "$canon" --arg date "$TARGET_DATE" '{
-    bank: "default",
+  # mnemopi_remember takes its bank from the payload, then MNEMOPI_MCP_BANK, then
+  # "default", and never from --cwd. Without the project's retainBank named here, every
+  # pin lands in the global store. No bank means no store.
+  bank=$("$SM" context --cwd "$cwd" </dev/null 2>/dev/null \
+    | jq -er '.retainBank | strings | select(length > 0)' 2>/dev/null) || { echo failed; return; }
+  payload=$(jq -cn --argjson pin "$canon" --arg date "$TARGET_DATE" --arg bank "$bank" '{
+    bank: $bank,
     content: ($pin.title + "\n\n" + $pin.body),
     source: "cc-autodream",
     importance: 0.7,
