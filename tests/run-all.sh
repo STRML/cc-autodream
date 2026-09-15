@@ -2854,6 +2854,90 @@ test_pins_invalid_cwd_still_counts_toward_a_collision(){
   rm -rf "$root"
 }
 
+test_pins_unresolvable_cwd_still_counts_toward_a_collision(){
+  echo "# pins: a session whose cwd no longer resolves still makes its bucket ambiguous"
+  local root; root=$(setup_env); mkdir -p "$root/a_b" "$root/a-b"
+  local gone ok; gone=$(cd "$root/a_b" && pwd -P); ok=$(cd "$root/a-b" && pwd -P)
+  local b; b=$(encode_project "$ok")
+  assert_eq "$(encode_project "$gone")" "$b" "the fixture really collides"
+  mk_session_with_cwd "$root" s1 "$gone"
+  mk_session_with_cwd "$root" s2 "$ok"
+  # A removed worktree: the adapter cannot resolve this session's cwd any more, which
+  # was true of 8 of the 48 sessions on 2026-09-14.
+  rmdir "$gone"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored in the one cwd that still resolves"
+  assert_grep "$d/pin-projects.tsv" "^$b"$'\t'"\$" "the bucket is listed with no cwd"
+  rm -rf "$root"
+}
+
+test_pins_applied_before_notify(){
+  echo "# pins: pins are stored before notify.sh runs, so a notify step that never returns cannot lose them"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  local cwd; cwd=$(cd "$root/work" && pwd -P)
+  mk_session_with_cwd "$root" s1 "$cwd"
+  local d; d=$(fdir "$root")
+  # AUTODREAM_OPEN runs synchronously inside notify.sh, so a blocking editor command holds
+  # the run there. This stand-in records whether the pin was already stored when it ran.
+  printf '#!/bin/bash\n[ -s "%s/pins-applied.tsv" ] && touch "%s/notify-saw-pins"\nexit 0\n' "$d" "$root" > "$root/autodream/notify.sh"
+  chmod +x "$root/autodream/notify.sh"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$(encode_project "$cwd")"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  assert_eq "$(sm_calls "$root")" "1" "one remember call"
+  assert_file "$root/notify-saw-pins" "the pin was already stored when notify.sh ran"
+  rm -rf "$root"
+}
+
+test_pins_bucket_named_subagents_is_a_project(){
+  echo "# pins: a session directly inside a bucket named 'subagents' belongs to that bucket"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  local cwd; cwd=$(cd "$root/work" && pwd -P)
+  # A CLAUDE_CODE_PROJECT_DIR_NAME slug can be any name, including "subagents". The project
+  # is the directory directly under the session root, whatever it is called.
+  mk_session_with_cwd "$root" s1 "$cwd" "subagents"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT=subagents; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "1" "the pin for the 'subagents' bucket was stored"
+  assert_eq "$(jq -r .cwd "$root/sm-calls.jsonl" 2>/dev/null)" "$cwd" "in the session's working directory"
+  assert_eq "$(jq -r .project "$d/$(hash_of "$root/projects/subagents/s1.jsonl").json" 2>/dev/null)" "subagents" "findings normalization keeps the bucket name"
+  rm -rf "$root"
+
+  echo "# pins: a workflow agent transcript nested under subagents/workflows/ belongs to its bucket"
+  root=$(setup_env); mkdir -p "$root/work"
+  cwd=$(cd "$root/work" && pwd -P)
+  local b; b=$(encode_project "$cwd")
+  # Claude Code writes workflow agents one level deeper than plain subagents:
+  # <bucket>/<session>/subagents/workflows/wf_<id>/agent-*.jsonl (65 such files on this host).
+  local wf="$root/projects/$b/uuid-1/subagents/workflows/wf_abc"; mkdir -p "$wf"
+  printf '%s\n' \
+    "{\"type\":\"user\",\"cwd\":\"$cwd\",\"message\":{\"content\":\"start the task\"}}" \
+    '{"type":"user","message":{"content":"keep going"}}' \
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}' > "$wf/agent-1.jsonl"
+  touch -t "$STAMP" "$wf/agent-1.jsonl"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "1" "the pin for the workflow agent's bucket was stored"
+  assert_eq "$(jq -r .project "$d/$(hash_of "$wf/agent-1.jsonl").json" 2>/dev/null)" "$b" "findings normalization names the bucket"
+  rm -rf "$root"
+}
+
+test_pins_failed_move_aside_leaves_no_temp_file(){
+  echo "# pins: a pins.jsonl that cannot be moved aside leaves no empty stale file behind"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  mk_session_with_cwd "$root" s1 "$(cd "$root/work" && pwd -P)"
+  local d="$root/autodream/findings/$DATE"
+  # A directory at the pins path: mv cannot put it over the mktemp file. L2's Write tool can
+  # make this by writing any path under pins.jsonl/.
+  mkdir -p "$d/pins.jsonl/sub"
+  printf '# old\n<!-- autodream:open-questions=0 -->\n' > "$root/dreams/$DATE.md"
+  export MOCK_MODE=l1_badproject AUTODREAM_FORCE=1; pins_run "$root"; unset MOCK_MODE AUTODREAM_FORCE
+  local n; n=$(find "$d" -maxdepth 1 -name 'pins.jsonl.stale-*' | wc -l | tr -d ' ')
+  assert_eq "$n" "0" "no empty stale file left behind"
+  assert_grep "$root/run.out" 'could not move an earlier pins.jsonl aside' "the run log says the move failed"
+  assert_eq "$(sm_calls "$root")" "0" "nothing stored"
+  rm -rf "$root"
+}
+
 pins_tamper_case(){ # $1=mock mode that appends an unscanned session to the worklist files
   local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
   local ca cb; ca=$(cd "$root/work-a" && pwd -P); cb=$(cd "$root/work-b" && pwd -P)
@@ -2916,6 +3000,10 @@ test_pins_cwd_outside_its_bucket_authorizes_nothing
 test_pins_colliding_cwds_authorize_nothing
 test_pins_custom_slug_bucket_keeps_its_cwd
 test_pins_invalid_cwd_still_counts_toward_a_collision
+test_pins_unresolvable_cwd_still_counts_toward_a_collision
+test_pins_applied_before_notify
+test_pins_bucket_named_subagents_is_a_project
+test_pins_failed_move_aside_leaves_no_temp_file
 test_pins_l2_cannot_widen_the_worklist
 test_pins_l1_cannot_widen_the_worklist
 test_no_markdown_memory_writer_remains

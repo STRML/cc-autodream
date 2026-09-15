@@ -1112,58 +1112,77 @@ report_complete() {
   [ -s "$REPORT_PATH" ] && grep -q 'autodream:open-questions=' "$REPORT_PATH" 2>/dev/null
 }
 
-# $1=findings dir -> prints one project<TAB>cwd row per project this run enumerated. run.sh
+# $1=adapter name $2=session path -> the project the session belongs to: the directory
+# directly under whichever of the adapter's roots holds it. Claude nests transcripts at
+# several depths under one bucket (<bucket>/<session>.jsonl, <bucket>/<session>/subagents/
+# agent-*.jsonl, <bucket>/<session>/subagents/workflows/wf_*/agent-*.jsonl), and a bucket
+# can itself be named "subagents", so no rule based on directory names finds the bucket at
+# every depth. A session under none of the adapter's roots falls back to its parent dir.
+session_project() {
+  local r rest
+  if [ -n "$1" ]; then
+    while IFS= read -r r; do
+      r=${r%/}
+      [ -n "$r" ] || continue
+      case $2 in
+        "$r"/*/*) rest=${2#"$r"/}; printf '%s' "${rest%%/*}"; return 0 ;;
+      esac
+    done < <(adapter_roots "$1")
+  fi
+  basename "$(dirname "$2")"
+}
+
+# $1=findings dir -> one hash<TAB>project<TAB>cwd row per session in sessions.txt. run.sh
 # calls it before the first model call and holds the result in memory: L1 and L2 both run
 # with the Write tool and bypassPermissions, so every file this reads, sessions.txt and
 # sessions-source.txt included, is one they could rewrite before the pins are applied.
-# apply-pins.sh refuses a pin whose project is not listed and scopes the memory by the cwd.
+# The rows feed two consumers: pin_projects_from_rows (the pin authorization list) and the
+# findings project normalization, which looks each findings file up by its hash.
 #
 # It walks sessions.txt, the runner's own worklist, and never a findings JSON. Outside the
 # slim case a findings session_path is whatever the L1 model wrote, so reading it would let
-# a transcript name another project's session and authorize memory there. The project is
-# the session's parent directory, the same rule the findings normalization applies, and
-# the cwd comes from the session's own adapter via sessions-source.txt.
+# a transcript name another project's session and authorize memory there.
 #
-# A project gets a cwd only when its sessions agree on exactly one usable cwd. A cwd is
-# unusable when it holds a tab or newline, or when its bucket is an encoded path (starts
-# with "-") that the cwd does not encode to. Slug buckets from CLAUDE_CODE_PROJECT_DIR_NAME
-# (owner-repo) skip that encoding check, because no cwd ever encodes to a slug. An unusable
-# cwd is recorded as "?" (an adapter cwd is always absolute, so it can never be "?") and
-# still counts as a distinct cwd, so it makes the bucket ambiguous rather than vanishing.
-# Anything looser would store one project's pin in another project's bank: a transcript
-# sitting in a bucket its cwd does not encode to, or two directories that encode to one
-# bucket (/tmp/a_b and /tmp/a-b). A project with no usable cwd keeps an empty column, and
-# its pins are refused as no_cwd.
-build_pin_projects() {
+# A cwd is unusable, and recorded as "?", when the adapter cannot resolve it (usually a
+# removed worktree), when it holds a tab or newline, or when its bucket is an encoded path
+# (starts with "-") that the cwd does not encode to. Slug buckets from
+# CLAUDE_CODE_PROJECT_DIR_NAME (owner-repo) skip that encoding check, because no cwd ever
+# encodes to a slug. An adapter cwd is always absolute, so it can never be "?" itself.
+session_rows() {
   local dir=$1 s hash src proj cwd
   # A missing worklist would otherwise read as "no projects" and refuse every pin silently.
   [ -r "$dir/sessions.txt" ] || return 1
   while IFS= read -r s <&3; do
     [ -n "$s" ] || continue
     hash=$(session_hash "$s") || continue
-    proj=$(basename "$(dirname "$s")")
-    # A subagent transcript is <bucket>/<session>/subagents/agent-*.jsonl, and its project
-    # is the bucket. Taken literally, every project's subagents would merge into one
-    # "subagents" row and one cwd would win for all of them. The findings normalization
-    # applies the same rule.
-    if [ "$proj" = "subagents" ]; then
-      proj=$(basename "$(dirname "$(dirname "$(dirname "$s")")")")
-    fi
     src=$(awk -F'\t' -v h="$hash" '$1 == h { print $2; exit }' "$dir/sessions-source.txt" 2>/dev/null)
-    cwd=""
+    proj=$(session_project "$src" "$s")
+    case $proj in ''|*$'\t'*|*$'\n'*) continue ;; esac
+    cwd="?"
     if [ -n "$src" ]; then
-      cwd=$(adapter_run "$src" project "$s" 2>/dev/null </dev/null) || cwd=""
+      cwd=$(adapter_run "$src" project "$s" 2>/dev/null </dev/null) || cwd="?"
+      [ -n "$cwd" ] || cwd="?"
     fi
-    # A tab or newline in a real directory name would split this row, and apply-pins.sh
-    # would read a different directory out of it. Such a project gets no cwd at all.
     case $cwd in *$'\t'*|*$'\n'*) cwd="?" ;; esac
     case $proj in
-      -*) if [ -n "$cwd" ] && [ "$cwd" != "?" ] && [ "$(encode_project "$cwd")" != "$proj" ]; then cwd="?"; fi ;;
+      -*) if [ "$cwd" != "?" ] && [ "$(encode_project "$cwd")" != "$proj" ]; then cwd="?"; fi ;;
     esac
-    printf '%s\t%s\n' "$proj" "$cwd"
-  done 3< "$dir/sessions.txt" | awk -F'\t' '
-    !($1 in seen) { seen[$1] = 1; order[++n] = $1 }
-    $2 != "" && !(($1, $2) in pair) { pair[$1, $2] = 1; count[$1]++; cwd[$1] = $2 }
+    printf '%s\t%s\t%s\n' "$hash" "$proj" "$cwd"
+  done 3< "$dir/sessions.txt"
+}
+
+# stdin: session_rows output -> one project<TAB>cwd row per project. A project gets a cwd
+# only when all its sessions agree on one usable cwd. An unusable "?" still counts as a
+# distinct cwd, so it makes the project ambiguous rather than vanishing. Anything looser
+# stores one project's pin in another project's bank: a transcript sitting in a bucket its
+# cwd does not encode to, or two directories that encode to one bucket (/tmp/a_b and
+# /tmp/a-b). A project with no usable cwd keeps an empty column, and apply-pins.sh refuses
+# its pins as no_cwd.
+pin_projects_from_rows() {
+  awk -F'\t' '
+    NF < 3 { next }
+    !($2 in seen) { seen[$2] = 1; order[++n] = $2 }
+    !(($2, $3) in pair) { pair[$2, $3] = 1; count[$2]++; cwd[$2] = $3 }
     END {
       for (i = 1; i <= n; i++) {
         p = order[i]
@@ -1173,7 +1192,7 @@ build_pin_projects() {
   '
 }
 
-# $1=findings dir -> writes the rows build_pin_projects produced before L1 ran to
+# $1=findings dir -> writes the rows pin_projects_from_rows produced before L1 ran to
 # pin-projects.tsv. The old file goes first, so an authorization list from an earlier run
 # never outlives a failed write. Fails when the build itself failed.
 write_pin_projects() {
@@ -1712,7 +1731,9 @@ EOF
   # held in this shell's memory until the pins are applied after the report.
   PIN_PROJECTS_BUILT=0
   PIN_PROJECTS_TSV=""
-  if PIN_PROJECTS_TSV=$(build_pin_projects "$FINDINGS_DIR"); then
+  SESSION_ROWS=""
+  if SESSION_ROWS=$(session_rows "$FINDINGS_DIR") \
+     && PIN_PROJECTS_TSV=$(printf '%s\n' "$SESSION_ROWS" | pin_projects_from_rows); then
     PIN_PROJECTS_BUILT=1
   else
     log "WARNING: could not build the pin authorization list; this run will not store memory pins"
@@ -1867,31 +1888,30 @@ EOF
   # SESSION_TRIAGE.md asks the L1 worker to emit "project" by hand, and haiku does it
   # nondeterministically: one run surfaced the SAME -Users-sean dir as "-Users-sean",
   # "Users-sean" (dash stripped), and even the bare session UUID (filename, not dir).
-  # That splinters L2's per-project grouping. The encoded project dir is just the parent
-  # directory of the session JSONL, so derive it from each findings JSON's own
-  # session_path (already rewritten back to the real session after any slimming) and
-  # overwrite whatever the model guessed. Deterministic, idempotent on re-runs.
+  # That splinters L2's per-project grouping. The project is the bucket the runner already
+  # computed for each session in SESSION_ROWS (see session_rows), before L1 ran. Each findings
+  # file is looked up by its own name, the session hash, never by the session_path the model
+  # wrote, and its project field is overwritten. Deterministic, idempotent on re-runs.
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$FINDINGS_DIR" <<'PY'
+    SESSION_ROWS="$SESSION_ROWS" python3 - "$FINDINGS_DIR" <<'PY'
 import glob, json, os, sys
 findings_dir = sys.argv[1]
+projects = {}
+for row in os.environ.get("SESSION_ROWS", "").splitlines():
+    parts = row.split("\t")
+    if len(parts) >= 2 and parts[1]:
+        projects[parts[0]] = parts[1]
 fixed = 0
 for path in glob.glob(os.path.join(findings_dir, "*.json")):
+    proj = projects.get(os.path.basename(path)[:-len(".json")])
+    if not proj:
+        continue
     try:
         with open(path) as f:
             data = json.load(f)
     except (ValueError, OSError):
         continue  # malformed JSON: leave for the triage-failures report section
-    sp = data.get("session_path")
-    if not sp:
-        continue
-    parent = os.path.dirname(sp)
-    proj = os.path.basename(parent)
-    # A subagent transcript is <bucket>/<session>/subagents/agent-*.jsonl; its project is
-    # the bucket, not "subagents". write_pin_projects applies the same rule.
-    if proj == "subagents":
-        proj = os.path.basename(os.path.dirname(os.path.dirname(parent)))
-    if proj and data.get("project") != proj:
+    if data.get("project") != proj:
         data["project"] = proj
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
@@ -2148,6 +2168,10 @@ PY
       else
         log "WARNING: could not move an earlier pins.jsonl aside; this run will not store memory pins"
         PINS_SAFE=0
+        # The empty mktemp placeholder is litter once the move fails, one per attempt.
+        if [ -n "${STALE_PINS:-}" ] && [ -f "$STALE_PINS" ] && [ ! -s "$STALE_PINS" ]; then
+          rm -f "$STALE_PINS"
+        fi
       fi
     fi
     # Same literal-path framing and brace-group assembly as L1 (see the L1 worker
@@ -2247,6 +2271,33 @@ PY
   if [ -f "$REPORT_PATH" ]; then
     log "report bytes: $(wc -c < "$REPORT_PATH" | tr -d ' ')"
 
+    # ---- Memory pins: L2's pins.jsonl into Mnemopi ----
+    # First step after the report, ahead of notify.sh and the consume steps. notify.sh runs
+    # AUTODREAM_OPEN synchronously, so a blocking editor command holds the run there; if
+    # the run dies in that wait, the next run skips the date and pins placed after it are
+    # never stored.
+    #
+    # Pins need a complete report from THIS run behind them: report_complete, CONSUME_SAFE
+    # (cleared when the old report could not be moved aside), and PINS_SAFE (cleared when an
+    # earlier pins.jsonl could not be moved aside). They skip the consume date gate on
+    # purpose: an old-date rebuild still teaches something real, and apply-pins.sh's ledger
+    # stops a rerun from storing the same pin twice.
+    #
+    # pin-projects.tsv is the authorization list. It holds only projects this run
+    # triaged, each with the working directory its session's adapter resolved, so a pin
+    # naming any other project is refused and memory is never scoped by a path the model
+    # wrote. Plan and failure matrix: docs/plans/2026-09-15-mnemopi-pins.md.
+    PINS="$FINDINGS_DIR/pins.jsonl"
+    if [ -s "$PINS" ] && { ! report_complete || [ "${CONSUME_SAFE:-1}" != "1" ] || [ "$PINS_SAFE" != "1" ]; }; then
+      log "skipping memory pins: no complete report from this run stands behind $PINS"
+    elif [ -s "$PINS" ] && ! write_pin_projects "$FINDINGS_DIR"; then
+      log "skipping memory pins: could not write pin-projects.tsv, so no project is authorized"
+    elif [ -s "$PINS" ]; then
+      bash "$APPLY_PINS" "$FINDINGS_DIR" "$TARGET_DATE" >> "$RUN_LOG" 2>&1 \
+        || log "apply-pins exited non-zero (pins stay in $PINS)"
+      log "memory pins: $(tr '\n' ' ' 2>/dev/null < "$FINDINGS_DIR/pins-result.txt" || echo "counters unavailable")"
+    fi
+
     # ---- Drop open-questions file into Sublime (no-op if zero questions) ----
     if [ -x "$AUTODREAM_DIR/notify.sh" ]; then
       log "writing open-questions inbox file..."
@@ -2300,28 +2351,6 @@ PY
       else
         log "target date $TARGET_DATE is not $NORMAL_TARGET_DATE (today's normal nightly date); skipping vault-notes archive and x-bookmark mark-read so today's inbox/unread bookmarks aren't consumed by this reprocess (still collected as L2 context)"
       fi
-    fi
-
-    # ---- Memory pins: L2's pins.jsonl into Mnemopi ----
-    # Pins need a complete report from THIS run behind them, so they share the consume
-    # gates above (report_complete, CONSUME_SAFE) plus PINS_SAFE, which a failed
-    # move-aside of an earlier pins.jsonl clears. They skip the date gate on purpose: an
-    # old-date rebuild still teaches something real, and apply-pins.sh's ledger stops a
-    # rerun from storing the same pin twice.
-    #
-    # pin-projects.tsv is the authorization list. It holds only projects this run
-    # triaged, each with the working directory its session's adapter resolved, so a pin
-    # naming any other project is refused and memory is never scoped by a path the model
-    # wrote. Plan and failure matrix: docs/plans/2026-09-15-mnemopi-pins.md.
-    PINS="$FINDINGS_DIR/pins.jsonl"
-    if [ -s "$PINS" ] && { ! report_complete || [ "${CONSUME_SAFE:-1}" != "1" ] || [ "$PINS_SAFE" != "1" ]; }; then
-      log "skipping memory pins: no complete report from this run stands behind $PINS"
-    elif [ -s "$PINS" ] && ! write_pin_projects "$FINDINGS_DIR"; then
-      log "skipping memory pins: could not write pin-projects.tsv, so no project is authorized"
-    elif [ -s "$PINS" ]; then
-      bash "$APPLY_PINS" "$FINDINGS_DIR" "$TARGET_DATE" >> "$RUN_LOG" 2>&1 \
-        || log "apply-pins exited non-zero (pins stay in $PINS)"
-      log "memory pins: $(tr '\n' ' ' 2>/dev/null < "$FINDINGS_DIR/pins-result.txt" || echo "counters unavailable")"
     fi
   else
     # Where the recoverable copies are was already logged above, in the one block that

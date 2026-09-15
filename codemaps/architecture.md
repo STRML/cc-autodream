@@ -44,7 +44,7 @@ bin/run.sh  TARGET_DATE
 
 | File | Role |
 |---|---|
-| `bin/run.sh` | orchestrator: guard, preflight, adapter load, enumerate+filter, L1 retry loop, changelog, L2 retry loop, notify, pin apply. Every fatal goes through `log_fatal`/`fatal_exit` (marker + banner) |
+| `bin/run.sh` | orchestrator: guard, preflight, adapter load, enumerate+filter, L1 retry loop, changelog, L2 retry loop, pin apply, notify. Every fatal goes through `log_fatal`/`fatal_exit` (marker + banner) |
 | `adapters/<name>/` | one harness. `manifest.json` (DATA — jq-parsed, never sourced) + `adapter.sh` + `facts.md`. Subcommands: `enumerate normalize project memory-root stats slim is-self skills-inventory` (`memory-root` is unused since pins moved to Mnemopi); contract table in `docs/design/unify-harness-adapters-2026-08-23.md`. `_fixture` is test-only (leading `_` excludes it) |
 | `bin/adapters.sh` | adapter discovery + dispatch. Identity is the DIRECTORY BASENAME (dispatch builds a path from it), must agree with `manifest.name`; realpath containment; refusals go to a file because `adapters_list` runs inside `$(...)` |
 | `bin/lib-project.sh` | the canonical project key every adapter must agree on: `encode_project` (everything outside `[A-Za-z0-9-]` → `-`), `canonical_project` (realpath first), `session_hash` (12 lowercase hex, validated) |
