@@ -1,6 +1,6 @@
 # Autodream — Layer 2 (aggregator)
 
-You are running headlessly at ~3am. Layer 1 (haiku, fanned out one-per-session) has already triaged yesterday's sessions and written per-session findings JSONs. Your job: aggregate them into a coherent, actionable report and update memory where high-confidence patterns warrant it.
+You are running headlessly at ~3am. Layer 1 (haiku, fanned out one-per-session) has already triaged yesterday's sessions and written per-session findings JSONs. Your job: aggregate them into a coherent, actionable report and propose memory pins where high-confidence patterns warrant it.
 
 ## Inputs (first two lines of this prompt)
 
@@ -18,7 +18,7 @@ All other inputs you need (treat `<findings-dir>` below as the literal path from
 - **Per-session findings JSONs**: every file matching `<findings-dir>/*.json` except `*.stats.json` (Glob it) is one session's structured output (schema in `SESSION_TRIAGE.md`). Read them all.
 - **Per-session stderr**: `<findings-dir>/*.json.err` if a triage call failed — note in your report.
 - **Installed skills**: walk `~/.claude/skills/`, `~/.claude/plugins/*/skills/`, and project `.claude/skills/`. Each has frontmatter `description`/triggers. Use this to validate `missed_skill` findings (skill exists? trigger matches?).
-- **Memory files**: `~/.claude/projects/*/memory/MEMORY.md` (one per project — may not exist).
+- **Legacy memory files**: `~/.claude/projects/*/memory/MEMORY.md` (one per project, may not exist). Read-only context. New memory goes through `pins.jsonl` (see Memory pins), never into these files.
 - **Global rules**: `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md`, and the lazy-loaded
   playbooks in `~/.claude/docs/guardrails/*.md` (dev-workflow, advisor-mode,
   failure-discipline, pr-workflow, claude-code-lore). The guardrails moved out of `rules/`
@@ -63,10 +63,10 @@ For each, ordered by (count × max-severity) descending, cap at 10:
 - **Count**: how many sessions exhibited it
 - **Severity**: high | medium | low (worst seen)
 - **Examples**: 1–3 verbatim evidence excerpts with `session_path` references
-- **Proposed action**: concrete sentence — skill to invoke, allowlist line, memory entry to add, or CLAUDE.md edit
+- **Proposed action**: concrete sentence — skill to invoke, allowlist line, memory pin to propose, or CLAUDE.md edit
 - **Grounded against**: the `file:line` you read to verify the proposal isn't already done or already-rejected, plus what it showed — or "n/a — no concrete artifact". A proposal that touches a concrete artifact with no grounding entry must not ship.
 - **Confidence**: high | medium | low
-- **Auto-applied**: yes/no (and a link to the file you edited)
+- **Pin proposed**: yes/no (the pin's title when yes; see Memory pins)
 
 **Grounding gate (do this before writing any Proposed action that edits a concrete artifact — a hook script, `settings.json`, a skill, `CLAUDE.md`, a rule):** Read that artifact in full first, *including its code comments*. The artifact you must read is the **edit target** — the exact file your proposal would change — plus, for `missed_skill` and other behavioral findings, the project `CLAUDE.md` (and `.claude/rules/*`) governing that behavior. Reading only a *related* file does not satisfy the gate: a 2026-07-06 report grounded a `missed_skill` proposal against the skill's own frontmatter, never read the project `CLAUDE.md` it proposed to edit, and contradicted a protocol documented right there in the target. If the target documents the flagged behavior as intentional protocol, the finding is a false positive — drop it or restate it as "working as documented". If the change is already implemented, drop the finding or restate it as "already addressed" citing the `file:line`. If the file's comments show a prior attempt was tried and reverted, your proposal must engage with that recorded reason rather than repeat the original idea. This is `verify-spec-against-code` applied to your own recommendation — the report prescribes that check for the sessions it reviews, so it must hold itself to the same bar. Record the result in the **Grounded against** field above.
 
@@ -150,9 +150,9 @@ An open question that would take the user ten seconds to answer with "that alrea
 N is how many questions survived the triviality gate above. Count the questions you are actually asking the user to decide, not the notes you kept for context: a section that says "None that clear the triviality gate" followed by three explanatory bullets is `N=0`, because none of those bullets is a question. `review.sh` reads this marker to decide whether the morning triage session is worth opening at all, so an inflated N costs a pointless session and a deflated N silently buries a real question.
 ```
 
-### 2. Memory updates (high-confidence only)
+### 2. Memory pins (high-confidence only)
 
-For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you MAY edit the relevant project's `MEMORY.md`:
+For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you MAY propose a memory pin. You do not write memory yourself. You write pins to a file, and after your report is complete the runner tries to store each one in Mnemopi, the shared memory every harness on this host reads.
 
 **Pilot quarantine — LIFTED for `buggy_code_shipped` on 2026-07-28.** Its pilot week ran 2026-07-20…07-27: 28 sessions emitted the category and none was dropped as a false positive, so it is now eligible for the normal memory-write gate above like any other category. (The one date that looked like a mass discard was a single code-review fanout, `wf_e1571958-08b`, which L2 correctly collapsed into one aggregate pattern rather than 9 separate ones.)
 
@@ -160,15 +160,14 @@ For findings with `confidence: high` AND `count >= 2` AND `severity: high`, you 
 
 Still read the field, for the one thing it proved good at: **compliance detection.** When a session was given an explicit instruction and the transcript shows it wasn't followed, that is a `compliance_failure` — report it as such, citing the instruction. This is the routing that surfaced "`verify-spec-against-code` not invoked by verifier subagents despite an explicit brief instruction", and it only works because the field records what was asked. The field is also legitimate colour for Per-project notes. If an instruction is already recorded in the relevant `MEMORY.md` or `~/.claude/CLAUDE.md` and was ignored, that is likewise a `compliance_failure`, not a memory candidate.
 
-- Project memory paths follow `~/.claude/projects/<encoded-cwd>/memory/MEMORY.md`.
-- The encoded-cwd comes from `session.project` in the JSON or by inspecting the session path.
-- **Always 📌-pin any entry you add.** A separate memory-consolidation pass (Claude Code's built-in auto-dream, or the `cc-simple-memory` plugin's `gc-memory.sh`) prunes non-pinned entries on a different schedule — the 📌 marker is the contract that keeps cc-autodream's signal from being garbage-collected before the human sees it.
-- **Never delete or rewrite an existing 📌 entry** unless you are explicitly replacing a stale autodream pin with a newer one on the same topic. Memory hygiene (consolidation, pruning, contradiction resolution) is the consolidator's job, not ours.
-- Keep each file ≤200 lines AND ≤25,000 bytes — these are the same caps Anthropic's auto-dream enforces (`MAX_ENTRYPOINT_LINES = 200`, `MAX_ENTRYPOINT_BYTES = 25_000` in `src/memdir/memdir.ts`). If you'd overflow, remove the oldest *non-pinned* entry only.
-- Each MEMORY.md line is an **index entry**, not a full memory body. Hold it under ~150 characters: one-line pointer that can include a markdown link to a topic file. (claude-dream and Anthropic's auto-dream both groom on this contract — staying within it makes your pins survive their passes.)
-- When you write a longer-form memory body, put it in a topic file alongside MEMORY.md with frontmatter `type: feedback` (or `project` / `reference` where applicable — match Anthropic's four-type taxonomy: `user`, `feedback`, `project`, `reference`). cc-autodream's signal almost always maps to `type: feedback`.
-- Record EVERY edit in the report's "Auto-applied: yes" lines. Before writing "Auto-applied: yes", Read the edited file back and confirm the change is on disk. Never claim an edit you have not verified, and never reference a topic file or `[[pin]]` you did not just write or confirm exists — a past report cited a pin that was never written.
-- **Sidecar for the GC step**: every time you write to a project's `MEMORY.md`, append the project's encoded directory name (the `<encoded-cwd>` segment of the path) as a new line in a `touched-projects.txt` file inside the findings directory (the literal path from line 1). The runner reads this file after you exit and triggers `claude-memory gc` for each listed project so the consolidator can resettle around your new pins. If you didn't touch any project memory, don't create the file.
+- Write every pin to `<findings-dir>/pins.jsonl` in one Write call, one JSON object per line and nothing else in the file. Skip the file when there are no pins.
+  `{"project":"-Users-x-repo","title":"One-line lesson","body":"Evidence and rule","kind":"correction"}`
+- `project` is the exact `project` value of a findings JSON in this directory. The runner refuses any other value, and it stores the memory in that project's own Mnemopi bank.
+- `title` is one line of at most 150 characters that states the lesson. `body` holds the rule and its quoted evidence, at most 4000 characters.
+- `kind` is `correction` (the usual one for autodream signal), `preference`, `fact`, or `decision`.
+- Never edit a legacy `MEMORY.md` file.
+- In the report, mark each pattern you wrote a pin for "Pin proposed: <title>". Never say a pin is stored and never claim a memory id. The runner applies pins after you exit, can still refuse one (a project it did not authorize, no usable working directory, a failed store), and records what happened in `pins-result.txt`.
+- Never mark a pin proposed unless its line is in the `pins.jsonl` you just wrote. A past report cited a pin that was never written.
 
 ### 3. Anything you may NOT edit
 
@@ -183,9 +182,9 @@ Still read the field, for the one thing it proved good at: **compliance detectio
 2. Build an in-memory aggregate: group findings by category, count, sort by (count × severity). Exclude `*.stats.json` sidecars from the findings aggregate. Also sum each session's `compliance_markers` counts (`RETRY-BUDGET`, `FETCH-PIVOT`, `DELEGATED`, `DIRECT-OK`) when present — a finding missing the newer keys defaults them to 0 (older findings predate them). RETRY-BUDGET/FETCH-PIVOT measure the retry-budget rules working as designed. (One-time discontinuity: these two switched from substring to line-start counting on 2026-07-20, so totals compared across that date may shift once — don't flag that shift as drift.) DELEGATED/DIRECT-OK measure advisor-mode delegation compliance (`~/.claude/docs/guardrails/advisor-mode.md`; it lived at `~/.claude/rules/advisor-mode.md` and was auto-loaded until 2026-07-24, so a drop in DELEGATED right after that date may reflect the move to lazy loading rather than rule erosion): report the day's totals and flag drift (a sustained fall in DELEGATED across heavy sessions suggests the rule is eroding). Note: `DELEGATED` counts dispatches, not workers — a swarm is ONE marker; per-child health lives in manager reports and is out of marker-telemetry scope. When reporting a `tool_loop` pattern, split marker-present sessions (rule fired — healthy) from marker-absent ones (the actual non-compliance) and state both counts. Also collect the facet fields when present: `outcome` for the Activity-snapshot outcomes line, `underlying_goal` for Per-project notes, and the `instructions_given` lists for the compliance check (see Memory updates). Ignore `satisfaction_signals` entirely — retired 2026-07-28.
 3. Walk installed skills (Glob `~/.claude/skills/*/SKILL.md` etc., Read frontmatter).
 4. Read `<findings-dir>/changelog-window.md` (Upstream changes) and `<findings-dir>/run-stats.txt` (Autodream self-audit) if present.
-5. Write the report to the literal report path from line 2.
-6. For each high-confidence high-severity recurring finding, update the matching project's MEMORY.md.
-7. Print: `report: <report-path>` (the literal path from line 2) then a 3-line summary (sessions reviewed, findings, edits made), then exit.
+5. For each high-confidence high-severity recurring finding, add a pin to `<findings-dir>/pins.jsonl` (see Memory pins). Write this file BEFORE the report: a report that is cut off before its last line is retried, but a complete report is never revisited, so pins written after it can be lost while the report says they exist.
+6. Write the report to the literal report path from line 2.
+7. Print: `report: <report-path>` (the literal path from line 2) then a 3-line summary (sessions reviewed, findings, pins proposed), then exit.
 
 ## Style
 

@@ -4,11 +4,13 @@ Operating notes for working on this repo. Read this before changing `bin/run.sh`
 
 ## What it is
 
-A nightly two-layer pipeline that reads yesterday's Claude Code session transcripts and produces a ranked daily report plus a few pinned MEMORY.md entries.
+A nightly two-layer pipeline that reads yesterday's Claude Code session transcripts and produces a ranked daily report plus a few pins to the shared Mnemopi memory store.
 
 - **Layer 1** (`prompts/SESSION_TRIAGE.md`, haiku, fanned out one per session): reads one transcript, writes one findings JSON.
-- **Layer 2** (`prompts/PROMPT.md`, opus, single call): reads all findings JSONs, writes `dreams/YYYY-MM-DD.md`, optionally pins to project MEMORY.md.
+- **Layer 2** (`prompts/PROMPT.md`, opus, single call): reads all findings JSONs, writes `dreams/YYYY-MM-DD.md`, optionally proposes pins to `pins.jsonl` for `run.sh` to apply.
 - `bin/run.sh` orchestrates both layers and everything around them.
+
+Legacy `MEMORY.md` memory is retired on this host: autodream no longer writes `MEMORY.md` pins and no longer runs `claude-memory gc`. See `docs/plans/2026-09-15-mnemopi-pins.md`.
 
 ## Session roots: one dir is not the corpus
 
@@ -55,7 +57,10 @@ All under `$AUTODREAM_DIR` (default `~/.claude/autodream/`) except the reports:
 - `findings/YYYY-MM-DD/run-stats.txt` — self-audit telemetry the aggregator reads.
 - `findings/YYYY-MM-DD/operator-notes.md` — every capture surface's notes merged into the one file L2 reads. `vault-notes-manifest.txt` alongside it lists the inbox files that went into it.
 - `findings/YYYY-MM-DD/x-bookmarks.md` — unread X bookmarks for the "Ideas from bookmarks" section, plus `x-bookmarks-manifest.txt` of their ids. `x-bookmarks/seen.jsonl` holds the persistent read state.
-- `findings/YYYY-MM-DD/touched-projects.txt` — sidecar listing projects whose MEMORY.md L2 edited (drives the optional `claude-memory gc`).
+- `findings/YYYY-MM-DD/pins.jsonl` — Layer 2's proposed pins, one JSON object per line (`project`, `title`, `body`, `kind`). A file left by an earlier run or attempt is moved to a unique `pins.jsonl.stale-XXXXXX` (mktemp) before each L2 attempt.
+- `findings/YYYY-MM-DD/pin-projects.tsv` — `project<TAB>cwd` rows for every project in this run's worklist (`sessions.txt`), computed before the first L1 call and written after a complete report. The rows are held in the runner's memory in between, because L1 and L2 both run with the Write tool and could rewrite the worklist files. Project and cwd both come from the real session path, never from a findings JSON, whose `session_path` the L1 model writes. The project is the directory directly under the session root, at any nesting depth. A cwd the adapter cannot resolve (a removed worktree), a cwd that does not encode to its dash bucket (slug buckets like `STRML-cc-autodream` skip that check), or a bucket with more than one distinct cwd, gets an empty column; `bin/apply-pins.sh` reads it to authorize and resolve each pin.
+- `findings/YYYY-MM-DD/pins-applied.tsv` — the ledger of applied pins, `<sha1 of the canonical pin><TAB><memory_id>`, so a rerun does not write the same pin twice.
+- `findings/YYYY-MM-DD/pins-result.txt` — pin application counters (`pins_total`, `pins_applied`, `pins_invalid`, and so on).
 - `findings/YYYY-MM-DD/unindexed-roots.txt` — Claude folders (`~/.claude*/projects`) that exist but are not indexed, for the self-audit section. Written before the idempotency guard so a catch-up no-op still reports folders that appeared since setup.
 - `root-choices.conf` — the per-folder index decision (`~/.claude-ds4/projects=index`), written by `bin/root-probe.sh` at install time. The primary `~/.claude/projects` is always indexed.
 - `cache/claude-code/` — persistent clone of `anthropics/claude-code` for the changelog.
@@ -97,7 +102,7 @@ The predicate is anchored to the FIRST user message so a human session that mere
 `--no-session-persistence` suppresses the full transcript but NOT Claude Code's **AI-title generation**: a fire-and-forget background call that writes a one-line `{"type":"ai-title",...}` stub into the launch cwd's project bucket. Because workers ran from `cd "$HOME"`, those stubs landed in the real `-Users-<you>` bucket and polluted session history / `search-sessions` — 339 of them accumulated 2026-05-25…06-02 (titles like "Analyze Claude session findings", "Aggregate daily findings into report"). Whether a stub lands is version/timing-dependent (the `--print` process sometimes exits before the async write flushes — current builds often drop it, older ones flushed it), so the fix must not assume the binary's current behavior.
 
 Two defenses:
-1. **cwd isolation + wipe (run.sh)**: both layers now launch from `$AUTODREAM_DIR/work` (`WORK_DIR`), not `$HOME`. Claude maps cwd → `~/.claude/projects/<cwd with / and . → ->`, so any stub lands in the isolated `WORK_BUCKET` instead of the real bucket. `clean_work_bucket` (`rm -rf "$WORK_BUCKET"`) runs before L1 and after L2, so stubs never accumulate. Workers read/write only by absolute path, so cwd is functionally irrelevant — L1 cd's inside the worker subshell; L2 cd's inside a subshell so the change does not leak into the notify/GC steps. **Watch the apostrophes**: the L1 worker body is a single-quoted `bash -c '...'`, so a `'` in a comment there silently breaks quoting (it still passes `bash -n`).
+1. **cwd isolation + wipe (run.sh)**: both layers now launch from `$AUTODREAM_DIR/work` (`WORK_DIR`), not `$HOME`. Claude maps cwd → `~/.claude/projects/<cwd with / and . → ->`, so any stub lands in the isolated `WORK_BUCKET` instead of the real bucket. `clean_work_bucket` (`rm -rf "$WORK_BUCKET"`) runs before L1 and after L2, so stubs never accumulate. Workers read/write only by absolute path, so cwd is functionally irrelevant — L1 cd's inside the worker subshell; L2 cd's inside a subshell so the change does not leak into the notify/pin steps. **Watch the apostrophes**: the L1 worker body is a single-quoted `bash -c '...'`, so a `'` in a comment there silently breaks quoting (it still passes `bash -n`).
 2. **Pruner title predicate (`is_self_title`)**: catches orphan stubs in the real bucket left by runs predating defense 1. Gated on (a) NO user turn anywhere in the file — a real session keeps its title alongside its conversation turns, so it is never a title-only orphan and is never matched — AND (b) the title paraphrases our L1/L2 prompts (session triage → findings, aggregate findings → report). Tuned against the real backlog: spares terminal-tab-title stubs and unrelated headless orphans (e.g. "GCU Rush firmware development").
 
 ## Sleep resilience
@@ -253,6 +258,8 @@ public. For private code, swap the seat rather than skipping the pass.
 ## Tests
 
 `tests/run-all.sh` drives the real `run.sh` against `tests/mock-claude.sh` (no network, no model). Mock modes: `good` (default), `l1_incomplete` (worker writes nothing), `l1_flaky` (fails first dispatch per session, succeeds on retry). The suite forces `AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0` and a low `AUTODREAM_L1_ROUNDS` so it never sleeps or hits the network. macOS only (BSD `date`/`touch`). Run it after any run.sh/prompt change — it now also invokes the five unit suites (`lib-project`, `preflight`, `adapters`, `adapter-claude`, `adapter-contract`) and folds their counts into its totals, so one command covers everything CI runs. They were workflow-only for a while, which meant a local pre-push run skipped adapter containment, the manifest-name check and the whole contract suite.
+
+`tests/apply-pins.sh` covers `bin/apply-pins.sh` directly: schema validation, the ledger that stops a rerun double-writing, an unobserved project, a missing `cwd`, a missing `pin-projects.tsv`, and shell-metacharacter payloads in a pin body. `tests/mock-shared-memory.sh` stands in for the `shared-memory` CLI. `SHARED_MEMORY_BIN` is pinned to that mock everywhere the suite runs `apply-pins.sh`, so no test call can write real Mnemopi memory.
 
 The suite pins `AUTODREAM_CONFIG` into its sandbox now that `run.sh` sources the config. Without that pin, a developer whose real config points `AUTODREAM_VAULT_DIR` at a live Obsidian vault would have the test suite writing notes and reports into it. `MOCK_MODE=l2_fail` makes the aggregator write nothing and exit 1, which is how the "don't archive an unread note" guard is tested; pair it with `AUTODREAM_L2_ATTEMPTS=1` so the test doesn't sit through the retry loop.
 

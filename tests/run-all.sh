@@ -14,6 +14,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
 RUN="$REPO/bin/run.sh"
 MOCK="$HERE/mock-claude.sh"
+# run.sh puts ~/.local/bin on PATH, where the real shared-memory CLI lives, so a
+# test whose L2 emits pins would store them in the developer's real Mnemopi.
+# Point every run at a path that does not exist; the pin tests override it with
+# tests/mock-shared-memory.sh.
+export SHARED_MEMORY_BIN="$HERE/no-such-shared-memory"
 DATE=2020-01-02          # fixed target date; sessions are touched into this day
 STAMP=202001021200       # touch -t form of DATE at noon
 
@@ -88,7 +93,7 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
   # AUTODREAM_VAULT_DIR could reach the nightly run; without this pin a developer whose
   # config points at a real Obsidian vault would have the suite writing into it.
   # Individual tests override this by exporting AUTODREAM_CONFIG before calling.
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG="${AUTODREAM_CHANGELOG:-0}" CLAUDE_BIN="$MOCK" \
   AUTODREAM_CONFIG="${AUTODREAM_CONFIG:-$1/autodream/config}" \
   AUTODREAM_CONSUME_DATE="${AUTODREAM_CONSUME_DATE:-$DATE}" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS="${AUTODREAM_L1_ROUNDS:-2}" \
@@ -102,7 +107,7 @@ run_dream(){ # $1=root ; inherits MOCK_MODE/MOCK_CAPTURE_DIR/FANOUT + changelog 
 # Same run, but piped into a reader that closes immediately, so any write run.sh makes to
 # stdout lands on a dead pipe. This is the shape of the real 2026-08-02 failure.
 run_dream_broken_pipe(){ # $1=root
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
   AUTODREAM_CONFIG="$1/autodream/config" \
   AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
@@ -1146,7 +1151,7 @@ test_runner_provenance_no_git(){
   # history at all — the tarball-install case, which must still produce a report.
   local bin="$root/bin"; mkdir -p "$bin"
   cp "$REPO"/bin/*.sh "$bin/"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
   bash "$bin/run.sh" "$DATE" > "$root/run.out" 2>&1
@@ -1166,7 +1171,7 @@ test_runner_provenance_through_symlink(){
   # .git, and provenance has to follow the file's own link to find the working tree.
   # Six production runs through 2026-08-03 stamped "unknown" against a clean checkout.
   local f; for f in "$REPO"/bin/*.sh; do ln -sf "$f" "$root/autodream/$(basename "$f")"; done
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
   AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -1194,7 +1199,7 @@ test_runner_provenance_relative_symlink(){
   phys_bin=$(cd "$REPO/bin" && pwd -P)
   rel=$(python3 -c 'import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))' "$phys_bin" "$phys_ad")
   local f; for f in "$REPO"/bin/*.sh; do ln -sf "$rel/$(basename "$f")" "$root/autodream/$(basename "$f")"; done
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
   AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -1220,7 +1225,7 @@ test_runner_provenance_unresolvable_chain(){
     prev="$root/autodream/hop-$i.sh"
   done
   ln -sf "$prev" "$root/autodream/run.sh"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
   AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -1541,7 +1546,7 @@ test_runner_dirty_ignores_untracked(){
   git -C "$repo" add -A 2>/dev/null
   git -C "$repo" -c user.email=t@t -c user.name=t commit -qm init 2>/dev/null
   printf 'scratch\n' > "$repo/untracked-scratch.txt"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
   bash "$repo/bin/run.sh" "$DATE" > "$root/run.out" 2>&1
@@ -1551,7 +1556,7 @@ test_runner_dirty_ignores_untracked(){
   # A tracked modification still does.
   printf '\n# tracked edit\n' >> "$repo/bin/session-stats.sh"
   rm -rf "$(fdir "$root")" "$root/dreams/$DATE.md"
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
   PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
   bash "$repo/bin/run.sh" "$DATE" > "$root/run2.out" 2>&1
@@ -1746,7 +1751,7 @@ test_config_unbound_var_does_not_kill_run
 # and overriding HOME into the sandbox so root-probe discovers the sandbox's claude dirs
 # rather than the host's.
 run_dream_autodetect(){ # $1=root — like run_dream but with HOME inside the sandbox, no PROJECTS_DIR
-  AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
   AUTODREAM_CONFIG="$1/autodream/config" \
   AUTODREAM_CONSUME_DATE="$DATE" \
   AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=2 \
@@ -1960,7 +1965,7 @@ test_preflight_stops_a_run_missing_a_dependency(){
   # An empty PATH dir hides shasum, whose absence silently empties the artifact
   # hash so every session in the night targets one findings filename.
   local empty; empty=$(mktemp -d "${TMPDIR:-/tmp}/nopath.XXXXXX")
-  PATH="$empty:/usr/bin:/bin" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK"     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE"     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1     AUTODREAM_PREFLIGHT_FORCE_MISSING=shasum     PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams"     bash "$RUN" "$DATE" > "$root/run.out" 2>&1 || true
+  PATH="$empty:/usr/bin:/bin" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK"     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE"     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1     AUTODREAM_PREFLIGHT_FORCE_MISSING=shasum     PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams"     bash "$RUN" "$DATE" > "$root/run.out" 2>&1 || true
   cat "$root/autodream/logs/run-$DATE.log" >> "$root/run.out" 2>/dev/null || true
   assert_no_file "$(fdir "$root")/sessions.txt" "nothing was enumerated"
   assert_grep "$root/run.out" 'preflight' "the log says preflight stopped it"
@@ -2060,7 +2065,7 @@ test_failing_enumerator_aborts_the_run(){
   printf '{"name":"claude","engine_bin":"true","writes_memory":true}\n' > "$ad/claude/manifest.json"
   printf '#!/bin/bash\ncase "${1:-}" in enumerate) exit 3 ;; *) exit 2 ;; esac\n' > "$ad/claude/adapter.sh"
   chmod +x "$ad/claude/adapter.sh"
-  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  ADAPTERS_ROOT="$ad" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -2102,7 +2107,7 @@ test_one_failed_root_does_not_kill_the_night(){
   # find cannot read. That combination is exit 1 with empty output.
   local bad="$root/badroot"; mkdir -p "$bad/locked"
   chmod 000 "$bad/locked"
-  SESSION_ROOTS="$root/projects:$bad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  SESSION_ROOTS="$root/projects:$bad" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -2167,7 +2172,7 @@ test_partial_enumeration_keeps_what_it_read(){
     printf 'esac\n'
   } > "$ad/claude/adapter.sh"
   chmod +x "$ad/claude/adapter.sh"
-  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  ADAPTERS_ROOT="$ad" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -2193,7 +2198,7 @@ test_all_roots_unavailable_fails(){
   local root; root=$(setup_env)
   mk_session "$root" a
   SESSION_ROOTS="$root/does-not-exist-a:$root/does-not-exist-b" \
-    AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -2219,7 +2224,7 @@ test_fresh_host_with_no_store_is_not_a_failure(){
   cp "$REPO/prompts/SESSION_TRIAGE.md" "$T/autodream/SESSION_TRIAGE.md"
   cp "$REPO/prompts/PROMPT.md"         "$T/autodream/PROMPT.md"
   # No SESSION_ROOTS, no PROJECTS_DIR, and a HOME with no .claude at all.
-  HOME="$T/home" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  HOME="$T/home" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$T/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     AUTODREAM_DIR="$T/autodream" DREAMS_DIR="$T/dreams" \
@@ -2243,7 +2248,7 @@ test_fatal_does_not_clobber_a_complete_date(){
   echo "# fatal: a forced rerun that dies leaves the completed date's stats alone"
   local root; root=$(setup_env)
   mk_session "$root" a
-  local env_common=(AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 AUTODREAM_NETCHECK=0
+  local env_common=(AUTODREAM_CHANGELOG=0 AUTODREAM_NETCHECK=0
                     AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1)
   # A good night first.
   env "${env_common[@]}" CLAUDE_BIN="$MOCK" AUTODREAM_CONFIG="$root/autodream/config" \
@@ -2301,7 +2306,7 @@ test_no_usable_adapter_leaves_a_trace(){
   printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/notify-args.txt"\n' "$root" \
     > "$root/autodream/notify.sh"
   chmod +x "$root/autodream/notify.sh"
-  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  ADAPTERS_ROOT="$ad" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -2323,7 +2328,7 @@ test_no_usable_adapter_leaves_a_trace(){
   local later=2020-01-03
   mk_session_dated "$root" b "$later" 2>/dev/null || true
   chmod +x "$ad/claude/adapter.sh"
-  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  ADAPTERS_ROOT="$ad" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$later" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -2361,7 +2366,7 @@ test_enabled_adapters_resolves_once(){
   chmod +x "$ad/claude/adapter.sh"
   printf '{"name":"other","engine_bin":"true","writes_memory":false}\n' > "$ad/other/manifest.json"
   printf '#!/bin/bash\nexit 2\n' > "$ad/other/adapter.sh"; chmod +x "$ad/other/adapter.sh"
-  ADAPTERS_ROOT="$ad" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  ADAPTERS_ROOT="$ad" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     PROJECTS_DIR="$root/projects" AUTODREAM_DIR="$root/autodream" DREAMS_DIR="$root/dreams" \
@@ -2398,7 +2403,7 @@ test_upgrade_lag_install_still_produces_a_report(){
   done
   ln -s "$REPO/bin/run.sh" "$T/autodream/run.sh"
   mk_session_in "$T/home/.claude/projects/proj-a" s1
-  HOME="$T/home" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  HOME="$T/home" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$T/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     AUTODREAM_DIR="$T/autodream" DREAMS_DIR="$T/dreams" \
@@ -2430,7 +2435,7 @@ collision_sandbox(){ # -> a root whose HOME holds a constant-hash shasum stub
   printf '%s' "$root"
 }
 run_dream_collision(){ # $1=root
-  HOME="$1/home" AUTODREAM_GC=0 AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
+  HOME="$1/home" AUTODREAM_CHANGELOG=0 CLAUDE_BIN="$MOCK" \
     AUTODREAM_CONFIG="$1/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
     AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_L1_ROUNDS=1 \
     PROJECTS_DIR="$1/projects" AUTODREAM_DIR="$1/autodream" DREAMS_DIR="$1/dreams" \
@@ -2637,7 +2642,371 @@ test_broken_shasum_never_collapses_sessions(){
   rm -rf "$root"
 }
 
+# ---- Memory pins go to Mnemopi ----
+# Rows R1-R11 of the failure matrix in docs/plans/2026-09-15-mnemopi-pins.md.
+# apply-pins.sh's own rows live in tests/apply-pins.sh.
+#
+# Sessions go in the bucket Claude would use for their cwd, because run.sh refuses a cwd
+# that does not encode to the bucket its session is stored in. lib-project.sh is the one
+# encoder, so the fixtures use it rather than a second copy of the rule.
+# shellcheck source=/dev/null
+. "$REPO/bin/lib-project.sh"
+mk_session_with_cwd(){ # $1=root $2=name $3=cwd [$4=bucket, default: the cwd's own]
+  local b="${4:-$(encode_project "$3")}"
+  mkdir -p "$1/projects/$b"
+  local f="$1/projects/$b/$2.jsonl"
+  printf '%s\n' \
+    "{\"type\":\"user\",\"cwd\":\"$3\",\"message\":{\"content\":\"start the task\"}}" \
+    '{"type":"user","message":{"content":"keep going"}}' \
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}' \
+    > "$f"
+  touch -t "$STAMP" "$f"
+}
+pins_run(){ # $1=root ; the mock CLI logs each call to $1/sm-calls.jsonl
+  SHARED_MEMORY_BIN="$HERE/mock-shared-memory.sh" MOCK_SM_LOG="$1/sm-calls.jsonl" run_dream "$1"
+}
+sm_calls(){ if [ -f "$1/sm-calls.jsonl" ]; then wc -l < "$1/sm-calls.jsonl" | tr -d ' '; else echo 0; fi; }
+
+test_pins_applied_after_complete_report(){
+  echo "# pins: a complete report's pins.jsonl reaches Mnemopi, scoped to the project's cwd"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  local cwd; cwd=$(cd "$root/work" && pwd -P)
+  mk_session_with_cwd "$root" s1 "$cwd"
+  local b; b=$(encode_project "$cwd")
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "1" "one remember call"
+  assert_eq "$(jq -r .cwd "$root/sm-calls.jsonl" 2>/dev/null)" "$cwd" "scoped to the session's working directory"
+  assert_grep "$d/pin-projects.tsv" "^$b"$'\t'"$cwd\$" "pin-projects.tsv pairs the bucket with its cwd"
+  assert_nonempty "$d/pins-applied.tsv" "the ledger records the stored pin"
+  assert_grep "$root/run.out" 'memory pins:' "the run log reports the pin counts"
+  rm -rf "$root"
+}
+
+test_pins_not_applied_after_truncated_report(){
+  echo "# pins: a truncated report's pins are never stored"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  mk_session_with_cwd "$root" s1 "$(cd "$root/work" && pwd -P)"
+  export MOCK_MODE=pins_partial AUTODREAM_L2_ATTEMPTS=1; pins_run "$root"; unset MOCK_MODE AUTODREAM_L2_ATTEMPTS
+  assert_eq "$(sm_calls "$root")" "0" "no remember call"
+  assert_no_file "$(fdir "$root")/pins-applied.tsv" "no ledger"
+  rm -rf "$root"
+}
+
+test_pins_stale_file_is_moved_aside(){
+  echo "# pins: a forced rebuild never stores the previous run's pins.jsonl"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  mk_session_with_cwd "$root" s1 "$(cd "$root/work" && pwd -P)"
+  local d="$root/autodream/findings/$DATE"; mkdir -p "$d"
+  printf '{"project":"proj-a","title":"old","body":"old pin","kind":"correction"}\n' > "$d/pins.jsonl"
+  printf '# old\n<!-- autodream:open-questions=0 -->\n' > "$root/dreams/$DATE.md"
+  export MOCK_MODE=l1_badproject AUTODREAM_FORCE=1; pins_run "$root"; unset MOCK_MODE AUTODREAM_FORCE
+  assert_eq "$(sm_calls "$root")" "0" "the old pin was not stored"
+  assert_no_file "$d/pins.jsonl" "nothing left at the live pins path"
+  local n; n=$(find "$d" -maxdepth 1 -name 'pins.jsonl.stale-*' | wc -l | tr -d ' ')
+  assert_eq "$n" "1" "the old pins.jsonl was moved aside"
+  rm -rf "$root"
+}
+
+test_pins_tab_in_cwd_never_splits_the_row(){
+  echo "# pins: a working directory containing a tab never splits a pin-projects.tsv row"
+  local root; root=$(setup_env)
+  local dir="$root/wo"$'\t'"rk"; mkdir -p "$dir"
+  local tabcwd; tabcwd=$(cd "$dir" && pwd -P)
+  # The bucket really is the tab cwd's own (the tab encodes to a dash), so the bucket check
+  # passes and only the tab guard stands between this row and a split.
+  local b; b=$(encode_project "$tabcwd"); mkdir -p "$root/projects/$b"
+  local f="$root/projects/$b/s1.jsonl"
+  {
+    jq -cn --arg c "$tabcwd" '{type:"user",cwd:$c,message:{content:"start the task"}}'
+    printf '%s\n' '{"type":"user","message":{"content":"keep going"}}' \
+      '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}'
+  } > "$f"
+  touch -t "$STAMP" "$f"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_file "$d/pin-projects.tsv" "pin-projects.tsv was written"
+  assert_eq "$(awk -F'\t' 'NF != 2' "$d/pin-projects.tsv" 2>/dev/null | wc -l | tr -d ' ')" "0" "every row has exactly two fields"
+  assert_eq "$(sm_calls "$root")" "0" "no remember call for a project with no usable cwd"
+  rm -rf "$root"
+}
+
+test_pins_failed_authorization_rebuild_stores_nothing(){
+  echo "# pins: a failed pin-projects.tsv rebuild never falls back to an old one"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  local cwd; cwd=$(cd "$root/work" && pwd -P)
+  mk_session_with_cwd "$root" s1 "$cwd"
+  local d="$root/autodream/findings/$DATE"
+  # A directory where the temp file goes makes the rebuild's redirect fail.
+  mkdir -p "$d/pin-projects.tsv.tmp"
+  local b; b=$(encode_project "$cwd")
+  printf '%s\t%s\n' "$b" "$cwd" > "$d/pin-projects.tsv"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  assert_eq "$(sm_calls "$root")" "0" "no remember call"
+  assert_no_file "$d/pin-projects.tsv" "the old authorization list is gone"
+  assert_grep "$root/run.out" 'could not write pin-projects.tsv' "the run log says why"
+  rm -rf "$root"
+}
+
+test_pins_forged_session_path_authorizes_nothing(){
+  echo "# pins: an L1 session_path naming another project's session authorizes no pin there"
+  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
+  local ca cb; ca=$(cd "$root/work-a" && pwd -P); cb=$(cd "$root/work-b" && pwd -P)
+  local ba bb; ba=$(encode_project "$ca"); bb=$(encode_project "$cb")
+  mk_session_with_cwd "$root" s1 "$ca"
+  # work-b's session exists and is readable, but its mtime is outside the target date,
+  # so the run never triages it. Only a forged session_path can point at it.
+  mkdir -p "$root/projects/$bb"
+  local other="$root/projects/$bb/other.jsonl"
+  printf '{"type":"user","cwd":"%s","message":{"content":"x"}}\n' "$cb" > "$other"
+  export MOCK_MODE=pins_forged MOCK_FORGED_SESSION="$other" MOCK_PIN_PROJECT="$bb"
+  pins_run "$root"
+  unset MOCK_MODE MOCK_FORGED_SESSION MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored for the untriaged project"
+  assert_nogrep "$d/pin-projects.tsv" "^$bb" "the untriaged project is not on the authorization list"
+  assert_grep   "$d/pin-projects.tsv" "^$ba" "the triaged project is"
+  rm -rf "$root"
+}
+
+test_pins_subagent_sessions_keep_their_project(){
+  echo "# pins: subagent transcripts belong to their own project, not a shared 'subagents' bucket"
+  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
+  local p dir agent_b=""
+  for p in a b; do
+    dir="$root/projects/$(encode_project "$(cd "$root/work-$p" && pwd -P)")/uuid-$p/subagents"; mkdir -p "$dir"
+    printf '%s\n' \
+      "{\"type\":\"user\",\"cwd\":\"$(cd "$root/work-$p" && pwd -P)\",\"message\":{\"content\":\"start the task\"}}" \
+      '{"type":"user","message":{"content":"keep going"}}' \
+      '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}' > "$dir/agent-$p.jsonl"
+    touch -t "$STAMP" "$dir/agent-$p.jsonl"
+    agent_b="$dir/agent-$p.jsonl"
+  done
+  local bb; bb=$(encode_project "$(cd "$root/work-b" && pwd -P)")
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$bb"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "1" "the proj-b pin was stored"
+  assert_eq "$(jq -r .cwd "$root/sm-calls.jsonl" 2>/dev/null)" "$(cd "$root/work-b" && pwd -P)" "in proj-b's working directory"
+  assert_nogrep "$d/pin-projects.tsv" '^subagents' "no shared subagents row on the authorization list"
+  assert_eq "$(jq -r .project "$d/$(hash_of "$agent_b").json" 2>/dev/null)" "$bb" "findings normalization names the real project too"
+  rm -rf "$root"
+}
+
+test_pins_cwd_outside_its_bucket_authorizes_nothing(){
+  echo "# pins: a session whose cwd does not encode to its bucket gives that project no cwd"
+  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
+  local ca cb; ca=$(cd "$root/work-a" && pwd -P); cb=$(cd "$root/work-b" && pwd -P)
+  local ba; ba=$(encode_project "$ca")
+  # Stored under work-a's bucket, but the transcript says it ran in work-b.
+  mk_session_with_cwd "$root" s1 "$cb" "$ba"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$ba"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "0" "no memory for work-a's project stored in work-b's bank"
+  assert_grep "$d/pin-projects.tsv" "^$ba"$'\t'"\$" "the bucket is listed with no cwd"
+  rm -rf "$root"
+}
+
+test_pins_colliding_cwds_authorize_nothing(){
+  echo "# pins: two working directories that encode to one bucket give it no cwd"
+  local root; root=$(setup_env); mkdir -p "$root/a_b" "$root/a-b"
+  local c1 c2; c1=$(cd "$root/a_b" && pwd -P); c2=$(cd "$root/a-b" && pwd -P)
+  local b; b=$(encode_project "$c1")
+  assert_eq "$(encode_project "$c2")" "$b" "the fixture really collides"
+  mk_session_with_cwd "$root" s1 "$c1"
+  mk_session_with_cwd "$root" s2 "$c2"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored in either directory's bank"
+  assert_grep "$d/pin-projects.tsv" "^$b"$'\t'"\$" "the bucket is listed with no cwd"
+  rm -rf "$root"
+}
+
+test_pins_custom_slug_bucket_keeps_its_cwd(){
+  echo "# pins: a CLAUDE_CODE_PROJECT_DIR_NAME slug bucket keeps its cwd"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  local cwd; cwd=$(cd "$root/work" && pwd -P)
+  # Slug buckets (owner-repo) override cwd encoding, so no cwd ever encodes to them. On
+  # this host they are the main Rush and STRML repos, 68 of 359 buckets in ~/.claude.
+  mk_session_with_cwd "$root" s1 "$cwd" "STRML-demo"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT=STRML-demo; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  assert_eq "$(sm_calls "$root")" "1" "the pin for the slug bucket was stored"
+  assert_eq "$(jq -r .cwd "$root/sm-calls.jsonl" 2>/dev/null)" "$cwd" "in the session's working directory"
+  rm -rf "$root"
+}
+
+test_pins_invalid_cwd_still_counts_toward_a_collision(){
+  echo "# pins: an unusable cwd in a bucket still makes that bucket ambiguous"
+  local root; root=$(setup_env)
+  local tabdir="$root/a"$'\t'"b" okdir="$root/a-b"; mkdir -p "$tabdir" "$okdir"
+  local tabcwd okcwd; tabcwd=$(cd "$tabdir" && pwd -P); okcwd=$(cd "$okdir" && pwd -P)
+  local b; b=$(encode_project "$okcwd")
+  assert_eq "$(encode_project "$tabcwd")" "$b" "the fixture really collides"
+  mkdir -p "$root/projects/$b"
+  {
+    jq -cn --arg c "$tabcwd" '{type:"user",cwd:$c,message:{content:"start the task"}}'
+    printf '%s\n' '{"type":"user","message":{"content":"keep going"}}' \
+      '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}'
+  } > "$root/projects/$b/s1.jsonl"
+  touch -t "$STAMP" "$root/projects/$b/s1.jsonl"
+  mk_session_with_cwd "$root" s2 "$okcwd"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored in the one usable cwd of an ambiguous bucket"
+  rm -rf "$root"
+}
+
+test_pins_unresolvable_cwd_still_counts_toward_a_collision(){
+  echo "# pins: a session whose cwd no longer resolves still makes its bucket ambiguous"
+  local root; root=$(setup_env); mkdir -p "$root/a_b" "$root/a-b"
+  local gone ok; gone=$(cd "$root/a_b" && pwd -P); ok=$(cd "$root/a-b" && pwd -P)
+  local b; b=$(encode_project "$ok")
+  assert_eq "$(encode_project "$gone")" "$b" "the fixture really collides"
+  mk_session_with_cwd "$root" s1 "$gone"
+  mk_session_with_cwd "$root" s2 "$ok"
+  # A removed worktree: the adapter cannot resolve this session's cwd any more, which
+  # was true of 8 of the 48 sessions on 2026-09-14.
+  rmdir "$gone"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored in the one cwd that still resolves"
+  assert_grep "$d/pin-projects.tsv" "^$b"$'\t'"\$" "the bucket is listed with no cwd"
+  rm -rf "$root"
+}
+
+test_pins_applied_before_notify(){
+  echo "# pins: pins are stored before notify.sh runs, so a notify step that never returns cannot lose them"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  local cwd; cwd=$(cd "$root/work" && pwd -P)
+  mk_session_with_cwd "$root" s1 "$cwd"
+  local d; d=$(fdir "$root")
+  # AUTODREAM_OPEN runs synchronously inside notify.sh, so a blocking editor command holds
+  # the run there. This stand-in records whether the pin was already stored when it ran.
+  printf '#!/bin/bash\n[ -s "%s/pins-applied.tsv" ] && touch "%s/notify-saw-pins"\nexit 0\n' "$d" "$root" > "$root/autodream/notify.sh"
+  chmod +x "$root/autodream/notify.sh"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$(encode_project "$cwd")"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  assert_eq "$(sm_calls "$root")" "1" "one remember call"
+  assert_file "$root/notify-saw-pins" "the pin was already stored when notify.sh ran"
+  rm -rf "$root"
+}
+
+test_pins_bucket_named_subagents_is_a_project(){
+  echo "# pins: a session directly inside a bucket named 'subagents' belongs to that bucket"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  local cwd; cwd=$(cd "$root/work" && pwd -P)
+  # A CLAUDE_CODE_PROJECT_DIR_NAME slug can be any name, including "subagents". The project
+  # is the directory directly under the session root, whatever it is called.
+  mk_session_with_cwd "$root" s1 "$cwd" "subagents"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT=subagents; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  local d; d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "1" "the pin for the 'subagents' bucket was stored"
+  assert_eq "$(jq -r .cwd "$root/sm-calls.jsonl" 2>/dev/null)" "$cwd" "in the session's working directory"
+  assert_eq "$(jq -r .project "$d/$(hash_of "$root/projects/subagents/s1.jsonl").json" 2>/dev/null)" "subagents" "findings normalization keeps the bucket name"
+  rm -rf "$root"
+
+  echo "# pins: a workflow agent transcript nested under subagents/workflows/ belongs to its bucket"
+  root=$(setup_env); mkdir -p "$root/work"
+  cwd=$(cd "$root/work" && pwd -P)
+  local b; b=$(encode_project "$cwd")
+  # Claude Code writes workflow agents one level deeper than plain subagents:
+  # <bucket>/<session>/subagents/workflows/wf_<id>/agent-*.jsonl (65 such files on this host).
+  local wf="$root/projects/$b/uuid-1/subagents/workflows/wf_abc"; mkdir -p "$wf"
+  printf '%s\n' \
+    "{\"type\":\"user\",\"cwd\":\"$cwd\",\"message\":{\"content\":\"start the task\"}}" \
+    '{"type":"user","message":{"content":"keep going"}}' \
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read"}]}}' > "$wf/agent-1.jsonl"
+  touch -t "$STAMP" "$wf/agent-1.jsonl"
+  export MOCK_MODE=pins MOCK_PIN_PROJECT="$b"; pins_run "$root"; unset MOCK_MODE MOCK_PIN_PROJECT
+  d=$(fdir "$root")
+  assert_eq "$(sm_calls "$root")" "1" "the pin for the workflow agent's bucket was stored"
+  assert_eq "$(jq -r .project "$d/$(hash_of "$wf/agent-1.jsonl").json" 2>/dev/null)" "$b" "findings normalization names the bucket"
+  rm -rf "$root"
+}
+
+test_pins_failed_move_aside_leaves_no_temp_file(){
+  echo "# pins: a pins.jsonl that cannot be moved aside leaves no empty stale file behind"
+  local root; root=$(setup_env); mkdir -p "$root/work"
+  mk_session_with_cwd "$root" s1 "$(cd "$root/work" && pwd -P)"
+  local d="$root/autodream/findings/$DATE"
+  # A directory at the pins path: mv cannot put it over the mktemp file. L2's Write tool can
+  # make this by writing any path under pins.jsonl/.
+  mkdir -p "$d/pins.jsonl/sub"
+  printf '# old\n<!-- autodream:open-questions=0 -->\n' > "$root/dreams/$DATE.md"
+  export MOCK_MODE=l1_badproject AUTODREAM_FORCE=1; pins_run "$root"; unset MOCK_MODE AUTODREAM_FORCE
+  local n; n=$(find "$d" -maxdepth 1 -name 'pins.jsonl.stale-*' | wc -l | tr -d ' ')
+  assert_eq "$n" "0" "no empty stale file left behind"
+  assert_grep "$root/run.out" 'could not move an earlier pins.jsonl aside' "the run log says the move failed"
+  assert_eq "$(sm_calls "$root")" "0" "nothing stored"
+  rm -rf "$root"
+}
+
+pins_tamper_case(){ # $1=mock mode that appends an unscanned session to the worklist files
+  local root; root=$(setup_env); mkdir -p "$root/work-a" "$root/work-b"
+  local ca cb; ca=$(cd "$root/work-a" && pwd -P); cb=$(cd "$root/work-b" && pwd -P)
+  local bb; bb=$(encode_project "$cb")
+  mk_session_with_cwd "$root" s1 "$ca"
+  # A real session in another project, never enumerated (its mtime is outside the date).
+  mkdir -p "$root/projects/$bb"
+  local other="$root/projects/$bb/other.jsonl"
+  printf '{"type":"user","cwd":"%s","message":{"content":"x"}}\n' "$cb" > "$other"
+  export MOCK_MODE="$1" MOCK_FORGED_SESSION="$other" MOCK_PIN_PROJECT="$bb"
+  pins_run "$root"
+  unset MOCK_MODE MOCK_FORGED_SESSION MOCK_PIN_PROJECT
+  assert_eq "$(sm_calls "$root")" "0" "no memory stored for a session the runner never enumerated ($1)"
+  assert_nogrep "$(fdir "$root")/pin-projects.tsv" "^$bb" "the injected project is not authorized ($1)"
+  rm -rf "$root"
+}
+
+test_pins_l2_cannot_widen_the_worklist(){
+  echo "# pins: L2 appending a session to sessions.txt authorizes no pin for it"
+  pins_tamper_case pins_tamper
+}
+
+test_pins_l1_cannot_widen_the_worklist(){
+  echo "# pins: L1 appending a session to sessions.txt authorizes no pin for it"
+  pins_tamper_case pins_tamper_l1
+}
+
+test_no_markdown_memory_writer_remains(){
+  echo "# pins: the MEMORY.md writer and the claude-memory GC are gone"
+  assert_nogrep "$REPO/prompts/PROMPT.md" 'touched-projects' "PROMPT.md has no touched-projects sidecar"
+  assert_nogrep "$REPO/prompts/PROMPT.md" 'MAY edit the relevant project' "PROMPT.md does not tell L2 to edit MEMORY.md"
+  assert_grep   "$REPO/prompts/PROMPT.md" 'pins.jsonl' "PROMPT.md tells L2 to write pins.jsonl"
+  assert_nogrep "$RUN" 'claude-memory' "run.sh no longer runs claude-memory"
+  assert_nogrep "$RUN" 'touched-projects' "run.sh no longer reads touched-projects"
+  # pins.jsonl before the report: a kill between the two writes must leave no complete
+  # report claiming pins that were never written.
+  local pin_step report_step
+  pin_step=$(grep -n 'add a pin to `<findings-dir>/pins.jsonl`' "$REPO/prompts/PROMPT.md" | head -1 | cut -d: -f1)
+  report_step=$(grep -n 'Write the report to the literal report path' "$REPO/prompts/PROMPT.md" | head -1 | cut -d: -f1)
+  if [ -n "$pin_step" ] && [ -n "$report_step" ] && [ "$pin_step" -lt "$report_step" ]; then
+    ok "PROMPT.md writes pins before the report"
+  else
+    no "PROMPT.md writes pins before the report (pins step line [$pin_step], report step line [$report_step])"
+  fi
+  # L2 exits before any pin is applied, and the runner can still refuse one, so the report
+  # may only say a pin was proposed.
+  assert_nogrep "$REPO/prompts/PROMPT.md" 'stored by the runner after this report' "PROMPT.md does not tell the report to call a pin stored"
+  assert_grep   "$REPO/prompts/PROMPT.md" 'Pin proposed' "PROMPT.md marks pins as proposed"
+}
+
 # ---- run the new tests ----
+test_pins_applied_after_complete_report
+test_pins_not_applied_after_truncated_report
+test_pins_stale_file_is_moved_aside
+test_pins_tab_in_cwd_never_splits_the_row
+test_pins_failed_authorization_rebuild_stores_nothing
+test_pins_forged_session_path_authorizes_nothing
+test_pins_subagent_sessions_keep_their_project
+test_pins_cwd_outside_its_bucket_authorizes_nothing
+test_pins_colliding_cwds_authorize_nothing
+test_pins_custom_slug_bucket_keeps_its_cwd
+test_pins_invalid_cwd_still_counts_toward_a_collision
+test_pins_unresolvable_cwd_still_counts_toward_a_collision
+test_pins_applied_before_notify
+test_pins_bucket_named_subagents_is_a_project
+test_pins_failed_move_aside_leaves_no_temp_file
+test_pins_l2_cannot_widen_the_worklist
+test_pins_l1_cannot_widen_the_worklist
+test_no_markdown_memory_writer_remains
 test_multiroot_triages_alt_root
 test_multiroot_heldout_and_dedup
 test_multiroot_flags_unindexed
@@ -2677,7 +3046,7 @@ test_all_excluded_corpus_says_so
 # Their counts fold into the totals below, so a red unit suite fails this script.
 echo
 echo "===== unit suites ====="
-for _suite in lib-project preflight adapters adapter-claude adapter-contract slim-transcript; do
+for _suite in lib-project preflight adapters adapter-claude adapter-contract slim-transcript apply-pins; do
   _out=$(bash "$HERE/$_suite.sh" 2>&1)
   _rc=$?
   _p=$(printf '%s\n' "$_out" | sed -n 's/^passed: *\([0-9][0-9]*\).*/\1/p' | tail -1)

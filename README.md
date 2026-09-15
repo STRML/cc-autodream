@@ -14,13 +14,12 @@ fresh and rediscovers the same friction.
 cc-autodream does the rereading for you. Every night it looks across **all** of
 yesterday's sessions, ranks what recurs by frequency × severity (so you see the
 patterns, not the one-offs), and writes a dated digest you can skim in a minute. The
-highest-confidence, highest-severity findings get pinned into the relevant project's
-`MEMORY.md`, so the next session already knows.
+highest-confidence, highest-severity findings get pinned to your shared Mnemopi
+memory store, so the next session already knows.
 
 This is the cross-session view the built-in per-project auto-memory doesn't give you.
-Anthropic's built-in auto-dream is a memory *janitor* — it grooms your `MEMORY.md`.
-cc-autodream is a *signal extractor* — it reads full transcripts and tells you what
-happened. They compose: cc-autodream adds the 📌 pins, the janitor grooms around them.
+cc-autodream reads full transcripts and tells you what happened, then hands the
+lessons to Mnemopi to hold.
 
 ## What you get
 
@@ -239,8 +238,8 @@ the adapter contract is defined by.
   is portable; the scheduling and notify bits are mac-specific. The morning
   open-questions file opens with your default `.md` app; set `AUTODREAM_OPEN`
   (e.g. `subl`, `code -g`, `open -a Obsidian`) to pick a specific editor.
-- Runs in `bypassPermissions` mode (workers Write findings; the aggregator Edits
-  project `MEMORY.md`). Don't run it in a shared environment.
+- Runs in `bypassPermissions` mode (workers Write findings). Don't run it in a
+  shared environment.
 - The first run clones `anthropics/claude-code` (small) for the changelog window; it
   degrades gracefully with no git/network.
 

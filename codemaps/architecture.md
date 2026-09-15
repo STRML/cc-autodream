@@ -34,18 +34,18 @@ bin/run.sh  TARGET_DATE
       ├─ L2 retry loop (AUTODREAM_L2_ATTEMPTS):
       │     claude --print (opus, lean flags) with PROMPT.md
       │       reads all findings/<date>/*.json + changelog-window.md + run-stats.txt
-      │       writes dreams/<date>.md; may edit project MEMORY.md (📌) + touched-projects.txt
+      │       writes dreams/<date>.md; may write findings/<date>/pins.jsonl (proposed pins)
       │
       ├─ notify.sh → open-questions inbox file ($AUTODREAM_OPEN, default `open`)
-      └─ optional: claude-memory gc per touched project
+      └─ pin-projects.tsv (project → cwd) + bin/apply-pins.sh → shared Mnemopi store
 ```
 
 ## Files
 
 | File | Role |
 |---|---|
-| `bin/run.sh` | orchestrator: guard, preflight, adapter load, enumerate+filter, L1 retry loop, changelog, L2 retry loop, notify, gc. Every fatal goes through `log_fatal`/`fatal_exit` (marker + banner) |
-| `adapters/<name>/` | one harness. `manifest.json` (DATA — jq-parsed, never sourced) + `adapter.sh` + `facts.md`. Subcommands: `enumerate normalize project memory-root stats slim is-self skills-inventory apply-pin`; contract table in `docs/design/unify-harness-adapters-2026-08-23.md`. `_fixture` is test-only (leading `_` excludes it) |
+| `bin/run.sh` | orchestrator: guard, preflight, adapter load, enumerate+filter, L1 retry loop, changelog, L2 retry loop, pin apply, notify. Every fatal goes through `log_fatal`/`fatal_exit` (marker + banner) |
+| `adapters/<name>/` | one harness. `manifest.json` (DATA — jq-parsed, never sourced) + `adapter.sh` + `facts.md`. Subcommands: `enumerate normalize project memory-root stats slim is-self skills-inventory` (`memory-root` is unused since pins moved to Mnemopi); contract table in `docs/design/unify-harness-adapters-2026-08-23.md`. `_fixture` is test-only (leading `_` excludes it) |
 | `bin/adapters.sh` | adapter discovery + dispatch. Identity is the DIRECTORY BASENAME (dispatch builds a path from it), must agree with `manifest.name`; realpath containment; refusals go to a file because `adapters_list` runs inside `$(...)` |
 | `bin/lib-project.sh` | the canonical project key every adapter must agree on: `encode_project` (everything outside `[A-Za-z0-9-]` → `-`), `canonical_project` (realpath first), `session_hash` (12 lowercase hex, validated) |
 | `bin/preflight.sh` | shared-dependency gate, run before anything is enumerated. Fatal on a missing hard dep rather than a quiet empty night |
