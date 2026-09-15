@@ -2,7 +2,7 @@
 # Unit tests for bin/apply-pins.sh: L2's pins.jsonl into Mnemopi via shared-memory.
 #
 # One test per row of the failure matrix in docs/plans/2026-09-15-mnemopi-pins.md
-# (rows A1-A14). shared-memory is always tests/mock-shared-memory.sh, so nothing
+# (rows A1-A24). shared-memory is always tests/mock-shared-memory.sh, so nothing
 # here can write real memory.
 set -u
 
@@ -216,6 +216,21 @@ MOCK_SM_MODE=storedexit1 run_ap
 assert_eq "$(stat_of pins_failed)" "1" "a nonzero store is a failure"
 assert_eq "$(stat_of pins_applied)" "0" "not counted as applied"
 assert_eq "$(ledger_rows)" "0" "no ledger row, so a later run can retry"
+
+echo "# A24: a pins.jsonl that exists but cannot be read"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"; chmod 000 "$F/pins.jsonl"
+run_ap
+chmod 600 "$F/pins.jsonl"
+assert_eq "$RC" "0" "exits 0"
+assert_eq "$(stat_of pins_unreadable)" "1" "unreadable file: pins_unreadable is 1"
+assert_eq "$(calls)" "0" "unreadable file: no call"
+setup; pin proj-a "Title" "Body" > "$F/pins.jsonl"; chmod 000 "$F/pins.jsonl"
+SM_BIN="$T/nonexistent/shared-memory" run_ap
+chmod 600 "$F/pins.jsonl"
+assert_eq "$(stat_of pins_unreadable)" "1" "unreadable file with no CLI: pins_unreadable is 1"
+setup; mkdir "$F/pins.jsonl"
+run_ap
+assert_eq "$(stat_of pins_unreadable)" "1" "a directory named pins.jsonl: pins_unreadable is 1"
 
 echo "# A14: no arguments"
 setup

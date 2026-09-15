@@ -59,7 +59,7 @@ VALID='select(type == "object")
   | select(.kind as $k | ["correction", "preference", "fact", "decision"] | index($k))
   | {project, title, body, kind}'
 
-total=0 applied=0 duplicate=0 invalid=0 rejected_project=0 no_cwd=0 failed=0 unledgered=0 cli_missing=0
+total=0 applied=0 duplicate=0 invalid=0 rejected_project=0 no_cwd=0 failed=0 unledgered=0 cli_missing=0 unreadable=0
 
 write_result() {
   {
@@ -72,8 +72,9 @@ write_result() {
     printf 'pins_failed: %s\n' "$failed"
     printf 'pins_unledgered: %s\n' "$unledgered"
     printf 'pins_cli_missing: %s\n' "$cli_missing"
+    printf 'pins_unreadable: %s\n' "$unreadable"
   } > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
-  echo "apply-pins: total=$total applied=$applied duplicate=$duplicate invalid=$invalid rejected_project=$rejected_project no_cwd=$no_cwd failed=$failed unledgered=$unledgered cli_missing=$cli_missing"
+  echo "apply-pins: total=$total applied=$applied duplicate=$duplicate invalid=$invalid rejected_project=$rejected_project no_cwd=$no_cwd failed=$failed unledgered=$unledgered cli_missing=$cli_missing unreadable=$unreadable"
 }
 
 # $1=project -> prints its cwd column; exit 1 when the run never saw the project.
@@ -145,14 +146,23 @@ apply_line() {
   echo applied
 }
 
-if [ ! -f "$PINS" ]; then
+if [ ! -e "$PINS" ]; then
   write_result
+  exit 0
+fi
+
+# Read the file once, and check that read. A redirect on the loop below that fails to
+# open runs zero iterations, and the counters would say L2 proposed no pins.
+if ! CONTENT=$(cat -- "$PINS" 2>/dev/null); then
+  unreadable=1
+  write_result
+  echo "apply-pins: could not read $PINS; pins stay there" >&2
   exit 0
 fi
 
 if ! command -v "$SM" >/dev/null 2>&1; then
   cli_missing=1
-  total=$(grep -c '[^[:space:]]' "$PINS" || true)
+  total=$(grep -c '[^[:space:]]' <<<"$CONTENT" || true)
   write_result
   echo "apply-pins: $SM not found; pins stay in $PINS" >&2
   exit 0
@@ -170,7 +180,7 @@ while IFS= read -r line <&3 || [ -n "$line" ]; do
     unledgered)       unledgered=$((unledgered + 1)) ;;
     *)                failed=$((failed + 1)) ;;
   esac
-done 3< "$PINS"
+done 3<<<"$CONTENT"
 
 write_result
 exit 0

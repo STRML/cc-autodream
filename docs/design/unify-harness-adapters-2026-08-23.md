@@ -266,7 +266,7 @@ After a complete report, and only when `CONSUME_SAFE=1` and `PINS_SAFE=1`, `run.
 
 `bin/apply-pins.sh` validates each line's schema (`kind` one of the four values, `title` non-empty, at most 150 characters, no newline, `body` non-empty, at most 4000 characters), then calls `shared-memory call mnemopi_remember '<json>' --cwd <cwd>` with content `title\n\nbody`, `source: cc-autodream`, `importance: 0.7`, metadata `{kind, project, autodream_date, origin: "cc-autodream"}`, and `bank` set to the `retainBank` that `shared-memory context --cwd <cwd>` reports. `mnemopi_remember` resolves its bank from the payload, then `MNEMOPI_MCP_BANK`, then `default`, never from `--cwd`, so leaving it out would put every project's pin in the global store. A call succeeds only on exit `0` with `status: "stored"` and a string `memory_id`.
 
-**Each success is ledgered so a rerun cannot double-write.** A successful call appends `<sha1 of the canonical pin>\t<memory_id>` to `pins-applied.tsv`; a pin whose hash is already ledgered is skipped rather than resent. Counters (`pins_total`, `pins_applied`, `pins_invalid`, `pins_rejected_project`, `pins_no_cwd`, `pins_duplicate`, `pins_cli_missing`, `pins_failed`, `pins_unledgered`) go to `pins-result.txt`. A pin that was stored but whose ledger row could not be written counts as `pins_unledgered`, never as applied, and its memory id goes to the run log. The script always exits `0` after its arguments parse, on the same principle the old `apply-pin` exit-code contract served: a pin must never cost a report.
+**Each success is ledgered so a rerun cannot double-write.** A successful call appends `<sha1 of the canonical pin>\t<memory_id>` to `pins-applied.tsv`; a pin whose hash is already ledgered is skipped rather than resent. Counters (`pins_total`, `pins_applied`, `pins_invalid`, `pins_rejected_project`, `pins_no_cwd`, `pins_duplicate`, `pins_cli_missing`, `pins_failed`, `pins_unledgered`, `pins_unreadable`) go to `pins-result.txt`. A pin that was stored but whose ledger row could not be written counts as `pins_unledgered`, never as applied, and its memory id goes to the run log. The script always exits `0` after its arguments parse, on the same principle the old `apply-pin` exit-code contract served: a pin must never cost a report.
 
 `SHARED_MEMORY_BIN` overrides the CLI path. The test suite pins it to `tests/mock-shared-memory.sh`, so no test can write real memory.
 
@@ -298,6 +298,7 @@ This also retires the defect this section used to track: `bin/run.sh:294` scanne
 | L2 capture missing sentinel or marker | treated as truncated, retried per `AUTODREAM_L2_ATTEMPTS`, same as today |
 | a pin line fails validation, or names a project this run never triaged | counted (`pins_invalid`, `pins_rejected_project`) and logged; the report is already on disk |
 | a pin's project has no resolvable working directory | counted `pins_no_cwd`; nothing stored |
+| `pins.jsonl` exists but cannot be read | counted `pins_unreadable`; nothing stored, the file stays |
 | `shared-memory` is missing, exits nonzero, or returns no `memory_id` | counted (`pins_cli_missing`, `pins_failed`); no ledger row, so a rerun of that date retries it. The nightly run only processes yesterday, so nothing retries it automatically (#69); never blocks anything downstream |
 | the store succeeds but the ledger append fails | counted `pins_unledgered` with the memory id logged; a rerun stores that pin again |
 | the store reports `stored` with an empty `memory_id` | counted `pins_failed`; no ledger row |
@@ -318,7 +319,7 @@ New keys in `run-stats.txt`, following the existing rule that a degraded measure
 - `adapters_rejected_identity`.
 - `normalize_failed`, `project_failed`, `stats_failed`, `slim_failed`.
 
-Pin counters live in `findings/<date>/pins-result.txt`, not `run-stats.txt`, because pins apply after L2 has already read the stats: `pins_total`, `pins_applied`, `pins_duplicate`, `pins_invalid`, `pins_rejected_project`, `pins_no_cwd`, `pins_failed`, `pins_unledgered`, `pins_cli_missing`.
+Pin counters live in `findings/<date>/pins-result.txt`, not `run-stats.txt`, because pins apply after L2 has already read the stats: `pins_total`, `pins_applied`, `pins_duplicate`, `pins_invalid`, `pins_rejected_project`, `pins_no_cwd`, `pins_failed`, `pins_unledgered`, `pins_cli_missing`, `pins_unreadable`.
 - `l2_input_bytes` — the total size of the findings the aggregator was handed.
 
 `runner_commit` and `runner_dirty` stay, and matter more after the rename, since the live install still symlinks into the working tree.
