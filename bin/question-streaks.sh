@@ -65,6 +65,16 @@
 # still escalating tomorrow.
 set -uo pipefail
 
+# install.sh links this script into the install's own AUTODREAM_DIR, so a bare invocation
+# (status, clear, or run.sh's early empty-night path) finds the store there, the same way
+# run.sh finds its install dir. The legacy ~/.claude/autodream stays the last resort
+# (Codex review of 232c94c).
+if [ -z "${AUTODREAM_DIR:-}" ]; then
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  if [ -n "$self_dir" ] && { [ -f "$self_dir/config" ] || [ -f "$self_dir/l1-no-advisor.yml" ]; }; then
+    AUTODREAM_DIR="$self_dir"
+  fi
+fi
 AUTODREAM_DIR="${AUTODREAM_DIR:-$HOME/.claude/autodream}"
 STATE="${AUTODREAM_QUESTION_STATE:-$AUTODREAM_DIR/question-streaks.tsv}"
 ESCALATE_AT="${AUTODREAM_QUESTION_ESCALATE_AT:-3}"
@@ -105,13 +115,46 @@ titles_of() { # $1=report
 # Serialize the read-modify-write. STATE is one shared file per install, and the scheduled
 # nightly and an `autodream-now.sh` run carry different launchd labels, so launchd's
 # one-instance-per-label rule does not keep them apart. Two overlapping runs would each
-# read the old state and the second `cp` would discard the first's increment.
+# read the old state and the second write would discard the first's increment.
 #
 # mkdir is the atomic primitive; a stale directory from a killed run is reclaimed by age so
 # one crash cannot wedge the feature forever. Failure to acquire SKIPS the update rather
 # than blocking — a missed increment costs one night of escalation latency, while a
 # bookkeeping helper that hangs would hold up the pipeline behind it.
 LOCK="$STATE.lock"
+
+# ONE FILE, ONE WRITE
+#
+# The newest counted report date is the first line of STATE, `#last<TAB>YYYY-MM-DD`, above
+# the streak rows. A question-free report leaves only that line, so the watermark survives
+# an empty board. Every write replaces the whole file: a temp file in the same directory,
+# then one rename. The watermark used to live in a second file, and three reviews in a row
+# (Codex on 232c94c, 4eea84d and 600e6dd) each found a write order or a failure between the
+# two files that let an older rebuild recreate a streak. One rename cannot leave the board
+# and its watermark disagreeing, so there is no order left to get wrong:
+#
+#   failure                                STATE afterwards
+#   temp file cannot be created            unchanged
+#   temp write fails (disk full)           unchanged, temp removed
+#   rename fails                           unchanged, temp removed
+#   killed between write and rename        unchanged, a stray STATE.XXXXXX left behind
+#   STATE exists but cannot be read        unchanged; update refuses, it is not an empty board
+rows_of() { awk '!/^#/ && NF' "$STATE" 2>/dev/null; }
+nrows()   { rows_of | wc -l | tr -d ' '; }
+newest_of() {
+  awk -F'\t' '/^#last\t/ {print $2} !/^#/ && NF>=4 {print $4}' "$STATE" 2>/dev/null \
+    | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort | tail -1
+}
+unreadable_state() { [ -e "$STATE" ] && { [ ! -f "$STATE" ] || [ ! -r "$STATE" ]; }; }
+write_state() { # $1=rows file  $2=watermark date, or empty for none
+  local t; t=$(mktemp "$STATE.XXXXXX" 2>/dev/null) || return 1
+  if ( { [ -z "$2" ] || printf '#last\t%s\n' "$2"; } && cat "$1" ) > "$t" 2>/dev/null \
+     && mv -f "$t" "$STATE" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$t" 2>/dev/null
+  return 1
+}
 acquire_lock() {
   local i=0
   while ! mkdir "$LOCK" 2>/dev/null; do
@@ -137,6 +180,10 @@ cmd_update() {
   [ -s "$report" ] || { echo "question-streaks: no report at $report; nothing to count"; return 0; }
   local date; date=$(basename "$report" .md)
 
+  # The lock lives beside the state, so its directory must exist before the lock is taken.
+  # Otherwise the first update on a new state path reads as a held lock and never creates
+  # the state (Codex review of b72f0e4).
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
   if ! acquire_lock; then
     echo "question-streaks: another run holds $LOCK; skipping this update"
     return 0
@@ -149,7 +196,13 @@ cmd_update() {
 
   # Refuse to go backwards. Rebuilding an old date would otherwise drop every streak that
   # old report does not mention and rewrite the live state with history.
-  local newest; newest=$(awk -F'\t' 'NF>=4 {print $4}' "$STATE" 2>/dev/null | sort | tail -1)
+  # A state file that cannot be read is not an empty board. Reading it as empty would drop
+  # the watermark and restart every streak.
+  if unreadable_state; then
+    echo "question-streaks: cannot read $STATE; leaving streaks untouched"
+    return 0
+  fi
+  local newest; newest=$(newest_of)
   if [ -n "$newest" ] && [ "$date" \< "$newest" ]; then
     echo "question-streaks: $date is older than the last counted report ($newest); leaving streaks untouched"
     return 0
@@ -163,10 +216,20 @@ cmd_update() {
   titles_of "$report" > "$tmp/titles" 2>/dev/null || : > "$tmp/titles"
   local n marker; n=$(nlines "$tmp/titles"); marker=$(marker_of "$report")
 
+  # No marker means the report is incomplete. This is stricter than run.sh's report_complete,
+  # which accepts any line containing `autodream:open-questions=`. An L2 run truncated
+  # before the Open questions section parses as zero questions, and
+  # counting that clears every streak and advances the watermark. run.sh leaves such a
+  # report in place when it cannot move it aside (Codex review of b72f0e4).
+  if [ -z "$marker" ]; then
+    echo "question-streaks: $date has no open-questions marker, so the report is incomplete; streaks not updated"
+    return 0
+  fi
+
   # The marker is the report's own count. Any disagreement means the format moved and some
   # questions parsed as nothing — refuse to touch state rather than silently dropping a
   # streak or freezing every one of them at its last value.
-  if [ -n "$marker" ] && [ "$marker" -ne "$n" ]; then
+  if [ "$marker" -ne "$n" ]; then
     echo "question-streaks: WARNING $date says $marker open question(s) but $n parsed — the title format changed; streaks not updated"
     # Banner, not just a log line. This feature exists because a signal buried in a place
     # nobody looks gets skimmed, and a parser breakage hidden in the run log is that same
@@ -178,8 +241,8 @@ cmd_update() {
   fi
 
   if [ "${n:-0}" -eq 0 ]; then
-    echo "question-streaks: no open questions in $date; clearing $(nlines "$STATE") streak(s)"
-    : > "$STATE" 2>/dev/null || echo "question-streaks: could not clear $STATE (continuing)"
+    echo "question-streaks: no open questions in $date; clearing $(nrows) streak(s)"
+    write_state /dev/null "$date" || echo "question-streaks: could not write $STATE; streaks untouched (continuing)"
     return 0
   fi
 
@@ -203,8 +266,7 @@ cmd_update() {
     fi
   done < "$tmp/titles"
 
-  mkdir -p "$(dirname "$STATE")" 2>/dev/null || true
-  cp "$tmp/next" "$STATE" 2>/dev/null || { echo "question-streaks: could not write $STATE (continuing)"; return 0; }
+  write_state "$tmp/next" "$date" || { echo "question-streaks: could not write $STATE; streaks untouched (continuing)"; return 0; }
 
   echo "question-streaks: $n question(s) in $date, $escalated at or past $ESCALATE_AT consecutive"
   [ "$escalated" -eq 0 ] && return 0
@@ -246,9 +308,10 @@ post_banner() { # $1=date $2=count $3=lead line
 }
 
 cmd_status() {
-  [ -s "$STATE" ] || { echo "question-streaks: no streaks recorded ($STATE)"; return 0; }
+  unreadable_state && { echo "question-streaks: cannot read $STATE" >&2; return 1; }
+  [ "$(nrows)" -gt 0 ] || { echo "question-streaks: no streaks recorded ($STATE)"; return 0; }
   printf '%-14s %-6s %-12s %-12s %s\n' KEY COUNT FIRST LAST TITLE
-  awk -F'\t' '{ printf "%-14s %-6s %-12s %-12s %s\n", $1, $2, $3, $4, $5 }' "$STATE"
+  rows_of | awk -F'\t' '{ printf "%-14s %-6s %-12s %-12s %s\n", $1, $2, $3, $4, $5 }'
   return 0
 }
 
@@ -256,13 +319,30 @@ cmd_status() {
 # is still on disk means tomorrow's escalation looks like the feature is broken.
 cmd_clear() {
   local what="${1:?usage: question-streaks.sh clear all|<key>}"
-  [ -s "$STATE" ] || { echo "question-streaks: nothing to clear"; return 0; }
-  if [ "$what" = "all" ]; then
-    if : > "$STATE" 2>/dev/null; then echo "question-streaks: cleared all streaks"; return 0; fi
-    echo "question-streaks: FAILED to clear $STATE" >&2; return 1
+  # Same lock as update. Without it an update that already read the old state writes it
+  # back after this clear, and the streak the operator just cleared returns (Codex review
+  # of 232c94c). The lock comes BEFORE the empty check: an update holding it may be about
+  # to write the first streak onto an empty board (Codex review of 4eea84d). With no state
+  # directory there is no lock to hold and nothing to clear, so that case stays a no-op
+  # rather than waiting out the lock and failing.
+  [ -d "$(dirname "$STATE")" ] || { echo "question-streaks: nothing to clear"; return 0; }
+  if ! acquire_lock; then
+    echo "question-streaks: FAILED to clear: another run holds $LOCK" >&2
+    return 1
   fi
+  trap 'release_lock' RETURN
+  unreadable_state && { echo "question-streaks: FAILED to clear: cannot read $STATE" >&2; return 1; }
+  [ "$(nrows)" -gt 0 ] || { echo "question-streaks: nothing to clear"; return 0; }
+  # An unknown key is a failure, not a no-op. Printing "cleared" for a mistyped key leaves
+  # the real streak escalating tomorrow (#32). `status` lists the keys.
+  if [ "$what" != "all" ] && ! rows_of | awk -F'\t' -v k="$what" '$1 == k {f=1} END {exit !f}'; then
+    echo "question-streaks: FAILED to clear: no streak with key $what (status lists the keys)" >&2
+    return 1
+  fi
+  # Forget streaks, keep the watermark: an older rebuild after a clear is still history.
   local tmp; tmp="$(mktemp)" || { echo "question-streaks: FAILED to stage a rewrite of $STATE" >&2; return 1; }
-  if awk -F'\t' -v k="$what" '$1!=k' "$STATE" > "$tmp" && cp "$tmp" "$STATE" 2>/dev/null; then
+  rows_of | awk -F'\t' -v k="$what" 'k != "all" && $1 != k' > "$tmp"
+  if write_state "$tmp" "$(newest_of)"; then
     rm -f "$tmp"; echo "question-streaks: cleared $what"; return 0
   fi
   rm -f "$tmp"

@@ -2695,6 +2695,167 @@ for _suite in lib-project preflight adapters adapter-claude adapter-contract sli
   fi
 done
 
+test_shared_drift_check_from_a_worktree(){
+  echo "# check-shared-drift.sh names the repo by its main checkout, so a git worktree still finds the sibling"
+  command -v git >/dev/null 2>&1 || { echo "  skip - git not available"; return 0; }
+  # Physical path: on macOS mktemp hands back /var/..., git reports /private/var/..., and the
+  # sibling path the script prints comes from git.
+  local T; T=$(cd "$(mktemp -d)" && pwd -P)
+  # A worktree gets its own directory name (cc-autodream-pr25), and inferring the sibling
+  # from that name exited 2 and failed the whole suite in every worktree.
+  mkdir -p "$T/cc-autodream/bin" "$T/omp-autodream/bin"
+  cp "$REPO/bin/check-shared-drift.sh" "$T/cc-autodream/bin/"
+  printf 'bin/a.sh\n' > "$T/cc-autodream/shared-with-sibling.txt"
+  printf 'echo same\n' > "$T/cc-autodream/bin/a.sh"
+  printf 'echo same\n' > "$T/omp-autodream/bin/a.sh"
+  ( cd "$T/cc-autodream" && git init -q && git config user.email t@t.invalid && git config user.name t \
+      && git add -A && git commit -q -m init && git worktree add -q "$T/cc-autodream-feature" 2>/dev/null )
+  local out rc
+  out=$(env -u AUTODREAM_SIBLING_REPO bash "$T/cc-autodream-feature/bin/check-shared-drift.sh" 2>&1); rc=$?
+  assert_eq "$rc" "0" "a worktree with a matching sibling exits 0"
+  case "$out" in *"ok — 1 shared file(s) match $T/omp-autodream"*) ok "and it compared against the sibling next to the main checkout" ;;
+    *) no "and it compared against the sibling next to the main checkout (got [$out])" ;; esac
+  printf 'echo drifted\n' > "$T/omp-autodream/bin/a.sh"
+  env -u AUTODREAM_SIBLING_REPO bash "$T/cc-autodream-feature/bin/check-shared-drift.sh" >/dev/null 2>&1; rc=$?
+  assert_eq "$rc" "1" "real drift seen from the worktree still fails"
+  # A checkout with a name the script does not know and no git is a degraded measurement:
+  # say SKIPPED and exit 0, the same contract as a sibling that is not on disk.
+  mkdir -p "$T/elsewhere/bin"; cp "$REPO/bin/check-shared-drift.sh" "$T/elsewhere/bin/"
+  printf 'bin/a.sh\n' > "$T/elsewhere/shared-with-sibling.txt"
+  out=$(env -u AUTODREAM_SIBLING_REPO bash "$T/elsewhere/bin/check-shared-drift.sh" 2>&1); rc=$?
+  assert_eq "$rc" "0" "an unrecognised checkout name skips instead of failing the suite"
+  case "$out" in *SKIPPED*) ok "and says it skipped" ;; *) no "and says it skipped (got [$out])" ;; esac
+  # Two unreadable copies used to strip to two empty files and compare equal (Codex review
+  # of 232c94c). A file the check cannot read has not been verified, so it is drift.
+  printf 'echo same\n' > "$T/omp-autodream/bin/a.sh"
+  chmod 000 "$T/cc-autodream-feature/bin/a.sh" "$T/omp-autodream/bin/a.sh"
+  env -u AUTODREAM_SIBLING_REPO bash "$T/cc-autodream-feature/bin/check-shared-drift.sh" >/dev/null 2>&1; rc=$?
+  chmod 644 "$T/cc-autodream-feature/bin/a.sh" "$T/omp-autodream/bin/a.sh"
+  assert_eq "$rc" "1" "an unreadable shared file is drift, not a match"
+  rm -rf "$T"
+}
+
+test_shared_drift_check_from_a_worktree
+
+streak_rows(){ awk '!/^#/ && NF' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+
+test_question_streaks_state_lives_with_the_install(){
+  echo "# question streaks: the store is the install's, one file holds the watermark, clear takes the lock"
+  local root; root=$(setup_env)
+  local QS="$REPO/bin/question-streaks.sh"
+  [ -x "$QS" ] || { no "question-streaks.sh executable"; return 0; }
+  mkdir -p "$root/home"
+  : > "$root/autodream/config"
+  local f; for f in "$REPO"/bin/*.sh; do ln -sf "$f" "$root/autodream/$(basename "$f")"; done
+  printf 'abc123def456\t2\t2019-12-30\t2019-12-31\tStale question?\n' > "$root/autodream/question-streaks.tsv"
+
+  # Run with no AUTODREAM_DIR at all, the documented no-environment invocation. The helper
+  # used to fall back to ~/.claude/autodream and never see this install's store.
+  local out
+  out=$(env -u AUTODREAM_DIR -u AUTODREAM_QUESTION_STATE HOME="$root/home" bash "$root/autodream/question-streaks.sh" status 2>&1)
+  case "$out" in *"Stale question?"*) ok "status run through the install link reads the install's store" ;; *) no "status run through the install link reads the install's store (got: $out)" ;; esac
+
+  # A night with no sessions writes a question-free report and must clear that store. This
+  # run.sh takes its install dir from AUTODREAM_DIR (default ~/.claude/autodream) rather than
+  # from its own location, so the sandbox install is named explicitly. When the value comes
+  # from that default instead, it is not exported on the early path, which is why both call
+  # sites pass it to the helper.
+  env HOME="$root/home" AUTODREAM_DIR="$root/autodream" AUTODREAM_CHANGELOG=0 AUTODREAM_GC=0 CLAUDE_BIN="$MOCK" \
+    AUTODREAM_CONFIG="$root/autodream/config" AUTODREAM_CONSUME_DATE="$DATE" \
+    AUTODREAM_NETCHECK=0 AUTODREAM_RETRY_WAIT=0 AUTODREAM_NOTIFY_DRYRUN=1 \
+    PROJECTS_DIR="$root/projects" DREAMS_DIR="$root/dreams" \
+    bash "$root/autodream/run.sh" "$DATE" > "$root/run.out" 2>&1
+  assert_file "$root/dreams/$DATE.md" "precondition: the empty night wrote its report"
+  assert_eq "$(streak_rows "$root/autodream/question-streaks.tsv")" "0" "the empty night clears the install's streak store"
+
+  # Clearing the board must not erase the watermark: rebuilding an older report afterwards
+  # would otherwise re-enter history as a new night and grow a false streak.
+  local st="$root/w.tsv"; : > "$st"
+  qsw(){ AUTODREAM_QUESTION_STATE="$st" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  printf '## Open questions for the user\n\n1. **Recurring?** body\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-03-01.md"
+  printf '## Open questions for the user\n\nNone.\n\n<!-- autodream:open-questions=0 -->\n' > "$root/2026-03-02.md"
+  qsw update "$root/2026-03-01.md" >/dev/null
+  qsw update "$root/2026-03-02.md" >/dev/null
+  out=$(qsw update "$root/2026-03-01.md")
+  case "$out" in *"older than the last counted report"*) ok "an older rebuild after a cleared board is still refused" ;; *) no "an older rebuild after a cleared board is still refused (got: $out)" ;; esac
+  assert_eq "$(streak_rows "$st")" "0" "and the cleared board stays clear"
+  # One file, one write. The watermark used to live beside the state, and three reviews in
+  # a row found an order of writes between the two files that let history back in.
+  assert_eq "$(head -1 "$st")" "$(printf '#last\t2026-03-02')" "the watermark is the first line of the state file"
+  assert_no_file "$st.last" "and no second watermark file is written"
+
+  # clear takes the same lock as update, or an update that already read the old state puts
+  # the cleared streak back when it writes.
+  printf 'k\t1\t2026-03-03\t2026-03-03\tHeld?\n' > "$st"
+  mkdir "$st.lock"
+  AUTODREAM_QUESTION_STATE="$st" bash "$QS" clear all >/dev/null 2>&1; local rc=$?
+  rmdir "$st.lock" 2>/dev/null
+  assert_eq "$rc" "1" "clear fails while an update holds the lock"
+  assert_eq "$(streak_rows "$st")" "1" "and leaves the state for that update"
+
+  # An EMPTY board is not a reason to skip the lock: an update holding it may be about to
+  # write the first streak, which clear would then report as cleared (Codex review of 4eea84d).
+  : > "$st"
+  mkdir "$st.lock"
+  AUTODREAM_QUESTION_STATE="$st" bash "$QS" clear all >/dev/null 2>&1; rc=$?
+  rmdir "$st.lock" 2>/dev/null
+  assert_eq "$rc" "1" "clear on an empty board still waits for the lock and fails while it is held"
+
+  # A state file that exists but cannot be read is not an empty board. Reading it as empty
+  # restarts every streak and drops the watermark with it. Write-only, so a write would land.
+  local st2="$root/w2.tsv"; : > "$st2"
+  qs2(){ AUTODREAM_QUESTION_STATE="$st2" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  printf '## Open questions for the user\n\n1. **Recurring?** body\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-03-04.md"
+  qs2 update "$root/2026-03-01.md" >/dev/null
+  cp "$st2" "$root/w2.before"
+  chmod 200 "$st2"
+  qs2 update "$root/2026-03-04.md" >/dev/null
+  chmod 644 "$st2"
+  if cmp -s "$st2" "$root/w2.before"; then ok "an unreadable state file refuses the update instead of restarting every streak"; else no "an unreadable state file refuses the update instead of restarting every streak"; fi
+
+  # A state directory that cannot take a temp file leaves the state as it was.
+  mkdir -p "$root/ro"; local st3="$root/ro/w3.tsv"
+  AUTODREAM_QUESTION_STATE="$st3" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-01.md" >/dev/null 2>&1
+  cp "$st3" "$root/w3.before"
+  chmod 500 "$root/ro"
+  AUTODREAM_QUESTION_STATE="$st3" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-04.md" >/dev/null 2>&1
+  chmod 700 "$root/ro"
+  if cmp -s "$st3" "$root/w3.before"; then ok "a state directory that refuses a temp file leaves state untouched"; else no "a state directory that refuses a temp file leaves state untouched"; fi
+
+  # clear all forgets the streaks and keeps the watermark, so an older rebuild afterwards is
+  # still refused. status never prints the watermark line as a streak.
+  local st6="$root/w6.tsv"; : > "$st6"
+  qs6(){ AUTODREAM_QUESTION_STATE="$st6" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" "$@" 2>&1; }
+  qs6 update "$root/2026-03-04.md" >/dev/null
+  out=$(qs6 status)
+  case "$out" in *"#last"*) no "status does not print the watermark line (got: $out)" ;; *"Recurring?"*) ok "status does not print the watermark line" ;; *) no "status does not print the watermark line (got: $out)" ;; esac
+  qs6 clear all >/dev/null
+  assert_eq "$(head -1 "$st6")" "$(printf '#last\t2026-03-04')" "clear all keeps the watermark"
+  out=$(qs6 update "$root/2026-03-01.md")
+  case "$out" in *"older than the last counted report"*) ok "and an older rebuild after clear all is refused" ;; *) no "and an older rebuild after clear all is refused (got: $out)" ;; esac
+
+  # A state path whose directory does not exist yet. The lock lives beside the state, so
+  # the directory has to exist before the lock is taken, or every update reads as a held
+  # lock and exits without ever creating the state (Codex review of b72f0e4).
+  local nested="$root/new/nested/question-streaks.tsv"
+  AUTODREAM_QUESTION_STATE="$nested" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-04.md" >/dev/null 2>&1
+  assert_eq "$(streak_rows "$nested")" "1" "the first update on a new state directory creates the state"
+
+  # The final rename can fail. The whole state is one temp file renamed into place, so a
+  # failed rename leaves the old file whole: board and watermark together.
+  local st4="$root/w4.tsv"; : > "$st4"
+  mkdir -p "$root/failmv"
+  printf '#!/bin/sh\nexit 1\n' > "$root/failmv/mv"; chmod +x "$root/failmv/mv"
+  printf '## Open questions for the user\n\n1. **Another?** body\n\n<!-- autodream:open-questions=1 -->\n' > "$root/2026-03-03.md"
+  AUTODREAM_QUESTION_STATE="$st4" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-01.md" >/dev/null 2>&1
+  cp "$st4" "$root/w4.before"
+  PATH="$root/failmv:$PATH" AUTODREAM_QUESTION_STATE="$st4" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-02.md" >/dev/null 2>&1
+  if cmp -s "$st4" "$root/w4.before"; then ok "a failed watermark move on a question-free report leaves the board as it was"; else no "a failed watermark move on a question-free report leaves the board as it was"; fi
+  PATH="$root/failmv:$PATH" AUTODREAM_QUESTION_STATE="$st4" AUTODREAM_NOTIFY_DRYRUN=1 bash "$QS" update "$root/2026-03-03.md" >/dev/null 2>&1
+  if cmp -s "$st4" "$root/w4.before"; then ok "a failed watermark move on a report with questions leaves the board as it was"; else no "a failed watermark move on a report with questions leaves the board as it was"; fi
+  rm -rf "$root"
+}
+
 test_question_streaks(){
   echo "# question streaks: count repeats across reports and escalate the stale ones"
   local root; root=$(setup_env)
@@ -2747,7 +2908,7 @@ test_question_streaks(){
   # wc -l, not `grep -c . || echo 0`: grep -c prints 0 AND exits 1 on no match, so the
   # fallback fires too and the value is "0\n0". That trap is documented in this repo and
   # it still caught this test on the first run.
-  assert_eq "$(wc -l < "$st" | tr -d " ")" "0" "a question-free report clears every streak"
+  assert_eq "$(streak_rows "$st")" "0" "a question-free report clears every streak"
 
   # A marker that promises questions while none parse means the format moved. That must be
   # reported, never silently counted as zero — the quiet version would freeze every streak
@@ -2780,25 +2941,45 @@ test_question_streaks_reruns_and_mismatch(){
   mk 2026-02-02 1 "Recurring question?"
   qs update "$root/2026-02-01.md" >/dev/null
   qs update "$root/2026-02-02.md" >/dev/null
-  assert_eq "$(awk -F'\t' '{print $2}' "$st")" "2" "two distinct reports count two"
+  assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "two distinct reports count two"
 
   # AUTODREAM_FORCE=1 rebuilds the same report. Counting it again would manufacture an
   # escalation out of a rerun.
   qs update "$root/2026-02-02.md" >/dev/null
-  assert_eq "$(awk -F'\t' '{print $2}' "$st")" "2" "rebuilding the same report does not advance the streak"
+  assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "rebuilding the same report does not advance the streak"
 
   # A rebuild of an OLDER date must not rewrite live state with history: 02-01 does not
   # know about anything that happened on 02-02.
   out=$(qs update "$root/2026-02-01.md")
   case "$out" in *"older than the last counted report"*) ok "an older rebuild is refused" ;; *) no "an older rebuild is refused (got: $out)" ;; esac
-  assert_eq "$(awk -F'\t' '{print $4}' "$st")" "2026-02-02" "and the live last-seen date is untouched"
+  assert_eq "$(awk -F'\t' '!/^#/ {print $4}' "$st")" "2026-02-02" "and the live last-seen date is untouched"
 
   # The marker is the report's own count. Disagreement means questions parsed as nothing;
   # touching state would silently drop a streak or freeze them all.
   mk 2026-02-03 2 "Recurring question?"   # marker says 2, only 1 bold title present
   out=$(qs update "$root/2026-02-03.md")
   case "$out" in *"but 1 parsed"*) ok "a parsed-vs-marker mismatch warns" ;; *) no "a parsed-vs-marker mismatch warns (got: $out)" ;; esac
-  assert_eq "$(awk -F'\t' '{print $2}' "$st")" "2" "and refuses to change state"
+  assert_eq "$(awk -F'\t' '!/^#/ {print $2}' "$st")" "2" "and refuses to change state"
+
+  # A report with no count marker is incomplete: an L2 run truncated before the Open
+  # questions section, left in place when run.sh could not move it aside. Parsing it as
+  # zero questions cleared every streak and advanced the watermark (Codex review of b72f0e4).
+  printf '# Autodream\n\n## Activity snapshot\n- 7 sessions\n' > "$root/2026-02-05.md"
+  printf '## Open questions for the user\n\n1. **Recurring question?** body cut off mid-' > "$root/2026-02-06.md"
+  cp "$st" "$root/st.before"
+  out=$(qs update "$root/2026-02-05.md")
+  case "$out" in *"no open-questions marker"*) ok "a report truncated before its questions is refused as incomplete" ;; *) no "a report truncated before its questions is refused as incomplete (got: $out)" ;; esac
+  if cmp -s "$st" "$root/st.before"; then ok "and does not clear the board"; else no "and does not clear the board"; fi
+  qs update "$root/2026-02-06.md" >/dev/null
+  if cmp -s "$st" "$root/st.before"; then ok "a report truncated after a question title is refused too"; else no "a report truncated after a question title is refused too"; fi
+
+  # clear with a key no streak carries printed "cleared" and exited 0, so a mistyped key left
+  # the streak escalating after the operator was told it was forgotten (#32).
+  local krc
+  out=$(qs clear deadbeef0000); krc=$?
+  assert_eq "$krc" "1" "clear with an unknown key fails"
+  case "$out" in *"no streak with key deadbeef0000"*) ok "and names the key it could not find" ;; *) no "and names the key it could not find (got: $out)" ;; esac
+  if cmp -s "$st" "$root/st.before"; then ok "and leaves the state untouched"; else no "and leaves the state untouched"; fi
 
   # clear must not claim success it did not achieve.
   chmod 500 "$root" 2>/dev/null
@@ -2811,6 +2992,7 @@ test_question_streaks_reruns_and_mismatch(){
 
 test_question_streaks
 test_question_streaks_reruns_and_mismatch
+test_question_streaks_state_lives_with_the_install
 
 # Cross-repo drift, last. It is not a unit test — it inspects the sibling checkout, so it
 # can only run on a machine holding both — but it belongs in the same command as the rest,

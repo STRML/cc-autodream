@@ -170,6 +170,7 @@ Each of these passed a smoke test and failed in a way that produced no error:
 - **An iCloud-evicted file is not a zero-byte file.** macOS replaces it outright with a dot-prefixed `.<name>.icloud` placeholder, so a `-name '*.md'` walk matches *nothing* and the unreadable-note branch was unreachable for the only case it existed for. Placeholders get their own pass and are never manifested, so the note stays in the inbox to retry.
 - **Sourcing a user-edited config under `set -u` kills the shell.** Not the source — the shell, so `|| echo WARNING` cannot fire. `run.sh` now probes the config in a throwaway subshell purely to capture bash's own error naming the bad variable, then sources for real with nounset off. Both helper scripts need the same guard; fixing only `run.sh` left them dying instead.
 - **`mv` across filesystems is a copy, not a rename.** State staged in `$TMPDIR` and moved onto `$STATE_DIR` was never the atomic swap its comment claimed. Stage in the destination directory and gate the `mv` on the staging copy having succeeded.
+- **State that has to change together goes in one file, written with one rename.** Two files cannot be updated atomically, so every write order leaves a failure point between them. `question-streaks.sh` kept its watermark in a second file, and three Codex rounds on omp-autodream PR #25 in a row each found a new order in which the two disagreed. Moving the watermark into the state file's first line ended it (see "Open questions that never get answered"). When a fix starts choosing which of two files to write first, merge the files instead.
 
 ## X bookmarks as idea fuel
 
@@ -270,11 +271,12 @@ and **both installs run nightly** — `~/.claude/autodream` off this repo,
 2026-09-15 with comments stripped, `run.sh` differs by 1009 code lines, `review.sh` by 93,
 `session-stats.sh` by 70. Those are a port, not a copy, and they should differ.
 
-Four helpers are byte-identical by intent, and they are listed in
+Five helpers are byte-identical by intent, and they are listed in
 `shared-with-sibling.txt`:
 
 ```
 bin/cookie-cadence.sh   bin/make-notifier.sh   bin/overlap-stats.sh   bin/x-bookmarks.sh
+bin/question-streaks.sh
 ```
 
 A fix to any of those is half a fix until it lands in both. That is not hypothetical. On
@@ -291,7 +293,11 @@ could ever have caught it.
 date its own incident notes in a comment block. An inline trailing comment is not
 stripped and does count as drift — `sed` cannot tell a `#` in a comment from one in a
 string or a regex, and for files meant to be identical "port the comment too" is the
-right answer anyway. With no sibling on disk it prints SKIPPED and
+right answer anyway. It finds the sibling by the name of the main checkout, not the
+current directory, so a git worktree such as `cc-autodream-port71` still resolves
+`../omp-autodream` (a name-based guess exited 2 and failed the whole suite in every
+worktree). A shared file it cannot read counts as drift, not a match. With no sibling on
+disk, or a checkout name it does not recognise, it prints SKIPPED and
 exits 0 **loudly**, naming the path it looked for — the same rule as `overlap_measured`
 and `stats_sidecars_unparseable`: a degraded measurement says so rather than reading as a
 pass. It is verified by re-introducing the real regression, not by a fixture.
@@ -334,7 +340,27 @@ Four decisions in it are load-bearing:
 - **A marker promising questions while none parse is a warning, not a zero.** If PROMPT.md
   ever stops emitting bold titles, the quiet failure would freeze every streak at its last
   value and the escalation would never fire again — the same class of bug as a broken
-  sidecar reading as a real measurement.
+  sidecar reading as a real measurement. A report with no marker at all is incomplete and
+  is refused too: a truncated L2 report parses as zero questions and would clear the board.
+
+Details from the Codex reviews of omp-autodream PR #25, ported here in #71, each with a test:
+
+- **The store is the install's.** A bare run of the helper (`status`, `clear`) resolves
+  its install dir from its own symlink when that dir carries a `config` or
+  `l1-no-advisor.yml`, and `run.sh` passes `AUTODREAM_DIR` at both call sites.
+- **One file holds the board and its watermark.** The newest counted date is the first
+  line of `question-streaks.tsv` (`#last<TAB>YYYY-MM-DD`), so a question-free report
+  leaves that line and an older rebuild is still refused. Every write is a temp file in
+  the same directory and one rename, so a failure at any step leaves the old file whole.
+  The watermark first lived in a second file, and three Codex rounds in a row found a way
+  for the two files to disagree that let history back in. A state file that exists but
+  cannot be read refuses the update, because reading it as empty restarts every streak.
+  `clear` keeps the watermark.
+- **`clear` takes the same lock as `update`**, before its "nothing to clear" check, and
+  fails loudly when it cannot. It also fails on a key no streak carries (omp-autodream
+  #32): printing "cleared" for a mistyped key left the real streak escalating.
+- **The state directory exists before the lock.** The lock lives beside the state, so on a
+  new state path the lock could never be taken.
 
 Threshold is `AUTODREAM_QUESTION_ESCALATE_AT` (default 3). `question-streaks.sh status`
 prints the current streaks; `clear all|<key>` forgets one after you have acted on it.
